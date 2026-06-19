@@ -1,0 +1,131 @@
+import { app } from "../../../scripts/app.js";
+
+console.log("[SCAIL Multi Cond] dynamic UI extension loaded");
+
+const MAX_SEGMENTS = 8;
+const MAX_REFERENCES = 8;
+
+function widgetByName(node, name) {
+    return node.widgets?.find((widget) => widget.name === name);
+}
+
+function setWidgetVisible(widget, visible) {
+    if (!widget) {
+        return;
+    }
+    widget.hidden = !visible;
+    widget.computeSize = visible
+        ? undefined
+        : () => [0, -4];
+}
+
+function setInputVisible(node, inputName, visible) {
+    const input = node.inputs?.find((slot) => slot.name === inputName);
+    if (!input) {
+        return;
+    }
+    input.hidden = !visible;
+}
+
+function scheduleCanvas(node) {
+    node.setDirtyCanvas?.(true, true);
+    app.graph?.setDirtyCanvas?.(true, true);
+}
+
+function resizeNode(node) {
+    if (node.computeSize) {
+        const size = node.computeSize();
+        node.size = [Math.max(node.size?.[0] ?? 420, size[0]), size[1]];
+    }
+    scheduleCanvas(node);
+}
+
+function updateSegmentBuilder(node) {
+    const countWidget = widgetByName(node, "segment_count");
+    const count = Math.max(1, Math.min(MAX_SEGMENTS, Number(countWidget?.value ?? 1)));
+    if (countWidget) {
+        countWidget.value = count;
+    }
+
+    for (let index = 1; index <= MAX_SEGMENTS; index += 1) {
+        const visible = index <= count;
+        for (const suffix of ["frames", "reference", "prompt", "negative", "boundary_overlap"]) {
+            setWidgetVisible(widgetByName(node, `segment_${index}_${suffix}`), visible);
+        }
+    }
+    resizeNode(node);
+}
+
+function referenceInputNumber(input) {
+    const match = /^reference_(\d+)$/.exec(input?.name ?? "");
+    return match ? Number(match[1]) : null;
+}
+
+function updateScheduledGenerator(node) {
+    const countWidget = widgetByName(node, "reference_count");
+    const count = Math.max(1, Math.min(MAX_REFERENCES, Number(countWidget?.value ?? MAX_REFERENCES)));
+    if (countWidget) {
+        countWidget.value = count;
+    }
+
+    for (let inputIndex = (node.inputs?.length ?? 0) - 1; inputIndex >= 0; inputIndex -= 1) {
+        const referenceNumber = referenceInputNumber(node.inputs[inputIndex]);
+        if (referenceNumber !== null && referenceNumber > count) {
+            node.removeInput(inputIndex);
+        }
+    }
+
+    const existing = new Set(
+        (node.inputs ?? [])
+            .map(referenceInputNumber)
+            .filter((value) => value !== null)
+    );
+    for (let index = 1; index <= count; index += 1) {
+        if (!existing.has(index)) {
+            node.addInput(`reference_${index}`, "IMAGE");
+        }
+    }
+    resizeNode(node);
+}
+
+function addUpdateButton(node, label, callback) {
+    if (node.widgets?.some((widget) => widget.name === label)) {
+        return;
+    }
+    node.addWidget("button", label, null, () => callback(node));
+}
+
+app.registerExtension({
+    name: "scail_multi_cond.dynamic_inputs",
+    beforeRegisterNodeDef(nodeType, nodeData) {
+        if (nodeData.name === "SCAIL2SegmentPlanBuilder") {
+            const originalOnNodeCreated = nodeType.prototype.onNodeCreated;
+            nodeType.prototype.onNodeCreated = function () {
+                originalOnNodeCreated?.apply(this, arguments);
+                addUpdateButton(this, "Update segment inputs", updateSegmentBuilder);
+                updateSegmentBuilder(this);
+            };
+
+            const originalOnConfigure = nodeType.prototype.onConfigure;
+            nodeType.prototype.onConfigure = function () {
+                originalOnConfigure?.apply(this, arguments);
+                requestAnimationFrame(() => updateSegmentBuilder(this));
+            };
+        }
+
+        if (nodeData.name === "SCAIL2ScheduledLongVideo") {
+            const originalOnNodeCreated = nodeType.prototype.onNodeCreated;
+            nodeType.prototype.onNodeCreated = function () {
+                originalOnNodeCreated?.apply(this, arguments);
+                addUpdateButton(this, "Update reference inputs", updateScheduledGenerator);
+                updateScheduledGenerator(this);
+            };
+
+            const originalOnConfigure = nodeType.prototype.onConfigure;
+            nodeType.prototype.onConfigure = function () {
+                originalOnConfigure?.apply(this, arguments);
+                requestAnimationFrame(() => updateScheduledGenerator(this));
+            };
+        }
+    },
+});

@@ -1,0 +1,20 @@
+__pycache__/
+*.pyc
+.DS_Store
+*.bak
+
+# Local media and generated outputs
+input/
+output/
+temp/
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.png
+*.jpg
+*.jpeg
+*.webp
+
+# Keep documentation assets tracked.
+!docs/assets/*.svg
