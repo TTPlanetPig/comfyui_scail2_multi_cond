@@ -216,6 +216,7 @@ The package itself does not depend on KJNodes. A workflow may still require KJNo
 ```text
 workflow/SCAIL2_scheduled_long_video_template.json
 workflow/SCAIL2_long_video_sample.json
+workflow/comfyui_scail2_multi_cond_sample.json
 ```
 
 The sample workflow uses placeholder media names such as:
@@ -224,6 +225,7 @@ The sample workflow uses placeholder media names such as:
 your_driving_video.mp4
 reference_1.png
 reference_2.png
+reference_3.png
 ```
 
 Replace them with your own ComfyUI input files.
