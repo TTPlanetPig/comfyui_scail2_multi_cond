@@ -52,6 +52,33 @@ The node also outputs `used_pose_video_mask` and `used_reference_mask_timeline`.
 Both are aligned to the final generated frame timeline after chunk overlap is
 discarded, so they can be previewed beside the generated video.
 
+### SCAIL-2 Scheduled Long Video (Internal SAM)
+
+Convenience version of the scheduler. It keeps the same segment/chunk/video
+generation logic as `SCAIL-2 Scheduled Long Video`, but builds the masks inside
+the node:
+
+```text
+pose_video + sam_model + sam_conditioning -> internal SAM3 driving track
+reference_N + sam_model + sam_conditioning -> internal SAM3 reference tracks
+tracks -> native SCAIL-2 colored masks -> scheduled long video generation
+```
+
+Use this node when you want a simpler workflow. Use the external-mask scheduler
+when you want to preview or manually adjust SAM tracks/masks before generation.
+
+The internal SAM node supports:
+
+- `object_indices`: driving-video object indices after sorting;
+- `reference_object_indices`: reference-image object indices, empty = all;
+- `sort_by`: `none`, `left_to_right`, or `area`;
+- SAM controls: detection threshold, max objects, detect interval.
+
+For single-person reference images, keep `reference_object_indices` empty. If
+you fill `object_indices = 1` to select the second person in the driving video
+and the reference image only has one person, also filtering the reference by `1`
+would make the reference mask empty.
+
 ### SCAIL-2 Multi Reference Colored Mask
 
 Builds SCAIL-2 colored masks for multiple reference tracks in one place.

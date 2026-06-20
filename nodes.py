@@ -323,6 +323,32 @@ def _encode_clip_vision(clip_vision, image: torch.Tensor):
     return nodes.CLIPVisionEncode().encode(clip_vision, image, "none")[0]
 
 
+def _run_sam3_track(
+    images: torch.Tensor,
+    model,
+    conditioning,
+    detection_threshold: float,
+    max_objects: int,
+    detect_interval: int,
+):
+    from comfy_extras.nodes_sam3 import SAM3_VideoTrack
+
+    result = _node_result(
+        SAM3_VideoTrack.execute(
+            images,
+            model,
+            initial_mask=None,
+            conditioning=conditioning,
+            detection_threshold=float(detection_threshold),
+            max_objects=int(max_objects),
+            detect_interval=max(1, int(detect_interval)),
+        )
+    )
+    if len(result) != 1:
+        raise RuntimeError("SAM3_VideoTrack returned an unexpected result.")
+    return result[0]
+
+
 def _apply_reference_mask(reference_image: torch.Tensor, reference_image_mask: Optional[torch.Tensor]) -> torch.Tensor:
     if reference_image_mask is None:
         return reference_image
@@ -1115,11 +1141,221 @@ class SCAIL2ScheduledLongVideo:
         return (frames, used_pose_video_mask, used_reference_mask_timeline, json.dumps(summary, indent=2))
 
 
+class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
+    @classmethod
+    def INPUT_TYPES(cls):
+        optional = {}
+        for index in range(1, MAX_REFERENCES + 1):
+            optional[f"reference_{index}"] = ("IMAGE",)
+
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "clip": ("CLIP",),
+                "vae": ("VAE",),
+                "sampler": ("SAMPLER",),
+                "sigmas": ("SIGMAS",),
+                "clip_vision": ("CLIP_VISION",),
+                "pose_video": ("IMAGE",),
+                "sam_model": ("MODEL",),
+                "sam_conditioning": ("CONDITIONING",),
+                "segment_plan": ("STRING", {"default": DEFAULT_PLAN, "multiline": True}),
+                "seed": ("INT", {"default": 1, "min": 0, "max": 0xFFFFFFFFFFFFFFFF}),
+                "cfg": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 20.0, "step": 0.1}),
+                "mode": (["replacement", "animation"], {"default": "replacement"}),
+                "max_frames": ("INT", {"default": 0, "min": 0, "max": 100000, "step": 1}),
+                "max_chunk_frames": ("INT", {"default": 81, "min": 17, "max": 81, "step": 4}),
+                "overlap_frames": ("INT", {"default": 5, "min": 0, "max": 33, "step": 1}),
+                "reference_count": ("INT", {"default": 2, "min": 1, "max": MAX_REFERENCES, "step": 1}),
+                "color_correction": ("BOOLEAN", {"default": True}),
+                "object_indices": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "tooltip": "Comma-separated driving-video object indices to include after sorting. Empty = all.",
+                    },
+                ),
+                "reference_object_indices": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "tooltip": "Comma-separated reference-image object indices. Empty = all reference objects, recommended for single-person reference images.",
+                    },
+                ),
+                "sort_by": (
+                    ["none", "left_to_right", "area"],
+                    {
+                        "default": "left_to_right",
+                        "tooltip": "Native SCAIL-2 identity color ordering before object index filtering.",
+                    },
+                ),
+                "sam_detection_threshold": (
+                    "FLOAT",
+                    {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01},
+                ),
+                "sam_max_objects": ("INT", {"default": 2, "min": 1, "max": 16, "step": 1}),
+                "sam_detect_interval": ("INT", {"default": 2, "min": 1, "max": 999, "step": 1}),
+            },
+            "optional": optional,
+        }
+
+    RETURN_TYPES = SCAIL2ScheduledLongVideo.RETURN_TYPES
+    RETURN_NAMES = SCAIL2ScheduledLongVideo.RETURN_NAMES
+    FUNCTION = "generate"
+    CATEGORY = CATEGORY
+
+    def generate(
+        self,
+        model,
+        clip,
+        vae,
+        sampler,
+        sigmas,
+        clip_vision,
+        pose_video: torch.Tensor,
+        sam_model,
+        sam_conditioning,
+        segment_plan: str,
+        seed: int,
+        cfg: float,
+        mode: str,
+        max_frames: int,
+        max_chunk_frames: int,
+        overlap_frames: int,
+        reference_count: int,
+        color_correction: bool,
+        object_indices: str = "",
+        reference_object_indices: str = "",
+        sort_by: str = "left_to_right",
+        sam_detection_threshold: float = 0.5,
+        sam_max_objects: int = 2,
+        sam_detect_interval: int = 2,
+        **kwargs,
+    ):
+        if not isinstance(pose_video, torch.Tensor) or pose_video.ndim != 4:
+            raise ValueError("pose_video must be a ComfyUI IMAGE tensor.")
+
+        active_reference_count = max(1, min(MAX_REFERENCES, int(reference_count)))
+        segments = _parse_plan(segment_plan, pose_frame_count=int(pose_video.shape[0]), max_frames=max_frames)
+        used_refs = sorted({int(segment["reference"]) for segment in segments})
+        object_indices = str(object_indices or "")
+        reference_object_indices = str(reference_object_indices or "")
+        sort_by = sort_by if sort_by in {"none", "left_to_right", "area"} else "left_to_right"
+        replacement_mode = mode == "replacement"
+
+        references: dict[int, torch.Tensor] = {}
+        for index in range(1, active_reference_count + 1):
+            image = kwargs.get(f"reference_{index}")
+            if image is not None:
+                references[index] = _first_image(image, f"reference_{index}")
+        missing = [index for index in used_refs if index not in references]
+        if missing:
+            raise ValueError(f"segment_plan references missing image input(s): {missing}")
+
+        print(
+            "[SCAIL2ScheduledLongVideoWithSAM] "
+            f"tracking pose_video frames={int(pose_video.shape[0])} refs={used_refs} "
+            f"object_indices='{object_indices}' reference_object_indices='{reference_object_indices}' "
+            f"sort_by={sort_by}"
+        )
+        driving_track_data = _run_sam3_track(
+            pose_video,
+            sam_model,
+            sam_conditioning,
+            detection_threshold=float(sam_detection_threshold),
+            max_objects=int(sam_max_objects),
+            detect_interval=int(sam_detect_interval),
+        )
+
+        pose_video_mask = None
+        reference_masks: dict[int, torch.Tensor] = {}
+        track_summary: list[dict[str, Any]] = []
+        for index in used_refs:
+            reference_track_data = _run_sam3_track(
+                references[index],
+                sam_model,
+                sam_conditioning,
+                detection_threshold=float(sam_detection_threshold),
+                max_objects=int(sam_max_objects),
+                detect_interval=1,
+            )
+
+            current_pose_mask, _ = _create_scail_masks(
+                driving_track_data,
+                reference_track_data,
+                object_indices,
+                sort_by,
+                replacement_mode,
+            )
+            _, reference_mask = _create_scail_masks(
+                driving_track_data,
+                reference_track_data,
+                reference_object_indices,
+                sort_by,
+                replacement_mode,
+            )
+            if pose_video_mask is None:
+                pose_video_mask = current_pose_mask.detach().contiguous()
+            reference_masks[index] = reference_mask.detach().contiguous()
+            track_summary.append(
+                {
+                    "reference": index,
+                    "reference_shape": _shape(references[index]),
+                    "reference_mask_shape": _shape(reference_mask),
+                }
+            )
+
+        if pose_video_mask is None:
+            raise RuntimeError("Internal SAM tracking produced no pose_video_mask.")
+
+        generate_kwargs: dict[str, Any] = {"pose_video_mask": pose_video_mask}
+        for index, image in references.items():
+            generate_kwargs[f"reference_{index}"] = image
+        for index, mask in reference_masks.items():
+            generate_kwargs[f"reference_{index}_mask"] = mask
+
+        frames, used_pose_video_mask, used_reference_mask_timeline, summary_text = super().generate(
+            model,
+            clip,
+            vae,
+            sampler,
+            sigmas,
+            clip_vision,
+            pose_video,
+            segment_plan,
+            seed,
+            cfg,
+            mode,
+            max_frames,
+            max_chunk_frames,
+            overlap_frames,
+            reference_count,
+            color_correction,
+            **generate_kwargs,
+        )
+        try:
+            summary = json.loads(summary_text)
+        except Exception:
+            summary = {"scheduled_summary": summary_text}
+        summary["internal_sam"] = {
+            "object_indices": object_indices,
+            "reference_object_indices": reference_object_indices,
+            "sort_by": sort_by,
+            "sam_detection_threshold": float(sam_detection_threshold),
+            "sam_max_objects": int(sam_max_objects),
+            "sam_detect_interval": int(sam_detect_interval),
+            "references_tracked": track_summary,
+            "pose_video_mask_shape": _shape(pose_video_mask),
+        }
+        return (frames, used_pose_video_mask, used_reference_mask_timeline, json.dumps(summary, indent=2))
+
+
 NODE_CLASS_MAPPINGS = {
     "SCAIL2SegmentPlanBuilder": SCAIL2SegmentPlanBuilder,
     "SCAIL2SegmentPlanner": SCAIL2SegmentPlanner,
     "SCAIL2MultiReferenceColoredMask": SCAIL2MultiReferenceColoredMask,
     "SCAIL2ScheduledLongVideo": SCAIL2ScheduledLongVideo,
+    "SCAIL2ScheduledLongVideoWithSAM": SCAIL2ScheduledLongVideoWithSAM,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1127,4 +1363,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SCAIL2SegmentPlanner": "SCAIL-2 Segment Planner",
     "SCAIL2MultiReferenceColoredMask": "SCAIL-2 Multi Reference Colored Mask",
     "SCAIL2ScheduledLongVideo": "SCAIL-2 Scheduled Long Video",
+    "SCAIL2ScheduledLongVideoWithSAM": "SCAIL-2 Scheduled Long Video (Internal SAM)",
 }

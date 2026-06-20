@@ -164,6 +164,35 @@ function updateScheduledGenerator(node) {
     resizeNode(node);
 }
 
+function updateScheduledGeneratorWithSAM(node) {
+    const countWidget = widgetByName(node, "reference_count");
+    const count = Math.max(1, Math.min(MAX_REFERENCES, Number(countWidget?.value ?? MAX_REFERENCES)));
+    if (countWidget) {
+        countWidget.value = count;
+    }
+
+    for (let inputIndex = (node.inputs?.length ?? 0) - 1; inputIndex >= 0; inputIndex -= 1) {
+        const referenceInfo = referenceInputInfo(node.inputs[inputIndex]);
+        if (referenceInfo !== null && (referenceInfo.isMask || referenceInfo.number > count)) {
+            node.removeInput(inputIndex);
+        }
+    }
+
+    const existingImages = new Set();
+    for (const input of node.inputs ?? []) {
+        const referenceInfo = referenceInputInfo(input);
+        if (referenceInfo && !referenceInfo.isMask) {
+            existingImages.add(referenceInfo.number);
+        }
+    }
+    for (let index = 1; index <= count; index += 1) {
+        if (!existingImages.has(index)) {
+            node.addInput(`reference_${index}`, "IMAGE");
+        }
+    }
+    resizeNode(node);
+}
+
 function updateMultiReferenceMask(node) {
     const countWidget = widgetByName(node, "reference_count");
     const count = Math.max(1, Math.min(MAX_REFERENCES, Number(countWidget?.value ?? MAX_REFERENCES)));
@@ -229,6 +258,21 @@ app.registerExtension({
             nodeType.prototype.onConfigure = function () {
                 originalOnConfigure?.apply(this, arguments);
                 requestAnimationFrame(() => updateScheduledGenerator(this));
+            };
+        }
+
+        if (nodeData.name === "SCAIL2ScheduledLongVideoWithSAM") {
+            const originalOnNodeCreated = nodeType.prototype.onNodeCreated;
+            nodeType.prototype.onNodeCreated = function () {
+                originalOnNodeCreated?.apply(this, arguments);
+                addUpdateButton(this, "Update reference inputs", updateScheduledGeneratorWithSAM);
+                updateScheduledGeneratorWithSAM(this);
+            };
+
+            const originalOnConfigure = nodeType.prototype.onConfigure;
+            nodeType.prototype.onConfigure = function () {
+                originalOnConfigure?.apply(this, arguments);
+                requestAnimationFrame(() => updateScheduledGeneratorWithSAM(this));
             };
         }
 
