@@ -60,7 +60,13 @@ def _get_scail_nodes_module():
         return nodes_wan
 
 
-def _create_scail_masks(driving_track_data, reference_track_data, replacement_mode: bool):
+def _create_scail_masks(
+    driving_track_data,
+    reference_track_data,
+    object_indices: str,
+    sort_by: str,
+    replacement_mode: bool,
+):
     scail_nodes = _get_scail_nodes_module()
     SCAIL2ColoredMask = getattr(scail_nodes, "SCAIL2ColoredMask", None)
     if SCAIL2ColoredMask is None:
@@ -68,8 +74,8 @@ def _create_scail_masks(driving_track_data, reference_track_data, replacement_mo
     result = _node_result(
         SCAIL2ColoredMask.execute(
             driving_track_data,
-            "",
-            "left_to_right",
+            object_indices,
+            sort_by,
             bool(replacement_mode),
             ref_track_data=reference_track_data,
         )
@@ -659,6 +665,20 @@ class SCAIL2MultiReferenceColoredMask:
             "required": {
                 "driving_track_data": ("SAM3_TRACK_DATA",),
                 "reference_count": ("INT", {"default": 2, "min": 1, "max": MAX_REFERENCES, "step": 1}),
+                "object_indices": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "tooltip": "Comma-separated tracked object indices to include, matching the native SCAIL-2 colored-mask node. Empty = all.",
+                    },
+                ),
+                "sort_by": (
+                    ["none", "left_to_right", "area"],
+                    {
+                        "default": "left_to_right",
+                        "tooltip": "Native SCAIL-2 identity color ordering. Applies to both driving and reference tracks.",
+                    },
+                ),
                 "replacement_mode": ("BOOLEAN", {"default": True}),
             },
             "optional": optional,
@@ -680,8 +700,18 @@ class SCAIL2MultiReferenceColoredMask:
     FUNCTION = "build"
     CATEGORY = CATEGORY
 
-    def build(self, driving_track_data, reference_count: int = 2, replacement_mode: bool = True, **kwargs):
+    def build(
+        self,
+        driving_track_data,
+        reference_count: int = 2,
+        object_indices: str = "",
+        sort_by: str = "left_to_right",
+        replacement_mode: bool = True,
+        **kwargs,
+    ):
         count = max(1, min(MAX_REFERENCES, int(reference_count)))
+        object_indices = str(object_indices or "")
+        sort_by = sort_by if sort_by in {"none", "left_to_right", "area"} else "left_to_right"
         pose_video_mask = None
         reference_masks: list[Optional[torch.Tensor]] = [None] * MAX_REFERENCES
         entries: list[dict[str, Any]] = []
@@ -694,6 +724,8 @@ class SCAIL2MultiReferenceColoredMask:
             current_pose_mask, reference_mask = _create_scail_masks(
                 driving_track_data,
                 ref_track,
+                object_indices,
+                sort_by,
                 bool(replacement_mode),
             )
             if pose_video_mask is None:
@@ -717,6 +749,8 @@ class SCAIL2MultiReferenceColoredMask:
 
         summary = {
             "reference_count": count,
+            "object_indices": object_indices,
+            "sort_by": sort_by,
             "replacement_mode": bool(replacement_mode),
             "pose_video_mask_shape": _shape(pose_video_mask),
             "references": entries,

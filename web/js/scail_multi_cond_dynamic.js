@@ -72,6 +72,60 @@ function referenceTrackInputNumber(input) {
     return match ? Number(match[1]) : null;
 }
 
+function referenceMaskOutputNumber(output) {
+    const match = /^reference_(\d+)_mask$/.exec(output?.name ?? "");
+    return match ? Number(match[1]) : null;
+}
+
+function syncOutputLinkSlots(node) {
+    const graph = node.graph ?? app.graph;
+    for (let outputIndex = 0; outputIndex < (node.outputs?.length ?? 0); outputIndex += 1) {
+        const output = node.outputs[outputIndex];
+        for (const linkId of output?.links ?? []) {
+            const link = graph?.links?.[linkId];
+            if (link && link.origin_id === node.id) {
+                link.origin_slot = outputIndex;
+            }
+        }
+    }
+}
+
+function updateMultiReferenceMaskOutputs(node, count) {
+    const desiredNames = [
+        "pose_video_mask",
+        ...Array.from({ length: count }, (_, index) => `reference_${index + 1}_mask`),
+    ];
+    const desiredNameSet = new Set(desiredNames);
+
+    for (let outputIndex = (node.outputs?.length ?? 0) - 1; outputIndex >= 0; outputIndex -= 1) {
+        const output = node.outputs[outputIndex];
+        const referenceNumber = referenceMaskOutputNumber(output);
+        const shouldRemove =
+            !desiredNameSet.has(output?.name) ||
+            (referenceNumber !== null && referenceNumber > count);
+        if (shouldRemove) {
+            node.removeOutput(outputIndex);
+        }
+    }
+
+    const existingNames = new Set((node.outputs ?? []).map((output) => output.name));
+    for (const name of desiredNames) {
+        if (!existingNames.has(name)) {
+            node.addOutput(name, "IMAGE");
+        }
+    }
+
+    const outputsByName = new Map((node.outputs ?? []).map((output) => [output.name, output]));
+    node.outputs = desiredNames
+        .map((name) => {
+            const output = outputsByName.get(name);
+            output.type = "IMAGE";
+            return output;
+        })
+        .filter(Boolean);
+    syncOutputLinkSlots(node);
+}
+
 function updateScheduledGenerator(node) {
     const countWidget = widgetByName(node, "reference_count");
     const count = Math.max(1, Math.min(MAX_REFERENCES, Number(countWidget?.value ?? MAX_REFERENCES)));
@@ -134,6 +188,7 @@ function updateMultiReferenceMask(node) {
             node.addInput(`reference_${index}_track_data`, "SAM3_TRACK_DATA");
         }
     }
+    updateMultiReferenceMaskOutputs(node, count);
     resizeNode(node);
 }
 

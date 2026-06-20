@@ -39,17 +39,14 @@ The same button also updates the matching `reference_N_mask` inputs.
 Recommended replacement setup:
 
 ```text
-driving_track_data + reference_1_track_data -> Create SCAIL-2 Colored Mask
-                                           -> pose_video_mask + reference_1_mask
-
-driving_track_data + reference_2_track_data -> Create SCAIL-2 Colored Mask
-                                           -> pose_video_mask + reference_2_mask
+driving_track_data + reference_N_track_data -> SCAIL-2 Multi Reference Colored Mask
+                                            -> pose_video_mask + reference_N_mask
 ```
 
 Connect one shared `pose_video_mask` to the scheduler and connect each segment
-reference to its matching `reference_N_mask`. The scheduler does not run SAM or
-build colored masks internally; person selection stays in upstream SAM / SCAIL-2
-mask nodes where it can be previewed.
+reference to its matching `reference_N_mask`. The scheduler does not run SAM
+internally; person selection stays in upstream SAM tracking and the multi-mask
+helper where it can be previewed.
 
 The node also outputs `used_pose_video_mask` and `used_reference_mask_timeline`.
 Both are aligned to the final generated frame timeline after chunk overlap is
@@ -64,11 +61,18 @@ Connect one `driving_track_data`, set `reference_count`, and connect
 logic for each connected reference and outputs:
 
 - `pose_video_mask`;
-- `reference_1_mask` through `reference_8_mask`;
-- `summary`.
+- dynamic `reference_N_mask` outputs matching `reference_count`.
 
 Set `reference_count`, then click `Update reference track inputs` to hide unused
-track-data inputs.
+track-data inputs and mask outputs.
+
+The node keeps the native `Create SCAIL-2 Colored Mask` controls:
+
+- `object_indices`: comma-separated object indices such as `0,2`; empty means all;
+- `sort_by`: `none`, `left_to_right`, or `area`.
+
+These settings are applied to both driving and reference tracks before the masks
+are rendered, matching the official SCAIL-2 behavior.
 
 ### SCAIL-2 Segment Planner
 
@@ -175,7 +179,7 @@ This package expects a recent ComfyUI build that includes:
 - `ColorTransfer`.
 
 Replacement workflows should use upstream ComfyUI nodes such as `SAM3_VideoTrack`
-and `Create SCAIL-2 Colored Mask` to prepare `pose_video_mask` and
+and `SCAIL-2 Multi Reference Colored Mask` to prepare `pose_video_mask` and
 `reference_N_mask` before this scheduler node.
 
 The package itself does not depend on KJNodes. A workflow may still require KJNodes if it uses unrelated KJNodes nodes such as resize helpers.
