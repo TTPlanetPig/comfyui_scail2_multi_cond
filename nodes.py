@@ -60,6 +60,25 @@ def _get_scail_nodes_module():
         return nodes_wan
 
 
+def _create_scail_masks(driving_track_data, reference_track_data, replacement_mode: bool):
+    scail_nodes = _get_scail_nodes_module()
+    SCAIL2ColoredMask = getattr(scail_nodes, "SCAIL2ColoredMask", None)
+    if SCAIL2ColoredMask is None:
+        raise RuntimeError("SCAIL2ColoredMask is unavailable in this ComfyUI build.")
+    result = _node_result(
+        SCAIL2ColoredMask.execute(
+            driving_track_data,
+            "",
+            "left_to_right",
+            bool(replacement_mode),
+            ref_track_data=reference_track_data,
+        )
+    )
+    if len(result) != 2:
+        raise RuntimeError("SCAIL2ColoredMask returned an unexpected result.")
+    return result[0], result[1]
+
+
 def _ceil_to_4n_plus_1(value: int) -> int:
     value = max(1, int(value))
     return 1 + ((value - 1 + 3) // 4) * 4
@@ -298,44 +317,6 @@ def _encode_clip_vision(clip_vision, image: torch.Tensor):
     return nodes.CLIPVisionEncode().encode(clip_vision, image, "none")[0]
 
 
-def _run_sam3_track(images: torch.Tensor, model, conditioning, detection_threshold: float, max_objects: int, detect_interval: int):
-    from comfy_extras.nodes_sam3 import SAM3_VideoTrack
-
-    result = _node_result(
-        SAM3_VideoTrack.execute(
-            images,
-            model,
-            initial_mask=None,
-            conditioning=conditioning,
-            detection_threshold=float(detection_threshold),
-            max_objects=int(max_objects),
-            detect_interval=max(1, int(detect_interval)),
-        )
-    )
-    if len(result) != 1:
-        raise RuntimeError("SAM3_VideoTrack returned an unexpected result.")
-    return result[0]
-
-
-def _create_scail_masks(driving_track_data, reference_track_data, replacement_mode: bool):
-    scail_nodes = _get_scail_nodes_module()
-    SCAIL2ColoredMask = getattr(scail_nodes, "SCAIL2ColoredMask", None)
-    if SCAIL2ColoredMask is None:
-        raise RuntimeError("SCAIL2ColoredMask is unavailable in this ComfyUI build.")
-    result = _node_result(
-        SCAIL2ColoredMask.execute(
-            driving_track_data,
-            "",
-            "left_to_right",
-            bool(replacement_mode),
-            ref_track_data=reference_track_data,
-        )
-    )
-    if len(result) != 2:
-        raise RuntimeError("SCAIL2ColoredMask returned an unexpected result.")
-    return result[0], result[1]
-
-
 def _apply_reference_mask(reference_image: torch.Tensor, reference_image_mask: Optional[torch.Tensor]) -> torch.Tensor:
     if reference_image_mask is None:
         return reference_image
@@ -351,6 +332,21 @@ def _apply_reference_mask(reference_image: torch.Tensor, reference_image_mask: O
         resized = reference_image_mask[:1].detach()
     alpha = (resized[..., :3].max(dim=-1, keepdim=True).values > 0.1).to(dtype=reference_image.dtype)
     return (reference_image[:1].detach() * alpha).contiguous()
+
+
+def _resize_image_tensor_like(image: torch.Tensor, target: torch.Tensor, *, mode: str = "nearest") -> torch.Tensor:
+    if list(image.shape[1:3]) == list(target.shape[1:3]):
+        return image
+    import torch.nn.functional as F
+
+    kwargs = {"align_corners": False} if mode in {"bilinear", "bicubic"} else {}
+    resized = F.interpolate(
+        image.detach().float().movedim(-1, 1),
+        size=(int(target.shape[1]), int(target.shape[2])),
+        mode=mode,
+        **kwargs,
+    ).movedim(1, -1)
+    return resized.to(dtype=target.dtype).contiguous()
 
 
 def _sample_for_decode(*, model, positive, negative, sampler, sigmas, latent, seed: int, cfg: float) -> dict:
@@ -653,16 +649,90 @@ class SCAIL2SegmentPlanBuilder:
         return (segment_plan, json.dumps(summary, indent=2))
 
 
+class SCAIL2MultiReferenceColoredMask:
+    @classmethod
+    def INPUT_TYPES(cls):
+        optional = {}
+        for index in range(1, MAX_REFERENCES + 1):
+            optional[f"reference_{index}_track_data"] = ("SAM3_TRACK_DATA",)
+        return {
+            "required": {
+                "driving_track_data": ("SAM3_TRACK_DATA",),
+                "reference_count": ("INT", {"default": 2, "min": 1, "max": MAX_REFERENCES, "step": 1}),
+                "replacement_mode": ("BOOLEAN", {"default": True}),
+            },
+            "optional": optional,
+        }
+
+    RETURN_TYPES = ("IMAGE",) + ("IMAGE",) * MAX_REFERENCES + ("STRING",)
+    RETURN_NAMES = (
+        "pose_video_mask",
+        "reference_1_mask",
+        "reference_2_mask",
+        "reference_3_mask",
+        "reference_4_mask",
+        "reference_5_mask",
+        "reference_6_mask",
+        "reference_7_mask",
+        "reference_8_mask",
+        "summary",
+    )
+    FUNCTION = "build"
+    CATEGORY = CATEGORY
+
+    def build(self, driving_track_data, reference_count: int = 2, replacement_mode: bool = True, **kwargs):
+        count = max(1, min(MAX_REFERENCES, int(reference_count)))
+        pose_video_mask = None
+        reference_masks: list[Optional[torch.Tensor]] = [None] * MAX_REFERENCES
+        entries: list[dict[str, Any]] = []
+
+        for index in range(1, count + 1):
+            ref_track = kwargs.get(f"reference_{index}_track_data")
+            if ref_track is None:
+                entries.append({"reference": index, "status": "missing_track_data"})
+                continue
+            current_pose_mask, reference_mask = _create_scail_masks(
+                driving_track_data,
+                ref_track,
+                bool(replacement_mode),
+            )
+            if pose_video_mask is None:
+                pose_video_mask = current_pose_mask.detach().contiguous()
+            reference_masks[index - 1] = reference_mask.detach().contiguous()
+            entries.append(
+                {
+                    "reference": index,
+                    "status": "ok",
+                    "pose_video_mask_shape": _shape(current_pose_mask),
+                    "reference_mask_shape": _shape(reference_mask),
+                }
+            )
+
+        if pose_video_mask is None:
+            raise ValueError("At least one reference_N_track_data input must be connected.")
+
+        for index, mask in enumerate(reference_masks):
+            if mask is None:
+                reference_masks[index] = torch.zeros_like(pose_video_mask[:1]).contiguous()
+
+        summary = {
+            "reference_count": count,
+            "replacement_mode": bool(replacement_mode),
+            "pose_video_mask_shape": _shape(pose_video_mask),
+            "references": entries,
+        }
+        return (pose_video_mask, *reference_masks, json.dumps(summary, indent=2))
+
+
 class SCAIL2ScheduledLongVideo:
     @classmethod
     def INPUT_TYPES(cls):
         optional = {
-            "driving_track_data": ("SAM3_TRACK_DATA",),
-            "sam_model": ("MODEL",),
-            "sam_conditioning": ("CONDITIONING",),
+            "pose_video_mask": ("IMAGE",),
         }
         for index in range(1, MAX_REFERENCES + 1):
             optional[f"reference_{index}"] = ("IMAGE",)
+            optional[f"reference_{index}_mask"] = ("IMAGE",)
 
         return {
             "required": {
@@ -682,15 +752,12 @@ class SCAIL2ScheduledLongVideo:
                 "overlap_frames": ("INT", {"default": 5, "min": 0, "max": 33, "step": 1}),
                 "reference_count": ("INT", {"default": 2, "min": 1, "max": MAX_REFERENCES, "step": 1}),
                 "color_correction": ("BOOLEAN", {"default": True}),
-                "sam_detection_threshold": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "sam_max_objects": ("INT", {"default": 2, "min": 1, "max": 8, "step": 1}),
-                "sam_detect_interval": ("INT", {"default": 2, "min": 1, "max": 999, "step": 1}),
             },
             "optional": optional,
         }
 
-    RETURN_TYPES = ("IMAGE", "STRING")
-    RETURN_NAMES = ("frames", "summary")
+    RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE", "STRING")
+    RETURN_NAMES = ("frames", "used_pose_video_mask", "used_reference_mask_timeline", "summary")
     FUNCTION = "generate"
     CATEGORY = CATEGORY
 
@@ -712,12 +779,7 @@ class SCAIL2ScheduledLongVideo:
         overlap_frames: int,
         reference_count: int,
         color_correction: bool,
-        sam_detection_threshold: float,
-        sam_max_objects: int,
-        sam_detect_interval: int,
-        driving_track_data=None,
-        sam_model=None,
-        sam_conditioning=None,
+        pose_video_mask=None,
         **kwargs,
     ):
         if not isinstance(pose_video, torch.Tensor) or pose_video.ndim != 4:
@@ -754,11 +816,15 @@ class SCAIL2ScheduledLongVideo:
             )
 
         references: dict[int, torch.Tensor] = {}
+        reference_masks: dict[int, torch.Tensor] = {}
         active_reference_count = max(1, min(MAX_REFERENCES, int(reference_count)))
         for index in range(1, active_reference_count + 1):
             image = kwargs.get(f"reference_{index}")
             if image is not None:
                 references[index] = _first_image(image, f"reference_{index}")
+            mask = kwargs.get(f"reference_{index}_mask")
+            if mask is not None:
+                reference_masks[index] = mask.detach().contiguous()
         if not references:
             raise ValueError("At least one reference_N image must be connected.")
 
@@ -767,10 +833,15 @@ class SCAIL2ScheduledLongVideo:
         if missing:
             raise ValueError(f"segment_plan references missing image input(s): {missing}")
 
-        if replacement_mode and driving_track_data is None:
-            raise ValueError("replacement mode requires driving_track_data from SAM3_VideoTrack.")
-        if replacement_mode and (sam_model is None or sam_conditioning is None):
-            raise ValueError("replacement mode requires sam_model and sam_conditioning to build per-reference masks.")
+        if replacement_mode:
+            if pose_video_mask is None:
+                raise ValueError("replacement mode requires pose_video_mask from Create SCAIL-2 Colored Mask.")
+            missing_masks = [index for index in used_refs if index not in reference_masks]
+            if missing_masks:
+                raise ValueError(
+                    "replacement mode requires reference_N_mask for every used reference. "
+                    f"Missing: {missing_masks}"
+                )
 
         reference_cache: dict[int, dict[str, Any]] = {}
         prompt_cache: dict[tuple[str, str], tuple[Any, Any]] = {}
@@ -785,28 +856,12 @@ class SCAIL2ScheduledLongVideo:
             if index in reference_cache:
                 return reference_cache[index]
             reference_image = references[index]
-            reference_mask = None
-            pose_mask = None
-            if driving_track_data is not None and sam_model is not None and sam_conditioning is not None:
-                ref_track = _run_sam3_track(
-                    reference_image,
-                    sam_model,
-                    sam_conditioning,
-                    detection_threshold=float(sam_detection_threshold),
-                    max_objects=int(sam_max_objects),
-                    detect_interval=int(sam_detect_interval),
-                )
-                pose_mask, reference_mask = _create_scail_masks(
-                    driving_track_data,
-                    ref_track,
-                    replacement_mode,
-                )
+            reference_mask = reference_masks.get(index)
             clip_image = _apply_reference_mask(reference_image, reference_mask) if replacement_mode else reference_image
             clip_vision_output = _encode_clip_vision(clip_vision, clip_image)
             reference_cache[index] = {
                 "reference_image": reference_image,
                 "reference_image_mask": reference_mask,
-                "pose_video_mask": pose_mask,
                 "clip_vision_output": clip_vision_output,
                 "reference_shape": _shape(reference_image),
                 "reference_mask_shape": _shape(reference_mask),
@@ -815,6 +870,8 @@ class SCAIL2ScheduledLongVideo:
 
         WanSCAILToVideo = _get_scail_nodes_module().WanSCAILToVideo
         stitched: list[torch.Tensor] = []
+        stitched_pose_masks: list[torch.Tensor] = []
+        stitched_reference_masks: list[torch.Tensor] = []
         previous_frames = None
         produced = 0
         chunk_index = 0
@@ -894,7 +951,7 @@ class SCAIL2ScheduledLongVideo:
                         reference_image=ref_info["reference_image"],
                         clip_vision_output=ref_info["clip_vision_output"],
                         pose_video=pose_video,
-                        pose_video_mask=ref_info["pose_video_mask"],
+                        pose_video_mask=pose_video_mask,
                         reference_image_mask=ref_info["reference_image_mask"],
                         previous_frames=previous_frames_for_scail,
                     )
@@ -932,6 +989,25 @@ class SCAIL2ScheduledLongVideo:
                     color_summary = {"applied": False}
 
                 stitched.append(kept.detach().cpu().contiguous())
+                if replacement_mode:
+                    pose_mask_window = pose_video_mask[
+                        video_frame_offset : video_frame_offset + int(decoded.shape[0])
+                    ].detach().cpu().contiguous()
+                    kept_pose_mask = pose_mask_window[discard_head : discard_head + wanted_keep].contiguous()
+                    if int(kept_pose_mask.shape[0]) != int(kept.shape[0]):
+                        kept_pose_mask = torch.zeros_like(kept)
+                    else:
+                        kept_pose_mask = _resize_image_tensor_like(kept_pose_mask, kept)
+                    stitched_pose_masks.append(kept_pose_mask)
+
+                    reference_mask = ref_info["reference_image_mask"]
+                    if reference_mask is None:
+                        kept_reference_mask = torch.zeros_like(kept)
+                    else:
+                        kept_reference_mask = reference_mask[:1].detach().cpu().contiguous()
+                        kept_reference_mask = kept_reference_mask.repeat(int(kept.shape[0]), 1, 1, 1)
+                        kept_reference_mask = _resize_image_tensor_like(kept_reference_mask, kept)
+                    stitched_reference_masks.append(kept_reference_mask)
                 produced += int(kept.shape[0])
                 segment_kept += int(kept.shape[0])
                 remaining -= int(kept.shape[0])
@@ -970,6 +1046,14 @@ class SCAIL2ScheduledLongVideo:
             last_segment_reference = segment_reference
 
         frames = torch.cat(stitched, dim=0).contiguous().clamp(0, 1)
+        if stitched_pose_masks:
+            used_pose_video_mask = torch.cat(stitched_pose_masks, dim=0).contiguous().clamp(0, 1)
+        else:
+            used_pose_video_mask = torch.zeros_like(frames)
+        if stitched_reference_masks:
+            used_reference_mask_timeline = torch.cat(stitched_reference_masks, dim=0).contiguous().clamp(0, 1)
+        else:
+            used_reference_mask_timeline = torch.zeros_like(frames)
         summary = {
             "mode": mode,
             "width": int(width),
@@ -994,17 +1078,19 @@ class SCAIL2ScheduledLongVideo:
             },
             "chunks": chunk_summaries,
         }
-        return (frames, json.dumps(summary, indent=2))
+        return (frames, used_pose_video_mask, used_reference_mask_timeline, json.dumps(summary, indent=2))
 
 
 NODE_CLASS_MAPPINGS = {
     "SCAIL2SegmentPlanBuilder": SCAIL2SegmentPlanBuilder,
     "SCAIL2SegmentPlanner": SCAIL2SegmentPlanner,
+    "SCAIL2MultiReferenceColoredMask": SCAIL2MultiReferenceColoredMask,
     "SCAIL2ScheduledLongVideo": SCAIL2ScheduledLongVideo,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SCAIL2SegmentPlanBuilder": "SCAIL-2 Segment Plan Builder",
     "SCAIL2SegmentPlanner": "SCAIL-2 Segment Planner",
+    "SCAIL2MultiReferenceColoredMask": "SCAIL-2 Multi Reference Colored Mask",
     "SCAIL2ScheduledLongVideo": "SCAIL-2 Scheduled Long Video",
 }

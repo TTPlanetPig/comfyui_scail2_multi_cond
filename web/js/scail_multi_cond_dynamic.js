@@ -56,8 +56,19 @@ function updateSegmentBuilder(node) {
     resizeNode(node);
 }
 
-function referenceInputNumber(input) {
-    const match = /^reference_(\d+)$/.exec(input?.name ?? "");
+function referenceInputInfo(input) {
+    const match = /^reference_(\d+)(?:_mask)?$/.exec(input?.name ?? "");
+    if (!match) {
+        return null;
+    }
+    return {
+        number: Number(match[1]),
+        isMask: input.name.endsWith("_mask"),
+    };
+}
+
+function referenceTrackInputNumber(input) {
+    const match = /^reference_(\d+)_track_data$/.exec(input?.name ?? "");
     return match ? Number(match[1]) : null;
 }
 
@@ -69,20 +80,58 @@ function updateScheduledGenerator(node) {
     }
 
     for (let inputIndex = (node.inputs?.length ?? 0) - 1; inputIndex >= 0; inputIndex -= 1) {
-        const referenceNumber = referenceInputNumber(node.inputs[inputIndex]);
+        const referenceInfo = referenceInputInfo(node.inputs[inputIndex]);
+        if (referenceInfo !== null && referenceInfo.number > count) {
+            node.removeInput(inputIndex);
+        }
+    }
+
+    const existingImages = new Set();
+    const existingMasks = new Set();
+    for (const input of node.inputs ?? []) {
+        const referenceInfo = referenceInputInfo(input);
+        if (!referenceInfo) {
+            continue;
+        }
+        if (referenceInfo.isMask) {
+            existingMasks.add(referenceInfo.number);
+        } else {
+            existingImages.add(referenceInfo.number);
+        }
+    }
+    for (let index = 1; index <= count; index += 1) {
+        if (!existingImages.has(index)) {
+            node.addInput(`reference_${index}`, "IMAGE");
+        }
+        if (!existingMasks.has(index)) {
+            node.addInput(`reference_${index}_mask`, "IMAGE");
+        }
+    }
+    resizeNode(node);
+}
+
+function updateMultiReferenceMask(node) {
+    const countWidget = widgetByName(node, "reference_count");
+    const count = Math.max(1, Math.min(MAX_REFERENCES, Number(countWidget?.value ?? MAX_REFERENCES)));
+    if (countWidget) {
+        countWidget.value = count;
+    }
+
+    for (let inputIndex = (node.inputs?.length ?? 0) - 1; inputIndex >= 0; inputIndex -= 1) {
+        const referenceNumber = referenceTrackInputNumber(node.inputs[inputIndex]);
         if (referenceNumber !== null && referenceNumber > count) {
             node.removeInput(inputIndex);
         }
     }
 
-    const existing = new Set(
+    const existingTracks = new Set(
         (node.inputs ?? [])
-            .map(referenceInputNumber)
+            .map(referenceTrackInputNumber)
             .filter((value) => value !== null)
     );
     for (let index = 1; index <= count; index += 1) {
-        if (!existing.has(index)) {
-            node.addInput(`reference_${index}`, "IMAGE");
+        if (!existingTracks.has(index)) {
+            node.addInput(`reference_${index}_track_data`, "SAM3_TRACK_DATA");
         }
     }
     resizeNode(node);
@@ -125,6 +174,21 @@ app.registerExtension({
             nodeType.prototype.onConfigure = function () {
                 originalOnConfigure?.apply(this, arguments);
                 requestAnimationFrame(() => updateScheduledGenerator(this));
+            };
+        }
+
+        if (nodeData.name === "SCAIL2MultiReferenceColoredMask") {
+            const originalOnNodeCreated = nodeType.prototype.onNodeCreated;
+            nodeType.prototype.onNodeCreated = function () {
+                originalOnNodeCreated?.apply(this, arguments);
+                addUpdateButton(this, "Update reference track inputs", updateMultiReferenceMask);
+                updateMultiReferenceMask(this);
+            };
+
+            const originalOnConfigure = nodeType.prototype.onConfigure;
+            nodeType.prototype.onConfigure = function () {
+                originalOnConfigure?.apply(this, arguments);
+                requestAnimationFrame(() => updateMultiReferenceMask(this));
             };
         }
     },

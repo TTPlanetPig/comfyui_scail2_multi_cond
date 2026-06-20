@@ -34,6 +34,41 @@ Set `segment_count`, then click `Update segment inputs` to hide unused segment c
 Runs the scheduled generation by repeatedly calling native ComfyUI SCAIL2 nodes internally.
 
 Set `reference_count`, then click `Update reference inputs` to hide unused `reference_N` inputs.
+The same button also updates the matching `reference_N_mask` inputs.
+
+Recommended replacement setup:
+
+```text
+driving_track_data + reference_1_track_data -> Create SCAIL-2 Colored Mask
+                                           -> pose_video_mask + reference_1_mask
+
+driving_track_data + reference_2_track_data -> Create SCAIL-2 Colored Mask
+                                           -> pose_video_mask + reference_2_mask
+```
+
+Connect one shared `pose_video_mask` to the scheduler and connect each segment
+reference to its matching `reference_N_mask`. The scheduler does not run SAM or
+build colored masks internally; person selection stays in upstream SAM / SCAIL-2
+mask nodes where it can be previewed.
+
+The node also outputs `used_pose_video_mask` and `used_reference_mask_timeline`.
+Both are aligned to the final generated frame timeline after chunk overlap is
+discarded, so they can be previewed beside the generated video.
+
+### SCAIL-2 Multi Reference Colored Mask
+
+Builds SCAIL-2 colored masks for multiple reference tracks in one place.
+
+Connect one `driving_track_data`, set `reference_count`, and connect
+`reference_N_track_data` inputs. The node calls the native SCAIL-2 colored-mask
+logic for each connected reference and outputs:
+
+- `pose_video_mask`;
+- `reference_1_mask` through `reference_8_mask`;
+- `summary`.
+
+Set `reference_count`, then click `Update reference track inputs` to hide unused
+track-data inputs.
 
 ### SCAIL-2 Segment Planner
 
@@ -44,9 +79,12 @@ Debug/helper node. It prints the resolved segment and chunk plan before generati
 ```mermaid
 flowchart LR
     A[Driving video] --> B[SAM3 video track]
-    C[Reference images] --> D[SCAIL-2 Scheduled Long Video]
+    C[Reference images] --> R[SAM3 reference tracks]
+    B --> M[SCAIL-2 Multi Reference Colored Mask]
+    R --> M
+    C --> D[SCAIL-2 Scheduled Long Video]
+    M --> D
     E[Segment Plan Builder] --> D
-    B --> D
     D --> F[Generated frames]
     F --> G[Interpolation / Video Combine]
 ```
@@ -57,7 +95,7 @@ Inside each chunk:
 flowchart TD
     P[Prompt + negative] --> S[WanSCAILToVideo]
     R[Reference image + CLIP Vision] --> S
-    M[Reference / pose masks] --> S
+    M[Reference / pose masks from Create SCAIL-2 Colored Mask] --> S
     V[Previous frames] --> S
     S --> K[SamplerCustom]
     K --> D[VAEDecode]
@@ -132,11 +170,13 @@ The browser console should show:
 This package expects a recent ComfyUI build that includes:
 
 - `WanSCAILToVideo`;
-- `SCAIL2ColoredMask`;
-- `SAM3_VideoTrack`;
 - `SamplerCustom`;
 - `VAEDecode`;
 - `ColorTransfer`.
+
+Replacement workflows should use upstream ComfyUI nodes such as `SAM3_VideoTrack`
+and `Create SCAIL-2 Colored Mask` to prepare `pose_video_mask` and
+`reference_N_mask` before this scheduler node.
 
 The package itself does not depend on KJNodes. A workflow may still require KJNodes if it uses unrelated KJNodes nodes such as resize helpers.
 
