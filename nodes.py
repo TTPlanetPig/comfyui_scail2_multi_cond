@@ -1272,6 +1272,13 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
                 "overlap_frames": ("INT", {"default": 5, "min": 0, "max": 33, "step": 1}),
                 "reference_count": ("INT", {"default": 2, "min": 1, "max": MAX_REFERENCES, "step": 1}),
                 "color_correction": ("BOOLEAN", {"default": True}),
+                "memory_cleanup": (
+                    ["balanced", "aggressive", "off"],
+                    {
+                        "default": "balanced",
+                        "tooltip": "balanced keeps models warm between chunks; aggressive frees VRAM after every chunk; off only clears at the end.",
+                    },
+                ),
                 "object_indices": (
                     "STRING",
                     {
