@@ -66,6 +66,9 @@ tracks -> native SCAIL-2 colored masks -> scheduled long video generation
 
 Use this node when you want a simpler workflow. Use the external-mask scheduler
 when you want to preview or manually adjust SAM tracks/masks before generation.
+In `animation` mode, the node skips internal SAM tracking because SCAIL
+replacement masks are not used; `sam_model` and `sam_conditioning` are only
+required for `replacement` mode.
 
 The internal SAM node supports:
 

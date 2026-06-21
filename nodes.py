@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import hashlib
 import inspect
 import json
 from typing import Any, Optional
@@ -20,6 +21,11 @@ DEFAULT_PLAN = """# frames | reference | prompt | negative | boundary_overlap
 
 def _shape(value: Any) -> list[int]:
     return list(value.shape) if hasattr(value, "shape") else []
+
+
+def _stable_fingerprint(value: Any) -> str:
+    text = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _empty_cache(force: bool = False) -> None:
@@ -821,6 +827,17 @@ class SCAIL2ScheduledLongVideo:
     FUNCTION = "generate"
     CATEGORY = CATEGORY
 
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        fingerprint_inputs: dict[str, Any] = {}
+        for key in sorted(kwargs):
+            value = kwargs[key]
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                fingerprint_inputs[key] = value
+            else:
+                fingerprint_inputs[key] = type(value).__name__
+        return _stable_fingerprint(fingerprint_inputs)
+
     def generate(
         self,
         model,
@@ -1144,7 +1161,10 @@ class SCAIL2ScheduledLongVideo:
 class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
     @classmethod
     def INPUT_TYPES(cls):
-        optional = {}
+        optional = {
+            "sam_model": ("MODEL",),
+            "sam_conditioning": ("CONDITIONING",),
+        }
         for index in range(1, MAX_REFERENCES + 1):
             optional[f"reference_{index}"] = ("IMAGE",)
 
@@ -1157,8 +1177,6 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
                 "sigmas": ("SIGMAS",),
                 "clip_vision": ("CLIP_VISION",),
                 "pose_video": ("IMAGE",),
-                "sam_model": ("MODEL",),
-                "sam_conditioning": ("CONDITIONING",),
                 "segment_plan": ("STRING", {"default": DEFAULT_PLAN, "multiline": True}),
                 "seed": ("INT", {"default": 1, "min": 0, "max": 0xFFFFFFFFFFFFFFFF}),
                 "cfg": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 20.0, "step": 0.1}),
@@ -1213,8 +1231,6 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
         sigmas,
         clip_vision,
         pose_video: torch.Tensor,
-        sam_model,
-        sam_conditioning,
         segment_plan: str,
         seed: int,
         cfg: float,
@@ -1230,6 +1246,8 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
         sam_detection_threshold: float = 0.5,
         sam_max_objects: int = 2,
         sam_detect_interval: int = 2,
+        sam_model=None,
+        sam_conditioning=None,
         **kwargs,
     ):
         if not isinstance(pose_video, torch.Tensor) or pose_video.ndim != 4:
@@ -1251,6 +1269,42 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
         missing = [index for index in used_refs if index not in references]
         if missing:
             raise ValueError(f"segment_plan references missing image input(s): {missing}")
+
+        if not replacement_mode:
+            generate_kwargs: dict[str, Any] = {}
+            for index, image in references.items():
+                generate_kwargs[f"reference_{index}"] = image
+            frames, used_pose_video_mask, used_reference_mask_timeline, summary_text = super().generate(
+                model,
+                clip,
+                vae,
+                sampler,
+                sigmas,
+                clip_vision,
+                pose_video,
+                segment_plan,
+                seed,
+                cfg,
+                mode,
+                max_frames,
+                max_chunk_frames,
+                overlap_frames,
+                reference_count,
+                color_correction,
+                **generate_kwargs,
+            )
+            try:
+                summary = json.loads(summary_text)
+            except Exception:
+                summary = {"scheduled_summary": summary_text}
+            summary["internal_sam"] = {
+                "skipped": True,
+                "reason": "animation mode does not use SCAIL replacement masks",
+            }
+            return (frames, used_pose_video_mask, used_reference_mask_timeline, json.dumps(summary, indent=2))
+
+        if sam_model is None or sam_conditioning is None:
+            raise ValueError("replacement mode requires sam_model and sam_conditioning.")
 
         print(
             "[SCAIL2ScheduledLongVideoWithSAM] "
