@@ -80,13 +80,6 @@ def _empty_cache(force: bool = False) -> None:
             torch.cuda.empty_cache()
 
 
-def _cleanup_after_chunk(memory_cleanup: str) -> None:
-    if memory_cleanup == "aggressive":
-        _empty_cache(force=True)
-    elif memory_cleanup == "balanced":
-        _empty_cache(force=False)
-
-
 def _node_result(value: Any) -> tuple:
     if hasattr(value, "result"):
         result = value.result
@@ -861,13 +854,6 @@ class SCAIL2ScheduledLongVideo:
                 "overlap_frames": ("INT", {"default": 5, "min": 0, "max": 33, "step": 1}),
                 "reference_count": ("INT", {"default": 2, "min": 1, "max": MAX_REFERENCES, "step": 1}),
                 "color_correction": ("BOOLEAN", {"default": True}),
-                "memory_cleanup": (
-                    ["balanced", "aggressive", "off"],
-                    {
-                        "default": "balanced",
-                        "tooltip": "balanced keeps models warm between chunks; aggressive frees VRAM after every chunk; off only clears at the end.",
-                    },
-                ),
             },
             "optional": optional,
         }
@@ -906,7 +892,6 @@ class SCAIL2ScheduledLongVideo:
         overlap_frames: int,
         reference_count: int,
         color_correction: bool,
-        memory_cleanup: str = "balanced",
         pose_video_mask=None,
         **kwargs,
     ):
@@ -932,7 +917,6 @@ class SCAIL2ScheduledLongVideo:
                 "overlap_frames": int(overlap_frames),
                 "reference_count": int(reference_count),
                 "color_correction": bool(color_correction),
-                "memory_cleanup": memory_cleanup,
                 "pose_video_mask": _tensor_fingerprint(pose_video_mask),
                 "dynamic_inputs": _cache_marker(kwargs),
             }
@@ -951,7 +935,6 @@ class SCAIL2ScheduledLongVideo:
         requested_overlap = max(0, int(overlap_frames))
         overlap = 0 if requested_overlap == 0 else min(_floor_to_4n_plus_1(requested_overlap), 33, max_chunk_frames - 4)
         replacement_mode = mode == "replacement"
-        memory_cleanup = memory_cleanup if memory_cleanup in {"balanced", "aggressive", "off"} else "balanced"
         planned_chunks = _build_chunk_plan(segments, max_chunk_frames, overlap)
         planned_frames = sum(segment["frames"] for segment in segments)
         print(
@@ -1026,6 +1009,17 @@ class SCAIL2ScheduledLongVideo:
                 "reference_mask_shape": _shape(reference_mask),
             }
             return reference_cache[index]
+
+        prompt_pairs = sorted({(segment["prompt"], segment["negative"]) for segment in segments})
+        print(
+            "[SCAIL2ScheduledLongVideo] prewarm "
+            f"references={used_refs} prompt_pairs={len(prompt_pairs)}"
+        )
+        for index in used_refs:
+            get_reference(index)
+        for prompt, negative in prompt_pairs:
+            get_prompt(prompt, negative)
+        print("[SCAIL2ScheduledLongVideo] prewarm done")
 
         WanSCAILToVideo = _get_scail_nodes_module().WanSCAILToVideo
         stitched: list[torch.Tensor] = []
@@ -1200,7 +1194,6 @@ class SCAIL2ScheduledLongVideo:
                 )
                 chunk_index += 1
                 del decoded, kept, current_overlap, reference_overlap, scail_out, latent
-                _cleanup_after_chunk(memory_cleanup)
             last_segment_reference = segment_reference
 
         frames = torch.cat(stitched, dim=0).contiguous().clamp(0, 1)
@@ -1224,10 +1217,10 @@ class SCAIL2ScheduledLongVideo:
             "reference_count": int(active_reference_count),
             "cfg": float(cfg),
             "seed_start": int(seed),
-            "memory_cleanup": memory_cleanup,
             "segments": segments,
             "planned_chunks": planned_chunks,
             "references_used": used_refs,
+            "prewarmed_prompt_pairs": int(len(prompt_cache)),
             "reference_cache": {
                 str(index): {
                     "reference_shape": value["reference_shape"],
@@ -1272,13 +1265,6 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
                 "overlap_frames": ("INT", {"default": 5, "min": 0, "max": 33, "step": 1}),
                 "reference_count": ("INT", {"default": 2, "min": 1, "max": MAX_REFERENCES, "step": 1}),
                 "color_correction": ("BOOLEAN", {"default": True}),
-                "memory_cleanup": (
-                    ["balanced", "aggressive", "off"],
-                    {
-                        "default": "balanced",
-                        "tooltip": "balanced keeps models warm between chunks; aggressive frees VRAM after every chunk; off only clears at the end.",
-                    },
-                ),
                 "object_indices": (
                     "STRING",
                     {
@@ -1333,7 +1319,6 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
         overlap_frames: int,
         reference_count: int,
         color_correction: bool,
-        memory_cleanup: str = "balanced",
         object_indices: str = "",
         reference_object_indices: str = "",
         sort_by: str = "left_to_right",
@@ -1385,7 +1370,6 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
                 "overlap_frames": int(overlap_frames),
                 "reference_count": int(reference_count),
                 "color_correction": bool(color_correction),
-                "memory_cleanup": memory_cleanup,
                 "object_indices": object_indices,
                 "reference_object_indices": reference_object_indices,
                 "sort_by": sort_by,
@@ -1422,7 +1406,6 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
                 overlap_frames,
                 reference_count,
                 color_correction,
-                memory_cleanup,
                 **generate_kwargs,
             )
             try:
@@ -1520,7 +1503,6 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
             overlap_frames,
             reference_count,
             color_correction,
-            memory_cleanup,
             **generate_kwargs,
         )
         try:
@@ -1534,7 +1516,6 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
             "sam_detection_threshold": float(sam_detection_threshold),
             "sam_max_objects": int(sam_max_objects),
             "sam_detect_interval": int(sam_detect_interval),
-            "memory_cleanup": memory_cleanup,
             "references_tracked": track_summary,
             "pose_video_mask_shape": _shape(pose_video_mask),
         }
