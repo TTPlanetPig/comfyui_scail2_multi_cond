@@ -28,6 +28,42 @@ def _stable_fingerprint(value: Any) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def _tensor_fingerprint(value: Optional[torch.Tensor]) -> Any:
+    if value is None:
+        return None
+    if not isinstance(value, torch.Tensor):
+        return {"type": type(value).__name__}
+    data = value.detach()
+    marker: dict[str, Any] = {
+        "shape": list(data.shape),
+        "dtype": str(data.dtype),
+    }
+    if data.numel() == 0:
+        marker["sample"] = ""
+        return marker
+    flat = data.reshape(-1)
+    step = max(1, int(flat.numel()) // 4096)
+    sample = flat[::step][:4096].detach().cpu().float().contiguous()
+    marker["sample"] = hashlib.sha256(sample.numpy().tobytes()).hexdigest()
+    return marker
+
+
+def _cache_marker(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return _tensor_fingerprint(value)
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, dict):
+        return {str(key): _cache_marker(value[key]) for key in sorted(value, key=str)}
+    if isinstance(value, (list, tuple)):
+        return [_cache_marker(item) for item in value]
+    return {"type": type(value).__name__, "id": id(value)}
+
+
+def _clone_cached_result(result: tuple) -> tuple:
+    return tuple(result)
+
+
 def _empty_cache(force: bool = False) -> None:
     if force:
         gc.collect()
@@ -862,6 +898,35 @@ class SCAIL2ScheduledLongVideo:
         if not isinstance(pose_video, torch.Tensor) or pose_video.ndim != 4:
             raise ValueError("pose_video must be a ComfyUI IMAGE tensor.")
 
+        call_cache_key = _stable_fingerprint(
+            {
+                "node": "SCAIL2ScheduledLongVideo",
+                "model": _cache_marker(model),
+                "clip": _cache_marker(clip),
+                "vae": _cache_marker(vae),
+                "sampler": _cache_marker(sampler),
+                "sigmas": _cache_marker(sigmas),
+                "clip_vision": _cache_marker(clip_vision),
+                "pose_video": _tensor_fingerprint(pose_video),
+                "segment_plan": segment_plan,
+                "seed": int(seed),
+                "cfg": float(cfg),
+                "mode": mode,
+                "max_frames": int(max_frames),
+                "max_chunk_frames": int(max_chunk_frames),
+                "overlap_frames": int(overlap_frames),
+                "reference_count": int(reference_count),
+                "color_correction": bool(color_correction),
+                "pose_video_mask": _tensor_fingerprint(pose_video_mask),
+                "dynamic_inputs": _cache_marker(kwargs),
+            }
+        )
+        cached_key = getattr(self, "_last_generate_cache_key", None)
+        cached_result = getattr(self, "_last_generate_cache_result", None)
+        if cached_key == call_cache_key and cached_result is not None:
+            print("[SCAIL2ScheduledLongVideo] cache hit; returning previous result without sampling.")
+            return _clone_cached_result(cached_result)
+
         total_pose_frames = int(pose_video.shape[0])
         segments = _parse_plan(segment_plan, pose_frame_count=total_pose_frames, max_frames=max_frames)
         width, height = _infer_generation_size(pose_video)
@@ -1155,7 +1220,10 @@ class SCAIL2ScheduledLongVideo:
             },
             "chunks": chunk_summaries,
         }
-        return (frames, used_pose_video_mask, used_reference_mask_timeline, json.dumps(summary, indent=2))
+        result = (frames, used_pose_video_mask, used_reference_mask_timeline, json.dumps(summary, indent=2))
+        self._last_generate_cache_key = call_cache_key
+        self._last_generate_cache_result = _clone_cached_result(result)
+        return result
 
 
 class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
@@ -1270,6 +1338,42 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
         if missing:
             raise ValueError(f"segment_plan references missing image input(s): {missing}")
 
+        call_cache_key = _stable_fingerprint(
+            {
+                "node": "SCAIL2ScheduledLongVideoWithSAM",
+                "model": _cache_marker(model),
+                "clip": _cache_marker(clip),
+                "vae": _cache_marker(vae),
+                "sampler": _cache_marker(sampler),
+                "sigmas": _cache_marker(sigmas),
+                "clip_vision": _cache_marker(clip_vision),
+                "pose_video": _tensor_fingerprint(pose_video),
+                "sam_model": _cache_marker(sam_model),
+                "sam_conditioning": _cache_marker(sam_conditioning),
+                "segment_plan": segment_plan,
+                "seed": int(seed),
+                "cfg": float(cfg),
+                "mode": mode,
+                "max_frames": int(max_frames),
+                "max_chunk_frames": int(max_chunk_frames),
+                "overlap_frames": int(overlap_frames),
+                "reference_count": int(reference_count),
+                "color_correction": bool(color_correction),
+                "object_indices": object_indices,
+                "reference_object_indices": reference_object_indices,
+                "sort_by": sort_by,
+                "sam_detection_threshold": float(sam_detection_threshold),
+                "sam_max_objects": int(sam_max_objects),
+                "sam_detect_interval": int(sam_detect_interval),
+                "dynamic_inputs": _cache_marker(kwargs),
+            }
+        )
+        cached_key = getattr(self, "_last_internal_sam_cache_key", None)
+        cached_result = getattr(self, "_last_internal_sam_cache_result", None)
+        if cached_key == call_cache_key and cached_result is not None:
+            print("[SCAIL2ScheduledLongVideoWithSAM] cache hit; returning previous result without SAM tracking.")
+            return _clone_cached_result(cached_result)
+
         if not replacement_mode:
             generate_kwargs: dict[str, Any] = {}
             for index, image in references.items():
@@ -1301,7 +1405,10 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
                 "skipped": True,
                 "reason": "animation mode does not use SCAIL replacement masks",
             }
-            return (frames, used_pose_video_mask, used_reference_mask_timeline, json.dumps(summary, indent=2))
+            result = (frames, used_pose_video_mask, used_reference_mask_timeline, json.dumps(summary, indent=2))
+            self._last_internal_sam_cache_key = call_cache_key
+            self._last_internal_sam_cache_result = _clone_cached_result(result)
+            return result
 
         if sam_model is None or sam_conditioning is None:
             raise ValueError("replacement mode requires sam_model and sam_conditioning.")
@@ -1401,7 +1508,10 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
             "references_tracked": track_summary,
             "pose_video_mask_shape": _shape(pose_video_mask),
         }
-        return (frames, used_pose_video_mask, used_reference_mask_timeline, json.dumps(summary, indent=2))
+        result = (frames, used_pose_video_mask, used_reference_mask_timeline, json.dumps(summary, indent=2))
+        self._last_internal_sam_cache_key = call_cache_key
+        self._last_internal_sam_cache_result = _clone_cached_result(result)
+        return result
 
 
 NODE_CLASS_MAPPINGS = {
