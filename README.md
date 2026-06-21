@@ -15,6 +15,41 @@ This custom node package wraps the native SCAIL2 long-video pattern into a clean
 
 ## Nodes
 
+### VNCCS Aligned 3D White Model
+
+Creates a single 3D white-model pose reference image from one character/action
+reference image. The node discovers a registered VNCCS image node at runtime,
+calls it with the reference image, then aligns the returned white model back to
+the original canvas.
+
+Use it as an independent first-frame-reference helper:
+
+```text
+Load Image -> VNCCS Aligned 3D White Model -> Save Image
+```
+
+The output `white_model` keeps the same width and height as `reference_image`.
+The node detects the source person box from `source_mask` when connected, or
+from the reference image as a fallback, then scales and places the VNCCS white
+model to match the source person's size and position.
+
+Inputs:
+
+- `reference_image`: one source image with the action/pose to copy;
+- `alignment_mode`: `strict` keeps the detected position and scale, `balanced`
+  allows small in-canvas corrections;
+- `background`: `white`, `gray`, or `transparent`;
+- `fit_padding`: expands or contracts the detected person box;
+- `edge_cleanup`: softens the generated white-model matte;
+- `source_mask`: optional person mask for more accurate size and position
+  matching on complex backgrounds.
+
+Outputs:
+
+- `white_model`: aligned 3D white model image;
+- `alignment_preview`: reference and white model overlay with debug boxes;
+- `summary`: JSON with detected boxes, output shape, and VNCCS call details.
+
 ### SCAIL-2 Segment Plan Builder
 
 Use this node to create a segment plan without hand-writing JSON.

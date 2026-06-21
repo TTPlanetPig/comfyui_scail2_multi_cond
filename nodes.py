@@ -10,6 +10,7 @@ import torch
 
 
 CATEGORY = "SCAIL-2/Scheduled"
+VNCCS_CATEGORY = "SCAIL-2/VNCCS"
 MAX_REFERENCES = 8
 DEFAULT_PLAN = """# frames | reference | prompt | negative | boundary_overlap
 49 | 1 | first segment prompt | |
@@ -408,6 +409,403 @@ def _apply_reference_mask(reference_image: torch.Tensor, reference_image_mask: O
     return (reference_image[:1].detach() * alpha).contiguous()
 
 
+def _to_single_image(value: torch.Tensor, name: str) -> torch.Tensor:
+    if not isinstance(value, torch.Tensor) or value.ndim != 4:
+        raise ValueError(f"{name} must be a ComfyUI IMAGE tensor.")
+    if int(value.shape[0]) <= 0:
+        raise ValueError(f"{name} has no images.")
+    return value[:1].detach().cpu().float().clamp(0, 1).contiguous()
+
+
+def _mask_to_single(mask: Optional[torch.Tensor], height: int, width: int) -> Optional[torch.Tensor]:
+    if mask is None:
+        return None
+    if not isinstance(mask, torch.Tensor):
+        raise ValueError("source_mask must be a ComfyUI MASK tensor.")
+    value = mask[:1].detach().cpu().float()
+    if value.ndim == 4:
+        value = value[..., 0]
+    if value.ndim != 3:
+        raise ValueError("source_mask must have shape [B,H,W] or [B,H,W,C].")
+    if int(value.shape[1]) != int(height) or int(value.shape[2]) != int(width):
+        import torch.nn.functional as F
+
+        value = F.interpolate(
+            value.unsqueeze(1),
+            size=(int(height), int(width)),
+            mode="nearest",
+        ).squeeze(1)
+    return value[:1].clamp(0, 1).contiguous()
+
+
+def _border_background_color(image: torch.Tensor) -> torch.Tensor:
+    rgb = image[0, :, :, :3]
+    border = torch.cat([rgb[0, :, :], rgb[-1, :, :], rgb[:, 0, :], rgb[:, -1, :]], dim=0)
+    return border.median(dim=0).values
+
+
+def _foreground_mask_from_image(image: torch.Tensor, threshold: float = 0.08) -> torch.Tensor:
+    if int(image.shape[-1]) >= 4:
+        alpha_mask = image[:1, :, :, 3] > 0.05
+        if int(alpha_mask.sum().item()) > 8:
+            return alpha_mask.float().contiguous()
+
+    rgb = image[:1, :, :, :3]
+    background = _border_background_color(image).view(1, 1, 1, 3)
+    diff = (rgb - background).abs().amax(dim=-1)
+    mask = diff > float(threshold)
+    pixels = int(mask.numel())
+    active = int(mask.sum().item())
+    if active < max(8, pixels // 200) or active > int(pixels * 0.92):
+        luminance = rgb[..., 0] * 0.299 + rgb[..., 1] * 0.587 + rgb[..., 2] * 0.114
+        bg_luma = float((_border_background_color(image) * torch.tensor([0.299, 0.587, 0.114])).sum().item())
+        mask = (luminance - bg_luma).abs() > max(float(threshold) * 0.6, 0.035)
+    return mask.float().contiguous()
+
+
+def _bbox_from_mask(mask: torch.Tensor) -> Optional[tuple[int, int, int, int]]:
+    if mask.ndim == 4:
+        value = mask[0, :, :, 0]
+    elif mask.ndim == 3:
+        value = mask[0]
+    else:
+        raise ValueError("mask must have shape [B,H,W] or [B,H,W,C].")
+    coords = torch.nonzero(value > 0.05, as_tuple=False)
+    if int(coords.shape[0]) <= 0:
+        return None
+    y0 = int(coords[:, 0].min().item())
+    y1 = int(coords[:, 0].max().item()) + 1
+    x0 = int(coords[:, 1].min().item())
+    x1 = int(coords[:, 1].max().item()) + 1
+    return x0, y0, x1, y1
+
+
+def _clamp_bbox(bbox: tuple[int, int, int, int], width: int, height: int) -> tuple[int, int, int, int]:
+    x0, y0, x1, y1 = bbox
+    x0 = max(0, min(int(width) - 1, int(x0)))
+    y0 = max(0, min(int(height) - 1, int(y0)))
+    x1 = max(x0 + 1, min(int(width), int(x1)))
+    y1 = max(y0 + 1, min(int(height), int(y1)))
+    return x0, y0, x1, y1
+
+
+def _pad_bbox(
+    bbox: tuple[int, int, int, int],
+    width: int,
+    height: int,
+    padding: float,
+) -> tuple[int, int, int, int]:
+    x0, y0, x1, y1 = bbox
+    box_w = max(1, x1 - x0)
+    box_h = max(1, y1 - y0)
+    pad_x = int(round(box_w * float(padding)))
+    pad_y = int(round(box_h * float(padding)))
+    return _clamp_bbox((x0 - pad_x, y0 - pad_y, x1 + pad_x, y1 + pad_y), width, height)
+
+
+def _background_canvas(background: str, height: int, width: int, channels: int = 3) -> torch.Tensor:
+    value = 1.0 if background == "white" else 0.72 if background == "gray" else 0.0
+    canvas = torch.full((1, int(height), int(width), int(channels)), float(value), dtype=torch.float32)
+    if background == "transparent" and channels >= 4:
+        canvas[..., :3] = 1.0
+        canvas[..., 3:] = 0.0
+    return canvas
+
+
+def _resize_image(image: torch.Tensor, size: tuple[int, int], mode: str = "bilinear") -> torch.Tensor:
+    import torch.nn.functional as F
+
+    kwargs = {"align_corners": False} if mode in {"bilinear", "bicubic"} else {}
+    resized = F.interpolate(
+        image.movedim(-1, 1),
+        size=(int(size[0]), int(size[1])),
+        mode=mode,
+        **kwargs,
+    ).movedim(1, -1)
+    return resized.clamp(0, 1).contiguous()
+
+
+def _resize_mask(mask: torch.Tensor, size: tuple[int, int], edge_cleanup: bool) -> torch.Tensor:
+    import torch.nn.functional as F
+
+    value = mask.unsqueeze(1) if mask.ndim == 3 else mask.movedim(-1, 1)
+    resized = F.interpolate(value.float(), size=(int(size[0]), int(size[1])), mode="bilinear", align_corners=False)
+    if edge_cleanup:
+        resized = F.avg_pool2d((resized > 0.08).float(), kernel_size=3, stride=1, padding=1)
+    return resized.squeeze(1).clamp(0, 1).contiguous()
+
+
+def _draw_rect(image: torch.Tensor, bbox: tuple[int, int, int, int], color: tuple[float, float, float]) -> None:
+    _, height, width, _ = image.shape
+    x0, y0, x1, y1 = _clamp_bbox(bbox, int(width), int(height))
+    thickness = max(1, min(int(width), int(height)) // 160)
+    rgb = torch.tensor(color, dtype=image.dtype).view(1, 1, 3)
+    image[:, y0 : min(y0 + thickness, y1), x0:x1, :3] = rgb
+    image[:, max(y1 - thickness, y0) : y1, x0:x1, :3] = rgb
+    image[:, y0:y1, x0 : min(x0 + thickness, x1), :3] = rgb
+    image[:, y0:y1, max(x1 - thickness, x0) : x1, :3] = rgb
+
+
+def _default_from_input_spec(spec: Any) -> Any:
+    if not isinstance(spec, tuple) or not spec:
+        return None
+    input_type = spec[0]
+    options = spec[1] if len(spec) > 1 and isinstance(spec[1], dict) else {}
+    if "default" in options:
+        return options["default"]
+    if isinstance(input_type, list) and input_type:
+        return input_type[0]
+    if input_type == "BOOLEAN":
+        return False
+    if input_type == "INT":
+        return 0
+    if input_type == "FLOAT":
+        return 0.0
+    if input_type == "STRING":
+        return ""
+    return None
+
+
+def _vnccs_input_kwargs(
+    node_cls,
+    fn,
+    reference_image: torch.Tensor,
+    source_mask: Optional[torch.Tensor],
+    background: str,
+) -> tuple[dict[str, Any], list[str]]:
+    height = int(reference_image.shape[1])
+    width = int(reference_image.shape[2])
+    input_types = node_cls.INPUT_TYPES() if hasattr(node_cls, "INPUT_TYPES") else {}
+    specs: dict[str, Any] = {}
+    for group in ("required", "optional"):
+        values = input_types.get(group, {}) if isinstance(input_types, dict) else {}
+        if isinstance(values, dict):
+            specs.update(values)
+
+    params = inspect.signature(fn).parameters
+    accepts_kwargs = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values())
+    names = [name for name in params if name != "self"]
+    if accepts_kwargs and specs:
+        names = sorted(set(names).union(specs.keys()))
+
+    kwargs: dict[str, Any] = {}
+    unsupported: list[str] = []
+    positive_prompt = (
+        "single full body 3D white clay human mannequin, same pose as reference image, "
+        "same body scale, same location in frame, clean white model, no clothes, no texture"
+    )
+    negative_prompt = "different pose, different position, cropped body, extra limbs, clothing, texture, face details"
+    image_names = {
+        "image",
+        "images",
+        "input_image",
+        "reference_image",
+        "source_image",
+        "pose_image",
+        "person_image",
+        "control_image",
+    }
+    mask_names = {"mask", "source_mask", "reference_mask", "person_mask", "input_mask"}
+
+    for name in names:
+        if name == "self":
+            continue
+        lower = name.lower()
+        param = params.get(name)
+        spec = specs.get(name)
+        default = _default_from_input_spec(spec)
+        if lower in image_names or ("image" in lower and default is None):
+            kwargs[name] = reference_image
+        elif lower in mask_names or ("mask" in lower and source_mask is not None):
+            if source_mask is not None:
+                kwargs[name] = source_mask
+            elif default is not None:
+                kwargs[name] = default
+        elif lower in {"width", "w", "canvas_width", "target_width"}:
+            kwargs[name] = width
+        elif lower in {"height", "h", "canvas_height", "target_height"}:
+            kwargs[name] = height
+        elif "background" in lower or lower == "bg":
+            kwargs[name] = background
+        elif "negative" in lower:
+            kwargs[name] = negative_prompt
+        elif "prompt" in lower or "caption" in lower or "text" in lower:
+            kwargs[name] = positive_prompt
+        elif lower in {"seed", "noise_seed"}:
+            kwargs[name] = 1
+        elif lower in {"steps", "step"}:
+            kwargs[name] = default if default not in (None, 0) else 1
+        elif lower in {"cfg", "cfg_scale", "guidance", "guidance_scale"}:
+            kwargs[name] = default if default is not None else 1.0
+        elif default is not None:
+            kwargs[name] = default
+        elif param is None:
+            unsupported.append(name)
+        elif param.default is inspect._empty and param.kind not in (
+            inspect.Parameter.VAR_POSITIONAL,
+            inspect.Parameter.VAR_KEYWORD,
+        ):
+            unsupported.append(name)
+
+    return kwargs, unsupported
+
+
+def _find_vnccs_node_class():
+    try:
+        import nodes
+    except Exception as exc:
+        raise RuntimeError(f"ComfyUI nodes registry is unavailable: {exc}") from exc
+
+    mappings = getattr(nodes, "NODE_CLASS_MAPPINGS", {})
+    display_mappings = getattr(nodes, "NODE_DISPLAY_NAME_MAPPINGS", {})
+    candidates: list[tuple[int, str, Any]] = []
+    for name, node_cls in mappings.items():
+        if name == "VNCCSAligned3DWhiteModel":
+            continue
+        display_name = str(display_mappings.get(name, ""))
+        haystack = f"{name} {display_name} {getattr(node_cls, '__name__', '')}".lower()
+        if "vnccs" not in haystack:
+            continue
+        return_types = tuple(getattr(node_cls, "RETURN_TYPES", ()) or ())
+        if return_types and "IMAGE" not in return_types:
+            continue
+        priority = 0 if "white" in haystack or "3d" in haystack or "model" in haystack else 1
+        candidates.append((priority, name, node_cls))
+
+    if not candidates:
+        available = sorted(name for name in mappings if "vnccs" in str(name).lower())
+        raise RuntimeError(
+            "No compatible VNCCS IMAGE node was found in ComfyUI NODE_CLASS_MAPPINGS. "
+            f"Registered VNCCS-like nodes: {available}"
+        )
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    return candidates[0][1], candidates[0][2]
+
+
+def _run_vnccs_white_model(
+    reference_image: torch.Tensor,
+    source_mask: Optional[torch.Tensor],
+    background: str,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    node_name, node_cls = _find_vnccs_node_class()
+    node = node_cls()
+    function_name = getattr(node, "FUNCTION", getattr(node_cls, "FUNCTION", None))
+    if not function_name or not hasattr(node, function_name):
+        raise RuntimeError(f"VNCCS node {node_name} does not expose a callable FUNCTION.")
+    fn = getattr(node, function_name)
+    kwargs, unsupported = _vnccs_input_kwargs(node_cls, fn, reference_image, source_mask, background)
+    if unsupported:
+        raise RuntimeError(
+            f"VNCCS node {node_name} has unsupported required input(s): {unsupported}. "
+            "Use a VNCCS node whose required inputs can be satisfied by a reference IMAGE, optional MASK, "
+            "canvas width/height, prompt text, seed, steps, cfg, and background."
+        )
+    result = _node_result(fn(**kwargs))
+    image = next((value for value in result if isinstance(value, torch.Tensor) and value.ndim == 4), None)
+    if image is None:
+        raise RuntimeError(f"VNCCS node {node_name} did not return an IMAGE tensor.")
+    return _to_single_image(image, "vnccs_output"), {"node": node_name, "function": function_name, "kwargs": sorted(kwargs)}
+
+
+def _align_white_model_to_reference(
+    reference_image: torch.Tensor,
+    raw_white_model: torch.Tensor,
+    source_mask: Optional[torch.Tensor],
+    alignment_mode: str,
+    background: str,
+    fit_padding: float,
+    edge_cleanup: bool,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+    reference = _to_single_image(reference_image, "reference_image")
+    raw = _to_single_image(raw_white_model, "raw_white_model")
+    height = int(reference.shape[1])
+    width = int(reference.shape[2])
+    source_mask = _mask_to_single(source_mask, height, width)
+
+    if source_mask is not None:
+        source_foreground = source_mask
+        source_reason = "source_mask"
+    else:
+        source_foreground = _foreground_mask_from_image(reference)
+        source_reason = "reference_image_heuristic"
+    source_bbox = _bbox_from_mask(source_foreground)
+    if source_bbox is None:
+        source_bbox = (0, 0, width, height)
+        source_reason = "full_canvas_fallback"
+    source_bbox = _pad_bbox(source_bbox, width, height, float(fit_padding))
+
+    raw_mask = _foreground_mask_from_image(raw, threshold=0.04)
+    raw_bbox = _bbox_from_mask(raw_mask)
+    raw_height = int(raw.shape[1])
+    raw_width = int(raw.shape[2])
+    if raw_bbox is None:
+        raw_bbox = (0, 0, raw_width, raw_height)
+        raw_reason = "full_canvas_fallback"
+    else:
+        raw_reason = "vnccs_output_heuristic"
+    raw_bbox = _clamp_bbox(raw_bbox, raw_width, raw_height)
+
+    sx0, sy0, sx1, sy1 = source_bbox
+    rx0, ry0, rx1, ry1 = raw_bbox
+    target_w = max(1, sx1 - sx0)
+    target_h = max(1, sy1 - sy0)
+    if alignment_mode == "balanced":
+        sx0 = max(0, min(width - target_w, sx0))
+        sy0 = max(0, min(height - target_h, sy0))
+        sx1 = sx0 + target_w
+        sy1 = sy0 + target_h
+        source_bbox = (sx0, sy0, sx1, sy1)
+
+    crop = raw[:, ry0:ry1, rx0:rx1, :]
+    crop_mask = raw_mask[:, ry0:ry1, rx0:rx1]
+    if int(crop.shape[1]) <= 0 or int(crop.shape[2]) <= 0:
+        crop = raw
+        crop_mask = raw_mask
+
+    resized_crop = _resize_image(crop[..., :3], (target_h, target_w), mode="bilinear")
+    resized_mask = _resize_mask(crop_mask, (target_h, target_w), bool(edge_cleanup)).unsqueeze(-1)
+    if float(resized_mask.max().item()) <= 0.05:
+        resized_mask = torch.ones((1, target_h, target_w, 1), dtype=torch.float32)
+
+    output_channels = 4 if background == "transparent" else 3
+    output = _background_canvas(background, height, width, output_channels)
+    if output_channels == 4:
+        output[:, sy0:sy1, sx0:sx1, :3] = torch.lerp(
+            output[:, sy0:sy1, sx0:sx1, :3], resized_crop, resized_mask
+        )
+        output[:, sy0:sy1, sx0:sx1, 3:] = torch.maximum(output[:, sy0:sy1, sx0:sx1, 3:], resized_mask)
+    else:
+        output[:, sy0:sy1, sx0:sx1, :3] = torch.lerp(
+            output[:, sy0:sy1, sx0:sx1, :3], resized_crop, resized_mask
+        )
+
+    preview = reference[..., :3].clone()
+    overlay = output[..., :3].clone()
+    preview = torch.lerp(preview, overlay, 0.35).clamp(0, 1)
+    output_mask = _foreground_mask_from_image(output[..., :3], threshold=0.04)
+    output_bbox = _bbox_from_mask(output_mask) or source_bbox
+    _draw_rect(preview, source_bbox, (0.0, 1.0, 0.0))
+    _draw_rect(preview, (sx0, sy0, sx1, sy1), (1.0, 0.2, 0.2))
+    _draw_rect(preview, output_bbox, (0.1, 0.35, 1.0))
+
+    summary = {
+        "input_shape": _shape(reference),
+        "vnccs_output_shape": _shape(raw),
+        "output_shape": _shape(output),
+        "alignment_mode": alignment_mode,
+        "background": background,
+        "fit_padding": float(fit_padding),
+        "source_bbox": list(source_bbox),
+        "source_bbox_reason": source_reason,
+        "raw_white_model_bbox": list(raw_bbox),
+        "raw_white_model_bbox_reason": raw_reason,
+        "target_bbox": [int(sx0), int(sy0), int(sx1), int(sy1)],
+        "output_bbox": list(output_bbox),
+        "edge_cleanup": bool(edge_cleanup),
+    }
+    return output.contiguous().clamp(0, 1), preview.contiguous().clamp(0, 1), summary
+
+
 def _resize_image_tensor_like(image: torch.Tensor, target: torch.Tensor, *, mode: str = "nearest") -> torch.Tensor:
     if list(image.shape[1:3]) == list(target.shape[1:3]):
         return image
@@ -597,6 +995,69 @@ def _match_chunk_color_like_original(
     fallback["method"] = "fallback_rgb_overlap"
     fallback["fallback_reason"] = fallback_reason
     return corrected, fallback
+
+
+class VNCCSAligned3DWhiteModel:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "reference_image": ("IMAGE",),
+                "alignment_mode": (["strict", "balanced"], {"default": "strict"}),
+                "background": (["white", "gray", "transparent"], {"default": "white"}),
+                "fit_padding": ("FLOAT", {"default": 0.0, "min": -0.5, "max": 0.5, "step": 0.01}),
+                "edge_cleanup": ("BOOLEAN", {"default": True}),
+            },
+            "optional": {
+                "source_mask": ("MASK",),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "IMAGE", "STRING")
+    RETURN_NAMES = ("white_model", "alignment_preview", "summary")
+    FUNCTION = "generate"
+    CATEGORY = VNCCS_CATEGORY
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        fingerprint_inputs: dict[str, Any] = {}
+        for key in sorted(kwargs):
+            value = kwargs[key]
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                fingerprint_inputs[key] = value
+            else:
+                fingerprint_inputs[key] = type(value).__name__
+        return _stable_fingerprint(fingerprint_inputs)
+
+    def generate(
+        self,
+        reference_image: torch.Tensor,
+        alignment_mode: str = "strict",
+        background: str = "white",
+        fit_padding: float = 0.0,
+        edge_cleanup: bool = True,
+        source_mask: Optional[torch.Tensor] = None,
+    ):
+        reference = _to_single_image(reference_image, "reference_image")
+        height = int(reference.shape[1])
+        width = int(reference.shape[2])
+        normalized_mask = _mask_to_single(source_mask, height, width)
+        raw_white_model, vnccs_summary = _run_vnccs_white_model(reference, normalized_mask, background)
+        white_model, alignment_preview, summary = _align_white_model_to_reference(
+            reference,
+            raw_white_model,
+            normalized_mask,
+            str(alignment_mode),
+            str(background),
+            float(fit_padding),
+            bool(edge_cleanup),
+        )
+        summary["vnccs"] = vnccs_summary
+        summary["note"] = (
+            "white_model keeps the reference_image canvas size and aligns the VNCCS 3D white model "
+            "to the detected reference person bbox."
+        )
+        return (white_model, alignment_preview, json.dumps(summary, indent=2))
 
 
 class SCAIL2SegmentPlanner:
@@ -1526,6 +1987,7 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
 
 
 NODE_CLASS_MAPPINGS = {
+    "VNCCSAligned3DWhiteModel": VNCCSAligned3DWhiteModel,
     "SCAIL2SegmentPlanBuilder": SCAIL2SegmentPlanBuilder,
     "SCAIL2SegmentPlanner": SCAIL2SegmentPlanner,
     "SCAIL2MultiReferenceColoredMask": SCAIL2MultiReferenceColoredMask,
@@ -1534,6 +1996,7 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "VNCCSAligned3DWhiteModel": "VNCCS Aligned 3D White Model",
     "SCAIL2SegmentPlanBuilder": "SCAIL-2 Segment Plan Builder",
     "SCAIL2SegmentPlanner": "SCAIL-2 Segment Planner",
     "SCAIL2MultiReferenceColoredMask": "SCAIL-2 Multi Reference Colored Mask",
