@@ -1,0 +1,15 @@
+[project]
+name = "comfyui_scail2_multi_cond"
+description = "Multi-reference and scheduled SCAIL-2 workflow helpers for ComfyUI."
+version = "1.0.0"
+license = { text = "MIT" }
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/TTPlanetPig/comfyui_scail2_multi_cond"
+#  Used by Comfy Registry https://comfyregistry.org
+
+[tool.comfy]
+PublisherId = "ttplanet"
+DisplayName = "ComfyUI SCAIL2 Multi Cond"
+Icon = "🪐"
