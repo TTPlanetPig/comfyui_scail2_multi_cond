@@ -659,6 +659,7 @@ def _save_keyframe_matrix_images(
     summary: str,
     filename_prefix: str,
     save_location: str,
+    display_group: str = "both",
 ) -> dict[str, Any]:
     import os
 
@@ -683,6 +684,15 @@ def _save_keyframe_matrix_images(
         raise ValueError(
             f"paired_keyframes count ({int(images.shape[0])}) does not match manifest count ({len(manifest)})."
         )
+    normalized_display_group = str(display_group or "both").strip() or "both"
+    allowed_kinds_by_group = {
+        "both": None,
+        "overlap_boundary_only": {"boundary_anchor", "final_anchor"},
+        "new_chunk_start_only": {"new_chunk_start"},
+    }
+    if normalized_display_group not in allowed_kinds_by_group:
+        normalized_display_group = "both"
+    allowed_kinds = allowed_kinds_by_group[normalized_display_group]
 
     location = "output" if str(save_location or "").strip() == "output" else "temp"
     base_dir = folder_paths.get_output_directory() if location == "output" else folder_paths.get_temp_directory()
@@ -701,6 +711,9 @@ def _save_keyframe_matrix_images(
 
     items: list[dict[str, Any]] = []
     for index, row in enumerate(manifest):
+        row_kind = str(row.get("kind", "keyframe"))
+        if allowed_kinds is not None and row_kind not in allowed_kinds:
+            continue
         frame = images[index].detach().cpu().float().clamp(0, 1)
         if int(frame.shape[-1]) > 3:
             frame = frame[..., :3]
@@ -719,7 +732,7 @@ def _save_keyframe_matrix_images(
             "batch_index": int(index),
             "chunk_index": chunk_index,
             "chunk_number_1_based": chunk_number,
-            "kind": str(row.get("kind", "keyframe")),
+            "kind": row_kind,
             "frame_1_based": frame_number,
             "frame_0_based": int(row.get("frame_0_based", frame_number - 1)),
             "output_range_1_based_inclusive": row.get("output_range_1_based_inclusive"),
@@ -736,6 +749,7 @@ def _save_keyframe_matrix_images(
         "type": location,
         "subfolder": subfolder,
         "filename_prefix": prefix,
+        "display_group": normalized_display_group,
     }
 
 
@@ -2075,6 +2089,10 @@ class SCAIL2KeyframeMatrixViewer:
                 "summary": ("STRING", {"default": "", "multiline": True, "forceInput": True}),
                 "filename_prefix": ("STRING", {"default": "scail_keyframe"}),
                 "save_location": (["temp", "output", ""], {"default": "temp"}),
+                "display_group": (
+                    ["both", "overlap_boundary_only", "new_chunk_start_only", ""],
+                    {"default": "both"},
+                ),
             }
         }
 
@@ -2089,12 +2107,14 @@ class SCAIL2KeyframeMatrixViewer:
         summary: str,
         filename_prefix: str = "scail_keyframe",
         save_location: str = "temp",
+        display_group: str = "both",
     ):
         matrix = _save_keyframe_matrix_images(
             paired_keyframes,
             summary,
             filename_prefix,
             save_location,
+            display_group,
         )
         return {
             "ui": {
