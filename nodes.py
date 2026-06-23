@@ -2094,8 +2094,9 @@ class SCAIL2KeyframeMatrixViewer:
         return {
             "ui": {
                 "images": matrix["items"],
-                "scail_keyframe_matrix": matrix,
+                "scail_keyframe_matrix": [matrix],
                 "scail_keyframe_matrix_list": [matrix],
+                "scail_keyframe_matrix_json": [json.dumps(matrix)],
             }
         }
 

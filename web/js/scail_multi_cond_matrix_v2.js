@@ -47,6 +47,14 @@ function normalizeItem(item, index) {
 
 function normalizePayload(payload) {
     let value = payload;
+    if (
+        Array.isArray(value) &&
+        value.every((item) => typeof item === "string") &&
+        value.includes("items") &&
+        value.includes("count")
+    ) {
+        return { items: [] };
+    }
     if (Array.isArray(value) && value.length === 1 && Array.isArray(value[0]?.items)) {
         value = value[0];
     }
@@ -216,17 +224,27 @@ function render(node, payload) {
 }
 
 function extractPayload(message) {
-    return (
-        message?.scail_keyframe_matrix ??
-        message?.scail_keyframe_matrix_list ??
-        message?.ui?.scail_keyframe_matrix ??
-        message?.ui?.scail_keyframe_matrix_list ??
-        message?.output?.scail_keyframe_matrix ??
-        message?.output?.scail_keyframe_matrix_list ??
-        message?.images ??
-        message?.ui?.images ??
-        message?.output?.images
-    );
+    const candidates = [
+        message?.scail_keyframe_matrix,
+        message?.scail_keyframe_matrix_json,
+        message?.scail_keyframe_matrix_list,
+        message?.ui?.scail_keyframe_matrix,
+        message?.ui?.scail_keyframe_matrix_json,
+        message?.ui?.scail_keyframe_matrix_list,
+        message?.output?.scail_keyframe_matrix,
+        message?.output?.scail_keyframe_matrix_json,
+        message?.output?.scail_keyframe_matrix_list,
+        message?.images,
+        message?.ui?.images,
+        message?.output?.images,
+    ];
+    for (const candidate of candidates) {
+        const normalized = normalizePayload(candidate);
+        if (normalized.items.length) {
+            return candidate;
+        }
+    }
+    return candidates.find((candidate) => candidate !== undefined && candidate !== null);
 }
 
 app.registerExtension({

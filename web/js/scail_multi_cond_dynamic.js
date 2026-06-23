@@ -270,6 +270,14 @@ function normalizeMatrixItem(item, index) {
 
 function normalizeMatrixPayload(payload) {
     let value = payload;
+    if (
+        Array.isArray(value) &&
+        value.every((item) => typeof item === "string") &&
+        value.includes("items") &&
+        value.includes("count")
+    ) {
+        return { items: [] };
+    }
     if (Array.isArray(value) && value.length === 1 && Array.isArray(value[0]?.items)) {
         value = value[0];
     }
@@ -517,16 +525,21 @@ app.registerExtension({
             const originalOnExecuted = nodeType.prototype.onExecuted;
             nodeType.prototype.onExecuted = function (message) {
                 originalOnExecuted?.apply(this, arguments);
-                const matrix =
-                    message?.scail_keyframe_matrix ??
-                    message?.scail_keyframe_matrix_list ??
-                    message?.ui?.scail_keyframe_matrix ??
-                    message?.ui?.scail_keyframe_matrix_list ??
-                    message?.output?.scail_keyframe_matrix ??
-                    message?.output?.scail_keyframe_matrix_list ??
-                    message?.images ??
-                    message?.ui?.images ??
-                    message?.output?.images;
+                const candidates = [
+                    message?.scail_keyframe_matrix,
+                    message?.scail_keyframe_matrix_json,
+                    message?.scail_keyframe_matrix_list,
+                    message?.ui?.scail_keyframe_matrix,
+                    message?.ui?.scail_keyframe_matrix_json,
+                    message?.ui?.scail_keyframe_matrix_list,
+                    message?.output?.scail_keyframe_matrix,
+                    message?.output?.scail_keyframe_matrix_json,
+                    message?.output?.scail_keyframe_matrix_list,
+                    message?.images,
+                    message?.ui?.images,
+                    message?.output?.images,
+                ];
+                const matrix = candidates.find((candidate) => normalizeMatrixPayload(candidate).items.length);
                 if (matrix !== undefined && matrix !== null) {
                     renderMatrix(this, normalizeMatrixPayload(matrix));
                 }
