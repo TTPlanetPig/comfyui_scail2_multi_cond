@@ -2091,7 +2091,7 @@ class SCAIL2KeyframeMatrixViewer:
             filename_prefix,
             save_location,
         )
-        return {"ui": {"scail_keyframe_matrix": matrix}}
+        return {"ui": {"scail_keyframe_matrix": matrix, "scail_keyframe_matrix_list": [matrix]}}
 
 
 NODE_CLASS_MAPPINGS = {

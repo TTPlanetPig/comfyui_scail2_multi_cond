@@ -237,6 +237,30 @@ function matrixImageUrl(item) {
     return api.apiURL(`/view?${params.toString()}`);
 }
 
+function normalizeMatrixPayload(payload) {
+    let value = payload;
+    if (Array.isArray(value)) {
+        value = value[0];
+    }
+    if (typeof value === "string") {
+        try {
+            value = JSON.parse(value);
+        } catch {
+            return { items: [] };
+        }
+    }
+    if (value?.matrix) {
+        value = value.matrix;
+    }
+    if (Array.isArray(value?.items)) {
+        return value;
+    }
+    if (Array.isArray(value)) {
+        return { items: value };
+    }
+    return { ...(value ?? {}), items: [] };
+}
+
 function ensureMatrixWidget(node) {
     if (node.scailMatrixContainer) {
         return node.scailMatrixContainer;
@@ -277,7 +301,8 @@ function ensureMatrixWidget(node) {
 
 function renderMatrix(node, matrix) {
     const container = ensureMatrixWidget(node);
-    const items = Array.isArray(matrix?.items) ? matrix.items : [];
+    const normalizedMatrix = normalizeMatrixPayload(matrix);
+    const items = Array.isArray(normalizedMatrix?.items) ? normalizedMatrix.items : [];
     container.replaceChildren();
 
     const header = document.createElement("div");
@@ -461,9 +486,14 @@ app.registerExtension({
             const originalOnExecuted = nodeType.prototype.onExecuted;
             nodeType.prototype.onExecuted = function (message) {
                 originalOnExecuted?.apply(this, arguments);
-                const matrix = message?.scail_keyframe_matrix ?? message?.ui?.scail_keyframe_matrix;
-                if (matrix) {
-                    renderMatrix(this, matrix);
+                const matrix =
+                    message?.scail_keyframe_matrix ??
+                    message?.scail_keyframe_matrix_list ??
+                    message?.ui?.scail_keyframe_matrix ??
+                    message?.ui?.scail_keyframe_matrix_list ??
+                    message?.output?.scail_keyframe_matrix;
+                if (matrix !== undefined && matrix !== null) {
+                    renderMatrix(this, normalizeMatrixPayload(matrix));
                 }
             };
         }
