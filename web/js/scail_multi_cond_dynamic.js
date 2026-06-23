@@ -255,16 +255,25 @@ function normalizeMatrixItem(item, index) {
     const image = item?.image ?? item;
     const filename = image?.filename ?? (typeof image === "string" ? image : "");
     const frameMatch = /frame(\d+)/i.exec(filename);
+    const rawChunkIndex = item?.chunk_index;
+    const chunkNumber = item?.chunk_number_1_based ?? (Number.isFinite(Number(rawChunkIndex)) ? Number(rawChunkIndex) + 1 : "-");
+    const frame = item?.frame_1_based ?? (frameMatch ? Number(frameMatch[1]) : null);
     return {
         ...(typeof item === "object" && item !== null ? item : {}),
         filename,
         subfolder: image?.subfolder ?? item?.subfolder ?? "",
         type: image?.type ?? item?.type ?? "temp",
         batch_index: item?.batch_index ?? item?.index ?? index,
-        chunk_index: item?.chunk_index ?? "-",
+        chunk_index: rawChunkIndex ?? "-",
+        chunk_number_1_based: chunkNumber,
         kind: item?.kind ?? "image",
-        frame_1_based: item?.frame_1_based ?? (frameMatch ? Number(frameMatch[1]) : null),
+        frame_1_based: frame,
         output_range_1_based_inclusive: item?.output_range_1_based_inclusive,
+        label:
+            item?.label ??
+            `${String(item?.batch_index ?? item?.index ?? index).padStart(3, "0")} | chunk ${chunkNumber} | ${
+                item?.kind ?? "image"
+            }${frame ? ` | frame ${frame}` : ""}`,
     };
 }
 
@@ -397,7 +406,7 @@ function renderMatrix(node, matrix) {
         const body = document.createElement("div");
         body.style.cssText = "padding:7px;";
         const name = document.createElement("div");
-        name.textContent = `${String(item.batch_index).padStart(3, "0")} | chunk ${item.chunk_index} | ${item.kind}`;
+        name.textContent = item.label;
         name.style.cssText = "font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;";
         const frame = document.createElement("div");
         frame.textContent = item.frame_1_based ? `frame ${item.frame_1_based}` : item.filename;

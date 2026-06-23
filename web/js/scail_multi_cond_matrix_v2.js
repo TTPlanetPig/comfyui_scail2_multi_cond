@@ -28,20 +28,25 @@ function normalizeItem(item, index) {
     const filename = image?.filename ?? (typeof image === "string" ? image : "");
     const frameMatch = /frame(\d+)/i.exec(filename);
     const batchIndex = item?.batch_index ?? item?.index ?? index;
-    const chunkIndex = item?.chunk_index ?? "-";
+    const rawChunkIndex = item?.chunk_index;
+    const chunkNumber = item?.chunk_number_1_based ?? (Number.isFinite(Number(rawChunkIndex)) ? Number(rawChunkIndex) + 1 : "-");
     const kind = item?.kind ?? "image";
     const frame = item?.frame_1_based ?? (frameMatch ? Number(frameMatch[1]) : null);
+    const fallbackLabel = `${String(batchIndex).padStart(3, "0")} | chunk ${chunkNumber} | ${kind}${
+        frame ? ` | frame ${frame}` : ""
+    }`;
     return {
         ...(typeof item === "object" && item !== null ? item : {}),
         filename,
         subfolder: image?.subfolder ?? item?.subfolder ?? "",
         type: image?.type ?? item?.type ?? "temp",
         batch_index: batchIndex,
-        chunk_index: chunkIndex,
+        chunk_index: rawChunkIndex ?? "-",
+        chunk_number_1_based: chunkNumber,
         kind,
         frame_1_based: frame,
         output_range_1_based_inclusive: item?.output_range_1_based_inclusive,
-        label: item?.label ?? `${String(batchIndex).padStart(3, "0")} | chunk ${chunkIndex} | ${kind}`,
+        label: item?.label ?? fallbackLabel,
     };
 }
 

@@ -558,7 +558,7 @@ def _build_keyframe_contact_sheet(
         col = index % columns
         boundary_row = group * 2
         start_row = boundary_row + 1
-        chunk_number = int(row["chunk_index"])
+        chunk_number = int(row["chunk_index"]) + 1
         output_range = row["output_range_1_based_inclusive"]
         draw_cell(
             boundary_anchor_frames[index],
@@ -609,6 +609,7 @@ def _build_paired_keyframes(
             {
                 "batch_index": len(manifest),
                 "chunk_index": int(row["chunk_index"]),
+                "chunk_number_1_based": int(row["chunk_index"]) + 1,
                 "kind": "boundary_anchor",
                 "frame_0_based": int(row["boundary_anchor_frame_0_based"]),
                 "frame_1_based": int(row["boundary_anchor_frame_1_based"]),
@@ -620,6 +621,7 @@ def _build_paired_keyframes(
             {
                 "batch_index": len(manifest),
                 "chunk_index": int(row["chunk_index"]),
+                "chunk_number_1_based": int(row["chunk_index"]) + 1,
                 "kind": "new_chunk_start",
                 "frame_0_based": int(row["new_chunk_start_frame_0_based"]),
                 "frame_1_based": int(row["new_chunk_start_frame_1_based"]),
@@ -634,6 +636,7 @@ def _build_paired_keyframes(
             {
                 "batch_index": len(manifest),
                 "chunk_index": int(rows[-1]["chunk_index"]),
+                "chunk_number_1_based": int(rows[-1]["chunk_index"]) + 1,
                 "kind": "final_anchor",
                 "frame_0_based": final_frame - 1,
                 "frame_1_based": final_frame,
@@ -708,12 +711,14 @@ def _save_keyframe_matrix_images(
 
         kind = _matrix_safe_filename_part(row.get("kind", "keyframe"))
         chunk_index = int(row.get("chunk_index", 0))
+        chunk_number = int(row.get("chunk_number_1_based", chunk_index + 1))
         frame_number = int(row.get("frame_1_based", index + 1))
         filename = f"{prefix}_{fingerprint}_{index:03d}_chunk{chunk_index}_{kind}_frame{frame_number}.png"
         image.save(os.path.join(target_dir, filename))
         item = {
             "batch_index": int(index),
             "chunk_index": chunk_index,
+            "chunk_number_1_based": chunk_number,
             "kind": str(row.get("kind", "keyframe")),
             "frame_1_based": frame_number,
             "frame_0_based": int(row.get("frame_0_based", frame_number - 1)),
@@ -722,7 +727,7 @@ def _save_keyframe_matrix_images(
             "subfolder": subfolder,
             "type": location,
         }
-        item["label"] = f"{index:03d} | chunk {chunk_index} | {item['kind']} | frame {frame_number}"
+        item["label"] = f"{index:03d} | chunk {chunk_number} | {item['kind']} | frame {frame_number}"
         items.append(item)
 
     return {
