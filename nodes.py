@@ -711,19 +711,19 @@ def _save_keyframe_matrix_images(
         frame_number = int(row.get("frame_1_based", index + 1))
         filename = f"{prefix}_{fingerprint}_{index:03d}_chunk{chunk_index}_{kind}_frame{frame_number}.png"
         image.save(os.path.join(target_dir, filename))
-        items.append(
-            {
-                "batch_index": int(index),
-                "chunk_index": chunk_index,
-                "kind": str(row.get("kind", "keyframe")),
-                "frame_1_based": frame_number,
-                "frame_0_based": int(row.get("frame_0_based", frame_number - 1)),
-                "output_range_1_based_inclusive": row.get("output_range_1_based_inclusive"),
-                "filename": filename,
-                "subfolder": subfolder,
-                "type": location,
-            }
-        )
+        item = {
+            "batch_index": int(index),
+            "chunk_index": chunk_index,
+            "kind": str(row.get("kind", "keyframe")),
+            "frame_1_based": frame_number,
+            "frame_0_based": int(row.get("frame_0_based", frame_number - 1)),
+            "output_range_1_based_inclusive": row.get("output_range_1_based_inclusive"),
+            "filename": filename,
+            "subfolder": subfolder,
+            "type": location,
+        }
+        item["label"] = f"{index:03d} | chunk {chunk_index} | {item['kind']} | frame {frame_number}"
+        items.append(item)
 
     return {
         "items": items,
