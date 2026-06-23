@@ -617,7 +617,7 @@ def _save_keyframe_matrix_images(
             f"paired_keyframes count ({int(images.shape[0])}) does not match manifest count ({len(manifest)})."
         )
 
-    location = "output" if str(save_location) == "output" else "temp"
+    location = "output" if str(save_location or "").strip() == "output" else "temp"
     base_dir = folder_paths.get_output_directory() if location == "output" else folder_paths.get_temp_directory()
     subfolder = "scail_keyframe_matrix"
     target_dir = os.path.join(base_dir, subfolder)
@@ -2001,7 +2001,7 @@ class SCAIL2KeyframeMatrixViewer:
                 "paired_keyframes": ("IMAGE",),
                 "summary": ("STRING", {"default": "", "multiline": True, "forceInput": True}),
                 "filename_prefix": ("STRING", {"default": "scail_keyframe"}),
-                "save_location": (["temp", "output"], {"default": "temp"}),
+                "save_location": (["temp", "output", ""], {"default": "temp"}),
             }
         }
 
