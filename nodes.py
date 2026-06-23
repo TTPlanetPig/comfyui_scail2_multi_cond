@@ -581,6 +581,95 @@ def _build_paired_keyframes(
     return torch.cat(frames, dim=0).contiguous(), manifest
 
 
+def _matrix_safe_filename_part(value: Any) -> str:
+    text = str(value or "").strip().replace("\\", "_").replace("/", "_")
+    safe = "".join(char if char.isalnum() or char in {"-", "_", "."} else "_" for char in text)
+    return safe.strip("._") or "keyframe"
+
+
+def _save_keyframe_matrix_images(
+    images: torch.Tensor,
+    summary: str,
+    filename_prefix: str,
+    save_location: str,
+) -> dict[str, Any]:
+    import os
+
+    import numpy as np
+    from PIL import Image
+
+    try:
+        import folder_paths
+    except Exception as exc:
+        raise RuntimeError("ComfyUI folder_paths is required to save keyframe matrix images.") from exc
+
+    if not isinstance(images, torch.Tensor) or images.ndim != 4 or int(images.shape[0]) <= 0:
+        raise ValueError("paired_keyframes must be a non-empty ComfyUI IMAGE batch.")
+    try:
+        parsed = json.loads(str(summary or "{}"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"summary must be JSON from SCAIL2ChunkKeyframeExtractor: {exc}") from exc
+    manifest = parsed.get("paired_keyframes_manifest")
+    if not isinstance(manifest, list) or not manifest:
+        raise ValueError("summary must contain paired_keyframes_manifest from SCAIL2ChunkKeyframeExtractor.")
+    if len(manifest) != int(images.shape[0]):
+        raise ValueError(
+            f"paired_keyframes count ({int(images.shape[0])}) does not match manifest count ({len(manifest)})."
+        )
+
+    location = "output" if str(save_location) == "output" else "temp"
+    base_dir = folder_paths.get_output_directory() if location == "output" else folder_paths.get_temp_directory()
+    subfolder = "scail_keyframe_matrix"
+    target_dir = os.path.join(base_dir, subfolder)
+    os.makedirs(target_dir, exist_ok=True)
+
+    prefix = _matrix_safe_filename_part(filename_prefix or "scail_keyframe")
+    fingerprint = _stable_fingerprint(
+        {
+            "prefix": prefix,
+            "shape": _shape(images),
+            "manifest": manifest,
+        }
+    )[:8]
+
+    items: list[dict[str, Any]] = []
+    for index, row in enumerate(manifest):
+        frame = images[index].detach().cpu().float().clamp(0, 1)
+        if int(frame.shape[-1]) > 3:
+            frame = frame[..., :3]
+        if int(frame.shape[-1]) < 3:
+            frame = frame[..., :1].repeat(1, 1, 3)
+        array = (frame.numpy() * 255.0).round().astype(np.uint8)
+        image = Image.fromarray(array, mode="RGB")
+
+        kind = _matrix_safe_filename_part(row.get("kind", "keyframe"))
+        chunk_index = int(row.get("chunk_index", 0))
+        frame_number = int(row.get("frame_1_based", index + 1))
+        filename = f"{prefix}_{fingerprint}_{index:03d}_chunk{chunk_index}_{kind}_frame{frame_number}.png"
+        image.save(os.path.join(target_dir, filename))
+        items.append(
+            {
+                "batch_index": int(index),
+                "chunk_index": chunk_index,
+                "kind": str(row.get("kind", "keyframe")),
+                "frame_1_based": frame_number,
+                "frame_0_based": int(row.get("frame_0_based", frame_number - 1)),
+                "output_range_1_based_inclusive": row.get("output_range_1_based_inclusive"),
+                "filename": filename,
+                "subfolder": subfolder,
+                "type": location,
+            }
+        )
+
+    return {
+        "items": items,
+        "count": len(items),
+        "type": location,
+        "subfolder": subfolder,
+        "filename_prefix": prefix,
+    }
+
+
 def _infer_generation_size(pose_video: torch.Tensor) -> tuple[int, int]:
     if not isinstance(pose_video, torch.Tensor) or pose_video.ndim != 4:
         raise ValueError("pose_video must be a ComfyUI IMAGE tensor.")
@@ -1904,8 +1993,42 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
         return result
 
 
+class SCAIL2KeyframeMatrixViewer:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "paired_keyframes": ("IMAGE",),
+                "summary": ("STRING", {"default": "", "multiline": True, "forceInput": True}),
+                "filename_prefix": ("STRING", {"default": "scail_keyframe"}),
+                "save_location": (["temp", "output"], {"default": "temp"}),
+            }
+        }
+
+    RETURN_TYPES = ()
+    FUNCTION = "view"
+    OUTPUT_NODE = True
+    CATEGORY = f"{CATEGORY}/Chunk Plan"
+
+    def view(
+        self,
+        paired_keyframes: torch.Tensor,
+        summary: str,
+        filename_prefix: str = "scail_keyframe",
+        save_location: str = "temp",
+    ):
+        matrix = _save_keyframe_matrix_images(
+            paired_keyframes,
+            summary,
+            filename_prefix,
+            save_location,
+        )
+        return {"ui": {"scail_keyframe_matrix": matrix}}
+
+
 NODE_CLASS_MAPPINGS = {
     "SCAIL2ChunkKeyframeExtractor": SCAIL2ChunkKeyframeExtractor,
+    "SCAIL2KeyframeMatrixViewer": SCAIL2KeyframeMatrixViewer,
     "SCAIL2SegmentPlanBuilder": SCAIL2SegmentPlanBuilder,
     "SCAIL2SegmentPlanner": SCAIL2SegmentPlanner,
     "SCAIL2MultiReferenceColoredMask": SCAIL2MultiReferenceColoredMask,
@@ -1915,6 +2038,7 @@ NODE_CLASS_MAPPINGS = {
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SCAIL2ChunkKeyframeExtractor": "SCAIL-2 Chunk Keyframe Extractor",
+    "SCAIL2KeyframeMatrixViewer": "SCAIL-2 Keyframe Matrix Viewer",
     "SCAIL2SegmentPlanBuilder": "SCAIL-2 Segment Plan Builder",
     "SCAIL2SegmentPlanner": "SCAIL-2 Segment Planner",
     "SCAIL2MultiReferenceColoredMask": "SCAIL-2 Multi Reference Colored Mask",

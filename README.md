@@ -139,6 +139,17 @@ Outputs:
 - `summary`: JSON with zero-based indices, one-based frame numbers, chunk
   ranges, and the safe continued keep size.
 
+### SCAIL-2 Keyframe Matrix Viewer
+
+Output/frontend node for browsing extracted keyframes as a clickable matrix.
+Connect `SCAIL-2 Chunk Keyframe Extractor.paired_keyframes` and `summary` to
+this node. When it runs, it saves each original-size keyframe as an individual
+PNG and renders a labeled matrix in the node UI.
+
+Each matrix cell shows the chunk/type/frame metadata and links to the original
+PNG with `Open`, `Download`, and `Copy URL` actions. This is different from
+`contact_sheet`, which is only a rendered preview image.
+
 ## Workflow
 
 ```mermaid
