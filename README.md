@@ -108,6 +108,29 @@ are rendered, matching the official SCAIL-2 behavior.
 
 Debug/helper node. It prints the resolved segment and chunk plan before generation.
 
+### SCAIL-2 Chunk Keyframe Extractor
+
+Pre-processing helper for extracting frames from a loaded reference/action video
+before generation. Use it when you want to build manually aligned reference
+images for chunk boundaries.
+
+Modes:
+
+- `planner_summary`: connect `SCAIL-2 Segment Planner.summary`; the extractor
+  follows the exact resolved chunk plan;
+- `standard_long_video`: no planner input required; the extractor derives
+  chunk boundaries from the video length, `max_chunk_frames`, and
+  `overlap_frames`.
+
+Outputs:
+
+- `boundary_anchor_frames`: the first frame, then each continued chunk's
+  previous kept-frame anchor. Use these when aligning reference structure to
+  the old video boundary;
+- `new_chunk_start_frames`: the first final frame owned by each chunk;
+- `summary`: JSON with zero-based indices, one-based frame numbers, chunk
+  ranges, and the safe continued keep size.
+
 ## Workflow
 
 ```mermaid
@@ -176,6 +199,19 @@ For a reference change, `boundary_overlap` can override the global value for the
 | `5` | Strong continuity, slower reference switch |
 
 There is intentionally no `reference_strength` control. SCAIL2 does not expose a true reference-weight input. Pixel-blending a reference image into `previous_frames` can create static-image ghosting, so this package uses overlap control instead.
+
+When planning chunks manually, remember that `max_chunk_frames` is the full
+native generation window, including overlap frames. If `max_chunk_frames=81`
+and `overlap_frames=5`, a continued chunk can only keep `76` new frames before
+another chunk is required. Segment lengths near the full chunk size can create
+tiny follow-up chunks, such as `81 -> 76 + 5`. Use `max_chunk_frames -
+overlap_frames` as the safe boundary for ordinary continued segments. For the
+first chunk after a reference change, use that segment's `boundary_overlap`
+instead of the global overlap when calculating the boundary.
+
+In `SCAIL-2 Chunk Keyframe Extractor.standard_long_video` mode, the same rule
+is used. With `max_chunk_frames=81` and `overlap_frames=5`, boundary anchors
+progress as `1, 81, 157, 233...`, not `1, 81, 162...`.
 
 ## Installation
 

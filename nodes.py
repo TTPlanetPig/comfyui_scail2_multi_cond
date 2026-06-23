@@ -337,6 +337,97 @@ def _build_chunk_plan(segments: list[dict[str, Any]], max_chunk_frames: int, ove
     return chunks
 
 
+def _parse_planner_chunks(planner_summary: str) -> list[dict[str, Any]]:
+    text = str(planner_summary or "").strip()
+    if not text:
+        raise ValueError("planner_summary is required when mode is planner_summary.")
+    try:
+        summary = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"planner_summary must be valid JSON from SCAIL2SegmentPlanner: {exc}") from exc
+    if not isinstance(summary, dict):
+        raise ValueError("planner_summary must be a JSON object.")
+    chunks = summary.get("chunks", summary.get("planned_chunks"))
+    if not isinstance(chunks, list) or not chunks:
+        raise ValueError("planner_summary must contain a non-empty chunks or planned_chunks list.")
+    normalized: list[dict[str, Any]] = []
+    for index, chunk in enumerate(chunks):
+        if not isinstance(chunk, dict):
+            raise ValueError(f"planner_summary chunk {index} must be an object.")
+        try:
+            output_start = int(chunk["output_start"])
+            output_end = int(chunk["output_end"])
+        except KeyError as exc:
+            raise ValueError(f"planner_summary chunk {index} is missing {exc.args[0]}.") from exc
+        if output_start < 0 or output_end <= output_start:
+            raise ValueError(f"planner_summary chunk {index} has invalid output range {output_start}:{output_end}.")
+        normalized.append({**chunk, "output_start": output_start, "output_end": output_end})
+    return normalized
+
+
+def _chunk_boundary_indices(
+    chunks: list[dict[str, Any]],
+    frame_count: int,
+    include_final_anchor: bool,
+) -> tuple[list[int], list[int], list[dict[str, Any]]]:
+    if not chunks:
+        raise ValueError("chunk plan produced no chunks.")
+    anchors: list[int] = []
+    starts: list[int] = []
+    rows: list[dict[str, Any]] = []
+    for index, chunk in enumerate(chunks):
+        output_start = int(chunk["output_start"])
+        output_end = int(chunk["output_end"])
+        anchor_index = 0 if index == 0 else output_start - 1
+        start_index = output_start
+        if anchor_index < 0 or start_index < 0 or output_end <= output_start:
+            raise ValueError(f"chunk {index} has invalid output range {output_start}:{output_end}.")
+        if anchor_index >= frame_count or start_index >= frame_count or output_end > frame_count:
+            raise ValueError(
+                f"chunk {index} references frames beyond the input video: "
+                f"range={output_start}:{output_end}, video_frames={frame_count}."
+            )
+        anchors.append(anchor_index)
+        starts.append(start_index)
+        rows.append(
+            {
+                "chunk_index": int(chunk.get("chunk_index", index)),
+                "reference": int(chunk.get("reference", 1)),
+                "output_range_0_based": [output_start, output_end],
+                "output_range_1_based_inclusive": [output_start + 1, output_end],
+                "boundary_anchor_frame_0_based": anchor_index,
+                "boundary_anchor_frame_1_based": anchor_index + 1,
+                "new_chunk_start_frame_0_based": start_index,
+                "new_chunk_start_frame_1_based": start_index + 1,
+                "discard_head": int(chunk.get("discard_head", 0)),
+                "keep_frames": int(chunk.get("keep_frames", output_end - output_start)),
+                "generate_length": int(chunk.get("generate_length", output_end - output_start)),
+                "boundary_overlap": chunk.get("boundary_overlap", None),
+            }
+        )
+    if include_final_anchor:
+        final_index = int(chunks[-1]["output_end"]) - 1
+        if final_index < 0 or final_index >= frame_count:
+            raise ValueError(f"final anchor frame {final_index} is outside the input video.")
+        anchors.append(final_index)
+    return anchors, starts, rows
+
+
+def _extract_frame_batch(video: torch.Tensor, indices: list[int], name: str) -> torch.Tensor:
+    if not isinstance(video, torch.Tensor) or video.ndim != 4:
+        raise ValueError("video must be a ComfyUI IMAGE tensor.")
+    if int(video.shape[0]) <= 0:
+        raise ValueError("video has no frames.")
+    if not indices:
+        raise ValueError(f"{name} produced no frame indices.")
+    frame_count = int(video.shape[0])
+    for index in indices:
+        if int(index) < 0 or int(index) >= frame_count:
+            raise ValueError(f"{name} frame index {index} is outside input video frame count {frame_count}.")
+    selector = torch.tensor(indices, device=video.device, dtype=torch.long)
+    return video.index_select(0, selector).detach().contiguous()
+
+
 def _infer_generation_size(pose_video: torch.Tensor) -> tuple[int, int]:
     if not isinstance(pose_video, torch.Tensor) or pose_video.ndim != 4:
         raise ValueError("pose_video must be a ComfyUI IMAGE tensor.")
@@ -642,6 +733,107 @@ class SCAIL2SegmentPlanner:
             ),
         }
         return (json.dumps(summary, indent=2),)
+
+
+class SCAIL2ChunkKeyframeExtractor:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video": ("IMAGE",),
+                "mode": (["planner_summary", "standard_long_video"], {"default": "planner_summary"}),
+                "max_chunk_frames": ("INT", {"default": 81, "min": 17, "max": 81, "step": 4}),
+                "overlap_frames": ("INT", {"default": 5, "min": 0, "max": 33, "step": 1}),
+                "max_frames": ("INT", {"default": 0, "min": 0, "max": 100000, "step": 1}),
+                "include_final_anchor": ("BOOLEAN", {"default": False}),
+            },
+            "optional": {
+                "planner_summary": ("STRING", {"default": "", "multiline": True, "forceInput": True}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "IMAGE", "STRING")
+    RETURN_NAMES = ("boundary_anchor_frames", "new_chunk_start_frames", "summary")
+    FUNCTION = "extract"
+    CATEGORY = f"{CATEGORY}/Chunk Plan"
+
+    def extract(
+        self,
+        video: torch.Tensor,
+        mode: str,
+        max_chunk_frames: int = 81,
+        overlap_frames: int = 5,
+        max_frames: int = 0,
+        include_final_anchor: bool = False,
+        planner_summary: str = "",
+    ):
+        if not isinstance(video, torch.Tensor) or video.ndim != 4:
+            raise ValueError("video must be a ComfyUI IMAGE tensor.")
+        video_frame_count = int(video.shape[0])
+        if video_frame_count <= 0:
+            raise ValueError("video has no frames.")
+
+        frame_cap = min(video_frame_count, int(max_frames)) if int(max_frames) > 0 else video_frame_count
+        if frame_cap <= 0:
+            raise ValueError("max_frames leaves no frames to extract.")
+
+        normalized_max_chunk_frames = min(81, _ceil_to_4n_plus_1(max(17, int(max_chunk_frames))))
+        overlap = _normalize_overlap(overlap_frames, normalized_max_chunk_frames)
+
+        if str(mode) == "planner_summary":
+            chunks = _parse_planner_chunks(planner_summary)
+            if chunks[-1]["output_end"] > frame_cap:
+                raise ValueError(
+                    "planner_summary requests frames beyond the selected video range: "
+                    f"last_output_end={chunks[-1]['output_end']}, available_frames={frame_cap}."
+                )
+            source = "planner_summary"
+        elif str(mode) == "standard_long_video":
+            segments = [
+                {
+                    "index": 0,
+                    "start": 0,
+                    "end": frame_cap,
+                    "frames": frame_cap,
+                    "reference": 1,
+                    "boundary_overlap": None,
+                    "prompt": "",
+                    "negative": "",
+                }
+            ]
+            chunks = _build_chunk_plan(segments, normalized_max_chunk_frames, overlap)
+            source = "standard_long_video"
+        else:
+            raise ValueError(f"Unsupported keyframe extraction mode: {mode}")
+
+        anchor_indices, start_indices, rows = _chunk_boundary_indices(chunks, frame_cap, bool(include_final_anchor))
+        boundary_anchor_frames = _extract_frame_batch(video[:frame_cap], anchor_indices, "boundary_anchor_frames")
+        new_chunk_start_frames = _extract_frame_batch(video[:frame_cap], start_indices, "new_chunk_start_frames")
+
+        safe_continued_keep = (
+            normalized_max_chunk_frames - overlap
+            if overlap > 0
+            else normalized_max_chunk_frames
+        )
+        summary = {
+            "mode": source,
+            "video_frames": int(video_frame_count),
+            "used_frames": int(frame_cap),
+            "max_chunk_frames": int(normalized_max_chunk_frames),
+            "overlap_frames": int(overlap),
+            "safe_continued_keep_frames": int(safe_continued_keep),
+            "include_final_anchor": bool(include_final_anchor),
+            "boundary_anchor_frame_indices_0_based": anchor_indices,
+            "boundary_anchor_frame_numbers_1_based": [index + 1 for index in anchor_indices],
+            "new_chunk_start_frame_indices_0_based": start_indices,
+            "new_chunk_start_frame_numbers_1_based": [index + 1 for index in start_indices],
+            "chunks": rows,
+            "note": (
+                "boundary_anchor_frames are previous kept-frame anchors for aligning reference structure; "
+                "new_chunk_start_frames are the first final frames owned by each chunk."
+            ),
+        }
+        return (boundary_anchor_frames, new_chunk_start_frames, json.dumps(summary, indent=2))
 
 
 class SCAIL2SegmentPlanBuilder:
@@ -1526,6 +1718,7 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
 
 
 NODE_CLASS_MAPPINGS = {
+    "SCAIL2ChunkKeyframeExtractor": SCAIL2ChunkKeyframeExtractor,
     "SCAIL2SegmentPlanBuilder": SCAIL2SegmentPlanBuilder,
     "SCAIL2SegmentPlanner": SCAIL2SegmentPlanner,
     "SCAIL2MultiReferenceColoredMask": SCAIL2MultiReferenceColoredMask,
@@ -1534,6 +1727,7 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "SCAIL2ChunkKeyframeExtractor": "SCAIL-2 Chunk Keyframe Extractor",
     "SCAIL2SegmentPlanBuilder": "SCAIL-2 Segment Plan Builder",
     "SCAIL2SegmentPlanner": "SCAIL-2 Segment Planner",
     "SCAIL2MultiReferenceColoredMask": "SCAIL-2 Multi Reference Colored Mask",
