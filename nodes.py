@@ -337,7 +337,70 @@ def _build_chunk_plan(segments: list[dict[str, Any]], max_chunk_frames: int, ove
     return chunks
 
 
-def _parse_planner_chunks(planner_summary: str) -> list[dict[str, Any]]:
+def _normalize_summary_segments(summary: dict[str, Any], max_frames: int = 0) -> list[dict[str, Any]]:
+    raw_segments = summary.get("segments")
+    if not isinstance(raw_segments, list) or not raw_segments:
+        raise ValueError("planner_summary must contain a non-empty chunks, planned_chunks, or segments list.")
+
+    segments: list[dict[str, Any]] = []
+    cursor = 0
+    for index, item in enumerate(raw_segments):
+        if not isinstance(item, dict):
+            raise ValueError(f"planner_summary segment {index} must be an object.")
+        frames = int(item.get("frames", 0))
+        range_value = item.get("range")
+        start = item.get("start", None)
+        end = item.get("end", None)
+        if isinstance(range_value, list) and len(range_value) >= 2:
+            start = range_value[0] if start is None else start
+            end = range_value[1] if end is None else end
+        if start is None:
+            start = cursor
+        if end is None:
+            end = int(start) + frames
+        start = int(start)
+        end = int(end)
+        if frames <= 0:
+            frames = end - start
+        if frames <= 0 or end <= start:
+            raise ValueError(f"planner_summary segment {index} has invalid frame range {start}:{end}.")
+        segments.append(
+            {
+                "index": int(item.get("index", index)),
+                "start": start,
+                "end": end,
+                "frames": frames,
+                "reference": int(item.get("reference", 1)),
+                "boundary_overlap": item.get("boundary_overlap", None),
+                "prompt": str(item.get("prompt", "")),
+                "negative": str(item.get("negative", "")),
+            }
+        )
+        cursor = end
+
+    cap = int(max_frames) if int(max_frames) > 0 else None
+    if cap is not None and segments and int(segments[-1]["end"]) > cap:
+        clipped: list[dict[str, Any]] = []
+        for segment in segments:
+            if int(segment["start"]) >= cap:
+                break
+            clipped_segment = dict(segment)
+            clipped_segment["end"] = min(int(segment["end"]), cap)
+            clipped_segment["frames"] = int(clipped_segment["end"]) - int(clipped_segment["start"])
+            if int(clipped_segment["frames"]) > 0:
+                clipped.append(clipped_segment)
+        segments = clipped
+    if not segments:
+        raise ValueError("planner_summary segments produce no frames after max_frames/video length clipping.")
+    return segments
+
+
+def _parse_planner_chunks(
+    planner_summary: str,
+    max_chunk_frames: int = 81,
+    overlap_frames: int = 5,
+    max_frames: int = 0,
+) -> tuple[list[dict[str, Any]], str]:
     text = str(planner_summary or "").strip()
     if not text:
         raise ValueError("planner_summary is required when mode is planner_summary.")
@@ -349,7 +412,8 @@ def _parse_planner_chunks(planner_summary: str) -> list[dict[str, Any]]:
         raise ValueError("planner_summary must be a JSON object.")
     chunks = summary.get("chunks", summary.get("planned_chunks"))
     if not isinstance(chunks, list) or not chunks:
-        raise ValueError("planner_summary must contain a non-empty chunks or planned_chunks list.")
+        segments = _normalize_summary_segments(summary, max_frames=max_frames)
+        return _build_chunk_plan(segments, max_chunk_frames, overlap_frames), "segment_summary"
     normalized: list[dict[str, Any]] = []
     for index, chunk in enumerate(chunks):
         if not isinstance(chunk, dict):
@@ -362,7 +426,7 @@ def _parse_planner_chunks(planner_summary: str) -> list[dict[str, Any]]:
         if output_start < 0 or output_end <= output_start:
             raise ValueError(f"planner_summary chunk {index} has invalid output range {output_start}:{output_end}.")
         normalized.append({**chunk, "output_start": output_start, "output_end": output_end})
-    return normalized
+    return normalized, "planner_summary"
 
 
 def _chunk_boundary_indices(
@@ -1033,13 +1097,17 @@ class SCAIL2ChunkKeyframeExtractor:
         overlap = _normalize_overlap(overlap_frames, normalized_max_chunk_frames)
 
         if str(mode) == "planner_summary":
-            chunks = _parse_planner_chunks(planner_summary)
+            chunks, source = _parse_planner_chunks(
+                planner_summary,
+                normalized_max_chunk_frames,
+                overlap,
+                frame_cap,
+            )
             if chunks[-1]["output_end"] > frame_cap:
                 raise ValueError(
                     "planner_summary requests frames beyond the selected video range: "
                     f"last_output_end={chunks[-1]['output_end']}, available_frames={frame_cap}."
                 )
-            source = "planner_summary"
         elif str(mode) == "standard_long_video":
             segments = [
                 {
