@@ -230,11 +230,42 @@ function addUpdateButton(node, label, callback) {
 }
 
 function matrixImageUrl(item) {
+    const image = item?.image ?? item;
+    if (typeof image === "string") {
+        if (/^(https?:)?\/\//.test(image) || image.startsWith("/")) {
+            return image;
+        }
+        const params = new URLSearchParams();
+        params.set("filename", image);
+        params.set("type", "temp");
+        params.set("subfolder", "");
+        return api.apiURL(`/view?${params.toString()}`);
+    }
+    if (image?.url) {
+        return image.url;
+    }
     const params = new URLSearchParams();
-    params.set("filename", item.filename ?? "");
-    params.set("type", item.type ?? "temp");
-    params.set("subfolder", item.subfolder ?? "");
+    params.set("filename", image?.filename ?? "");
+    params.set("type", image?.type ?? "temp");
+    params.set("subfolder", image?.subfolder ?? "");
     return api.apiURL(`/view?${params.toString()}`);
+}
+
+function normalizeMatrixItem(item, index) {
+    const image = item?.image ?? item;
+    const filename = image?.filename ?? (typeof image === "string" ? image : "");
+    const frameMatch = /frame(\d+)/i.exec(filename);
+    return {
+        ...(typeof item === "object" && item !== null ? item : {}),
+        filename,
+        subfolder: image?.subfolder ?? item?.subfolder ?? "",
+        type: image?.type ?? item?.type ?? "temp",
+        batch_index: item?.batch_index ?? item?.index ?? index,
+        chunk_index: item?.chunk_index ?? "-",
+        kind: item?.kind ?? "image",
+        frame_1_based: item?.frame_1_based ?? (frameMatch ? Number(frameMatch[1]) : null),
+        output_range_1_based_inclusive: item?.output_range_1_based_inclusive,
+    };
 }
 
 function normalizeMatrixPayload(payload) {
@@ -253,10 +284,10 @@ function normalizeMatrixPayload(payload) {
         value = value.matrix;
     }
     if (Array.isArray(value?.items)) {
-        return value;
+        return { ...value, items: value.items.map(normalizeMatrixItem) };
     }
     if (Array.isArray(value)) {
-        return { items: value };
+        return { items: value.map(normalizeMatrixItem) };
     }
     return { ...(value ?? {}), items: [] };
 }
@@ -361,7 +392,7 @@ function renderMatrix(node, matrix) {
         name.textContent = `${String(item.batch_index).padStart(3, "0")} | chunk ${item.chunk_index} | ${item.kind}`;
         name.style.cssText = "font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;";
         const frame = document.createElement("div");
-        frame.textContent = `frame ${item.frame_1_based}`;
+        frame.textContent = item.frame_1_based ? `frame ${item.frame_1_based}` : item.filename;
         frame.style.cssText = "margin-top:2px;color:#475569;";
         const range = document.createElement("div");
         const outputRange = item.output_range_1_based_inclusive;
@@ -377,7 +408,7 @@ function renderMatrix(node, matrix) {
         open.textContent = "Open";
         const download = document.createElement("a");
         download.href = url;
-        download.download = item.filename ?? "";
+        download.download = item.filename || `keyframe_${item.batch_index}.png`;
         download.textContent = "Download";
         const copy = document.createElement("button");
         copy.type = "button";
@@ -489,11 +520,12 @@ app.registerExtension({
                 const matrix =
                     message?.scail_keyframe_matrix ??
                     message?.scail_keyframe_matrix_list ??
-                    message?.images ??
                     message?.ui?.scail_keyframe_matrix ??
                     message?.ui?.scail_keyframe_matrix_list ??
-                    message?.ui?.images ??
                     message?.output?.scail_keyframe_matrix ??
+                    message?.output?.scail_keyframe_matrix_list ??
+                    message?.images ??
+                    message?.ui?.images ??
                     message?.output?.images;
                 if (matrix !== undefined && matrix !== null) {
                     renderMatrix(this, normalizeMatrixPayload(matrix));
