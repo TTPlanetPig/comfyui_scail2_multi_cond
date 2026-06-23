@@ -530,6 +530,57 @@ def _build_keyframe_contact_sheet(
     return array.unsqueeze(0).contiguous()
 
 
+def _build_paired_keyframes(
+    boundary_anchor_frames: torch.Tensor,
+    new_chunk_start_frames: torch.Tensor,
+    rows: list[dict[str, Any]],
+    include_final_anchor: bool,
+) -> tuple[torch.Tensor, list[dict[str, Any]]]:
+    frames: list[torch.Tensor] = []
+    manifest: list[dict[str, Any]] = []
+    for index, row in enumerate(rows):
+        output_range = row["output_range_1_based_inclusive"]
+        frames.append(boundary_anchor_frames[index : index + 1])
+        manifest.append(
+            {
+                "batch_index": len(manifest),
+                "chunk_index": int(row["chunk_index"]),
+                "kind": "boundary_anchor",
+                "frame_0_based": int(row["boundary_anchor_frame_0_based"]),
+                "frame_1_based": int(row["boundary_anchor_frame_1_based"]),
+                "output_range_1_based_inclusive": output_range,
+            }
+        )
+        frames.append(new_chunk_start_frames[index : index + 1])
+        manifest.append(
+            {
+                "batch_index": len(manifest),
+                "chunk_index": int(row["chunk_index"]),
+                "kind": "new_chunk_start",
+                "frame_0_based": int(row["new_chunk_start_frame_0_based"]),
+                "frame_1_based": int(row["new_chunk_start_frame_1_based"]),
+                "output_range_1_based_inclusive": output_range,
+            }
+        )
+    if include_final_anchor and int(boundary_anchor_frames.shape[0]) > len(rows):
+        final_index = int(boundary_anchor_frames.shape[0]) - 1
+        final_frame = int(rows[-1]["output_range_1_based_inclusive"][1])
+        frames.append(boundary_anchor_frames[final_index : final_index + 1])
+        manifest.append(
+            {
+                "batch_index": len(manifest),
+                "chunk_index": int(rows[-1]["chunk_index"]),
+                "kind": "final_anchor",
+                "frame_0_based": final_frame - 1,
+                "frame_1_based": final_frame,
+                "output_range_1_based_inclusive": rows[-1]["output_range_1_based_inclusive"],
+            }
+        )
+    if not frames:
+        raise ValueError("paired_keyframes produced no frames.")
+    return torch.cat(frames, dim=0).contiguous(), manifest
+
+
 def _infer_generation_size(pose_video: torch.Tensor) -> tuple[int, int]:
     if not isinstance(pose_video, torch.Tensor) or pose_video.ndim != 4:
         raise ValueError("pose_video must be a ComfyUI IMAGE tensor.")
@@ -856,8 +907,14 @@ class SCAIL2ChunkKeyframeExtractor:
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE", "STRING")
-    RETURN_NAMES = ("boundary_anchor_frames", "new_chunk_start_frames", "contact_sheet", "summary")
+    RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE", "IMAGE", "STRING")
+    RETURN_NAMES = (
+        "boundary_anchor_frames",
+        "new_chunk_start_frames",
+        "paired_keyframes",
+        "contact_sheet",
+        "summary",
+    )
     FUNCTION = "extract"
     CATEGORY = f"{CATEGORY}/Chunk Plan"
 
@@ -915,6 +972,12 @@ class SCAIL2ChunkKeyframeExtractor:
         anchor_indices, start_indices, rows = _chunk_boundary_indices(chunks, frame_cap, bool(include_final_anchor))
         boundary_anchor_frames = _extract_frame_batch(video[:frame_cap], anchor_indices, "boundary_anchor_frames")
         new_chunk_start_frames = _extract_frame_batch(video[:frame_cap], start_indices, "new_chunk_start_frames")
+        paired_keyframes, paired_keyframes_manifest = _build_paired_keyframes(
+            boundary_anchor_frames,
+            new_chunk_start_frames,
+            rows,
+            bool(include_final_anchor),
+        )
         contact_sheet = _build_keyframe_contact_sheet(
             boundary_anchor_frames,
             new_chunk_start_frames,
@@ -943,13 +1006,21 @@ class SCAIL2ChunkKeyframeExtractor:
             "boundary_anchor_frame_numbers_1_based": [index + 1 for index in anchor_indices],
             "new_chunk_start_frame_indices_0_based": start_indices,
             "new_chunk_start_frame_numbers_1_based": [index + 1 for index in start_indices],
+            "paired_keyframes_manifest": paired_keyframes_manifest,
             "chunks": rows,
             "note": (
-                "boundary_anchor_frames are previous kept-frame anchors for aligning reference structure; "
-                "new_chunk_start_frames are the first final frames owned by each chunk."
+                "boundary_anchor_frames and new_chunk_start_frames keep original frame size. "
+                "paired_keyframes keeps original frame size in the same visual order as contact_sheet. "
+                "contact_sheet is a labeled preview image only."
             ),
         }
-        return (boundary_anchor_frames, new_chunk_start_frames, contact_sheet, json.dumps(summary, indent=2))
+        return (
+            boundary_anchor_frames,
+            new_chunk_start_frames,
+            paired_keyframes,
+            contact_sheet,
+            json.dumps(summary, indent=2),
+        )
 
 
 class SCAIL2SegmentPlanBuilder:

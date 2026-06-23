@@ -131,8 +131,11 @@ Outputs:
   previous kept-frame anchor. Use these when aligning reference structure to
   the old video boundary;
 - `new_chunk_start_frames`: the first final frame owned by each chunk;
-- `contact_sheet`: one labeled table image for previewing and saving the
-  extracted boundary/start frame pairs;
+- `paired_keyframes`: original-size keyframes in the same visual order as the
+  browser sheet, alternating boundary/start pairs;
+- `contact_sheet`: one labeled table image for preview only. It uses resized
+  thumbnails and text labels, so use `paired_keyframes` when saving usable
+  source images;
 - `summary`: JSON with zero-based indices, one-based frame numbers, chunk
   ranges, and the safe continued keep size.
 
