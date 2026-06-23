@@ -239,7 +239,7 @@ function matrixImageUrl(item) {
 
 function normalizeMatrixPayload(payload) {
     let value = payload;
-    if (Array.isArray(value)) {
+    if (Array.isArray(value) && value.length === 1 && Array.isArray(value[0]?.items)) {
         value = value[0];
     }
     if (typeof value === "string") {
@@ -489,9 +489,12 @@ app.registerExtension({
                 const matrix =
                     message?.scail_keyframe_matrix ??
                     message?.scail_keyframe_matrix_list ??
+                    message?.images ??
                     message?.ui?.scail_keyframe_matrix ??
                     message?.ui?.scail_keyframe_matrix_list ??
-                    message?.output?.scail_keyframe_matrix;
+                    message?.ui?.images ??
+                    message?.output?.scail_keyframe_matrix ??
+                    message?.output?.images;
                 if (matrix !== undefined && matrix !== null) {
                     renderMatrix(this, normalizeMatrixPayload(matrix));
                 }
