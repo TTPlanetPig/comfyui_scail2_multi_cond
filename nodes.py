@@ -428,6 +428,108 @@ def _extract_frame_batch(video: torch.Tensor, indices: list[int], name: str) -> 
     return video.index_select(0, selector).detach().contiguous()
 
 
+def _tensor_frame_to_pil(frame: torch.Tensor, thumbnail_width: int):
+    from PIL import Image
+
+    value = frame.detach().cpu().float().clamp(0, 1)
+    if int(value.shape[-1]) > 3:
+        value = value[..., :3]
+    if int(value.shape[-1]) < 3:
+        value = value[..., :1].repeat(1, 1, 3)
+    height = int(value.shape[0])
+    width = int(value.shape[1])
+    if height <= 0 or width <= 0:
+        raise ValueError("Cannot build contact sheet from an empty frame.")
+    array = (value.numpy() * 255.0).round().astype("uint8")
+    image = Image.fromarray(array, mode="RGB")
+    thumb_w = max(96, int(thumbnail_width))
+    thumb_h = max(1, int(round(float(height) * float(thumb_w) / float(width))))
+    resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.BICUBIC)
+    return image.resize((thumb_w, thumb_h), resample)
+
+
+def _build_keyframe_contact_sheet(
+    boundary_anchor_frames: torch.Tensor,
+    new_chunk_start_frames: torch.Tensor,
+    rows: list[dict[str, Any]],
+    include_final_anchor: bool,
+    columns: int,
+    thumbnail_width: int,
+) -> torch.Tensor:
+    import numpy as np
+    from PIL import Image, ImageDraw, ImageFont
+
+    chunk_count = len(rows)
+    if chunk_count <= 0:
+        raise ValueError("Cannot build contact sheet without chunk rows.")
+    columns = max(1, min(12, int(columns)))
+    label_h = 46
+    padding = 8
+    font = ImageFont.load_default()
+
+    sample = _tensor_frame_to_pil(boundary_anchor_frames[0], thumbnail_width)
+    thumb_w, thumb_h = sample.size
+    cell_w = thumb_w + padding * 2
+    cell_h = thumb_h + label_h + padding * 2
+    group_count = (chunk_count + columns - 1) // columns
+    extra_final_row = 1 if include_final_anchor and int(boundary_anchor_frames.shape[0]) > chunk_count else 0
+    sheet_w = cell_w * columns
+    sheet_h = cell_h * (group_count * 2 + extra_final_row)
+    sheet = Image.new("RGB", (sheet_w, sheet_h), (246, 247, 249))
+    draw = ImageDraw.Draw(sheet)
+
+    def draw_cell(frame: torch.Tensor, label_lines: list[str], col: int, row: int) -> None:
+        x = col * cell_w
+        y = row * cell_h
+        draw.rectangle((x, y, x + cell_w - 1, y + cell_h - 1), outline=(202, 207, 214), width=1)
+        image = _tensor_frame_to_pil(frame, thumb_w)
+        sheet.paste(image, (x + padding, y + padding))
+        text_y = y + padding + thumb_h + 5
+        for line in label_lines[:3]:
+            draw.text((x + padding, text_y), line, fill=(20, 24, 31), font=font)
+            text_y += 13
+
+    for index, row in enumerate(rows):
+        group = index // columns
+        col = index % columns
+        boundary_row = group * 2
+        start_row = boundary_row + 1
+        chunk_number = int(row["chunk_index"])
+        output_range = row["output_range_1_based_inclusive"]
+        draw_cell(
+            boundary_anchor_frames[index],
+            [
+                f"chunk {chunk_number} boundary",
+                f"frame {int(row['boundary_anchor_frame_1_based'])}",
+                f"out {output_range[0]}-{output_range[1]}",
+            ],
+            col,
+            boundary_row,
+        )
+        draw_cell(
+            new_chunk_start_frames[index],
+            [
+                f"chunk {chunk_number} new start",
+                f"frame {int(row['new_chunk_start_frame_1_based'])}",
+                f"keep {int(row['keep_frames'])}",
+            ],
+            col,
+            start_row,
+        )
+
+    if extra_final_row:
+        final_frame_number = int(rows[-1]["output_range_1_based_inclusive"][1])
+        draw_cell(
+            boundary_anchor_frames[-1],
+            ["final anchor", f"frame {final_frame_number}", "end of plan"],
+            0,
+            group_count * 2,
+        )
+
+    array = torch.from_numpy(np.array(sheet).astype("float32") / 255.0)
+    return array.unsqueeze(0).contiguous()
+
+
 def _infer_generation_size(pose_video: torch.Tensor) -> tuple[int, int]:
     if not isinstance(pose_video, torch.Tensor) or pose_video.ndim != 4:
         raise ValueError("pose_video must be a ComfyUI IMAGE tensor.")
@@ -746,14 +848,16 @@ class SCAIL2ChunkKeyframeExtractor:
                 "overlap_frames": ("INT", {"default": 5, "min": 0, "max": 33, "step": 1}),
                 "max_frames": ("INT", {"default": 0, "min": 0, "max": 100000, "step": 1}),
                 "include_final_anchor": ("BOOLEAN", {"default": False}),
+                "contact_sheet_columns": ("INT", {"default": 4, "min": 1, "max": 12, "step": 1}),
+                "contact_sheet_thumbnail_width": ("INT", {"default": 256, "min": 96, "max": 1024, "step": 16}),
             },
             "optional": {
                 "planner_summary": ("STRING", {"default": "", "multiline": True, "forceInput": True}),
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "IMAGE", "STRING")
-    RETURN_NAMES = ("boundary_anchor_frames", "new_chunk_start_frames", "summary")
+    RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE", "STRING")
+    RETURN_NAMES = ("boundary_anchor_frames", "new_chunk_start_frames", "contact_sheet", "summary")
     FUNCTION = "extract"
     CATEGORY = f"{CATEGORY}/Chunk Plan"
 
@@ -765,6 +869,8 @@ class SCAIL2ChunkKeyframeExtractor:
         overlap_frames: int = 5,
         max_frames: int = 0,
         include_final_anchor: bool = False,
+        contact_sheet_columns: int = 4,
+        contact_sheet_thumbnail_width: int = 256,
         planner_summary: str = "",
     ):
         if not isinstance(video, torch.Tensor) or video.ndim != 4:
@@ -809,6 +915,14 @@ class SCAIL2ChunkKeyframeExtractor:
         anchor_indices, start_indices, rows = _chunk_boundary_indices(chunks, frame_cap, bool(include_final_anchor))
         boundary_anchor_frames = _extract_frame_batch(video[:frame_cap], anchor_indices, "boundary_anchor_frames")
         new_chunk_start_frames = _extract_frame_batch(video[:frame_cap], start_indices, "new_chunk_start_frames")
+        contact_sheet = _build_keyframe_contact_sheet(
+            boundary_anchor_frames,
+            new_chunk_start_frames,
+            rows,
+            bool(include_final_anchor),
+            int(contact_sheet_columns),
+            int(contact_sheet_thumbnail_width),
+        )
 
         safe_continued_keep = (
             normalized_max_chunk_frames - overlap
@@ -823,6 +937,8 @@ class SCAIL2ChunkKeyframeExtractor:
             "overlap_frames": int(overlap),
             "safe_continued_keep_frames": int(safe_continued_keep),
             "include_final_anchor": bool(include_final_anchor),
+            "contact_sheet_columns": int(contact_sheet_columns),
+            "contact_sheet_thumbnail_width": int(contact_sheet_thumbnail_width),
             "boundary_anchor_frame_indices_0_based": anchor_indices,
             "boundary_anchor_frame_numbers_1_based": [index + 1 for index in anchor_indices],
             "new_chunk_start_frame_indices_0_based": start_indices,
@@ -833,7 +949,7 @@ class SCAIL2ChunkKeyframeExtractor:
                 "new_chunk_start_frames are the first final frames owned by each chunk."
             ),
         }
-        return (boundary_anchor_frames, new_chunk_start_frames, json.dumps(summary, indent=2))
+        return (boundary_anchor_frames, new_chunk_start_frames, contact_sheet, json.dumps(summary, indent=2))
 
 
 class SCAIL2SegmentPlanBuilder:

@@ -122,12 +122,17 @@ Modes:
   chunk boundaries from the video length, `max_chunk_frames`, and
   `overlap_frames`.
 
+`contact_sheet_columns` and `contact_sheet_thumbnail_width` control the labeled
+browser sheet layout.
+
 Outputs:
 
 - `boundary_anchor_frames`: the first frame, then each continued chunk's
   previous kept-frame anchor. Use these when aligning reference structure to
   the old video boundary;
 - `new_chunk_start_frames`: the first final frame owned by each chunk;
+- `contact_sheet`: one labeled table image for previewing and saving the
+  extracted boundary/start frame pairs;
 - `summary`: JSON with zero-based indices, one-based frame numbers, chunk
   ranges, and the safe continued keep size.
 
