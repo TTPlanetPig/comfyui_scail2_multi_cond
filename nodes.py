@@ -2124,9 +2124,12 @@ class SCAIL2KeyframeMatrixViewer:
                 "paired_keyframes": ("IMAGE",),
                 "summary": ("STRING", {"default": "", "multiline": True, "forceInput": True}),
                 "filename_prefix": ("STRING", {"default": "scail_keyframe"}),
-                "save_location": (["temp", "output", ""], {"default": "temp"}),
+                "save_location": (
+                    ["temp", "output", "", "both", "overlap_boundary_only", "new_chunk_start_only"],
+                    {"default": "temp"},
+                ),
                 "display_group": (
-                    ["both", "overlap_boundary_only", "new_chunk_start_only", ""],
+                    ["both", "overlap_boundary_only", "new_chunk_start_only", "", "temp", "output"],
                     {"default": "both"},
                 ),
             }
@@ -2145,6 +2148,16 @@ class SCAIL2KeyframeMatrixViewer:
         save_location: str = "temp",
         display_group: str = "both",
     ):
+        display_choices = {"both", "overlap_boundary_only", "new_chunk_start_only"}
+        save_choices = {"temp", "output"}
+        save_text = str(save_location or "").strip()
+        group_text = str(display_group or "").strip()
+        if save_text in display_choices:
+            display_group = save_text
+            save_location = group_text if group_text in save_choices else "temp"
+        elif group_text in save_choices and save_text not in save_choices:
+            save_location = group_text
+            display_group = "both"
         matrix = _save_keyframe_matrix_images(
             paired_keyframes,
             summary,
