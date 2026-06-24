@@ -433,16 +433,31 @@ def _chunk_boundary_indices(
     chunks: list[dict[str, Any]],
     frame_count: int,
     include_final_anchor: bool,
+    boundary_anchor_mode: str = "overlap_last_frame",
 ) -> tuple[list[int], list[int], list[dict[str, Any]]]:
     if not chunks:
         raise ValueError("chunk plan produced no chunks.")
+    normalized_anchor_mode = (
+        "overlap_first_frame"
+        if str(boundary_anchor_mode or "").strip() == "overlap_first_frame"
+        else "overlap_last_frame"
+    )
     anchors: list[int] = []
     starts: list[int] = []
     rows: list[dict[str, Any]] = []
     for index, chunk in enumerate(chunks):
         output_start = int(chunk["output_start"])
         output_end = int(chunk["output_end"])
-        anchor_index = 0 if index == 0 else output_start - 1
+        discard_head = int(chunk.get("discard_head", 0))
+        if index == 0:
+            anchor_index = 0
+            boundary_anchor_source = "video_start"
+        elif normalized_anchor_mode == "overlap_first_frame" and discard_head > 0:
+            anchor_index = output_start - discard_head
+            boundary_anchor_source = "overlap_first"
+        else:
+            anchor_index = output_start - 1
+            boundary_anchor_source = "overlap_last"
         start_index = output_start
         if anchor_index < 0 or start_index < 0 or output_end <= output_start:
             raise ValueError(f"chunk {index} has invalid output range {output_start}:{output_end}.")
@@ -461,9 +476,11 @@ def _chunk_boundary_indices(
                 "output_range_1_based_inclusive": [output_start + 1, output_end],
                 "boundary_anchor_frame_0_based": anchor_index,
                 "boundary_anchor_frame_1_based": anchor_index + 1,
+                "boundary_anchor_mode": normalized_anchor_mode,
+                "boundary_anchor_source": boundary_anchor_source,
                 "new_chunk_start_frame_0_based": start_index,
                 "new_chunk_start_frame_1_based": start_index + 1,
-                "discard_head": int(chunk.get("discard_head", 0)),
+                "discard_head": discard_head,
                 "keep_frames": int(chunk.get("keep_frames", output_end - output_start)),
                 "generate_length": int(chunk.get("generate_length", output_end - output_start)),
                 "boundary_overlap": chunk.get("boundary_overlap", None),
@@ -560,10 +577,11 @@ def _build_keyframe_contact_sheet(
         start_row = boundary_row + 1
         chunk_number = int(row["chunk_index"]) + 1
         output_range = row["output_range_1_based_inclusive"]
+        boundary_source = str(row.get("boundary_anchor_source", "overlap_last")).replace("_", " ")
         draw_cell(
             boundary_anchor_frames[index],
             [
-                f"chunk {chunk_number} boundary",
+                f"chunk {chunk_number} {boundary_source}",
                 f"frame {int(row['boundary_anchor_frame_1_based'])}",
                 f"out {output_range[0]}-{output_range[1]}",
             ],
@@ -611,6 +629,7 @@ def _build_paired_keyframes(
                 "chunk_index": int(row["chunk_index"]),
                 "chunk_number_1_based": int(row["chunk_index"]) + 1,
                 "kind": "boundary_anchor",
+                "display_kind": str(row.get("boundary_anchor_source", "boundary_anchor")),
                 "frame_0_based": int(row["boundary_anchor_frame_0_based"]),
                 "frame_1_based": int(row["boundary_anchor_frame_1_based"]),
                 "output_range_1_based_inclusive": output_range,
@@ -733,6 +752,7 @@ def _save_keyframe_matrix_images(
             "chunk_index": chunk_index,
             "chunk_number_1_based": chunk_number,
             "kind": row_kind,
+            "display_kind": str(row.get("display_kind", row_kind)),
             "frame_1_based": frame_number,
             "frame_0_based": int(row.get("frame_0_based", frame_number - 1)),
             "output_range_1_based_inclusive": row.get("output_range_1_based_inclusive"),
@@ -740,7 +760,7 @@ def _save_keyframe_matrix_images(
             "subfolder": subfolder,
             "type": location,
         }
-        item["label"] = f"{index:03d} | chunk {chunk_number} | {item['kind']} | frame {frame_number}"
+        item["label"] = f"{index:03d} | chunk {chunk_number} | {item['display_kind']} | frame {frame_number}"
         items.append(item)
 
     return {
@@ -1073,6 +1093,10 @@ class SCAIL2ChunkKeyframeExtractor:
                 "include_final_anchor": ("BOOLEAN", {"default": False}),
                 "contact_sheet_columns": ("INT", {"default": 4, "min": 1, "max": 12, "step": 1}),
                 "contact_sheet_thumbnail_width": ("INT", {"default": 256, "min": 96, "max": 1024, "step": 16}),
+                "boundary_anchor_mode": (
+                    ["overlap_last_frame", "overlap_first_frame", ""],
+                    {"default": "overlap_last_frame"},
+                ),
             },
             "optional": {
                 "planner_summary": ("STRING", {"default": "", "multiline": True, "forceInput": True}),
@@ -1100,6 +1124,7 @@ class SCAIL2ChunkKeyframeExtractor:
         include_final_anchor: bool = False,
         contact_sheet_columns: int = 4,
         contact_sheet_thumbnail_width: int = 256,
+        boundary_anchor_mode: str = "overlap_last_frame",
         planner_summary: str = "",
     ):
         if not isinstance(video, torch.Tensor) or video.ndim != 4:
@@ -1145,7 +1170,17 @@ class SCAIL2ChunkKeyframeExtractor:
         else:
             raise ValueError(f"Unsupported keyframe extraction mode: {mode}")
 
-        anchor_indices, start_indices, rows = _chunk_boundary_indices(chunks, frame_cap, bool(include_final_anchor))
+        normalized_boundary_anchor_mode = (
+            "overlap_first_frame"
+            if str(boundary_anchor_mode or "").strip() == "overlap_first_frame"
+            else "overlap_last_frame"
+        )
+        anchor_indices, start_indices, rows = _chunk_boundary_indices(
+            chunks,
+            frame_cap,
+            bool(include_final_anchor),
+            normalized_boundary_anchor_mode,
+        )
         boundary_anchor_frames = _extract_frame_batch(video[:frame_cap], anchor_indices, "boundary_anchor_frames")
         new_chunk_start_frames = _extract_frame_batch(video[:frame_cap], start_indices, "new_chunk_start_frames")
         paired_keyframes, paired_keyframes_manifest = _build_paired_keyframes(
@@ -1176,6 +1211,7 @@ class SCAIL2ChunkKeyframeExtractor:
             "overlap_frames": int(overlap),
             "safe_continued_keep_frames": int(safe_continued_keep),
             "include_final_anchor": bool(include_final_anchor),
+            "boundary_anchor_mode": normalized_boundary_anchor_mode,
             "contact_sheet_columns": int(contact_sheet_columns),
             "contact_sheet_thumbnail_width": int(contact_sheet_thumbnail_width),
             "boundary_anchor_frame_indices_0_based": anchor_indices,

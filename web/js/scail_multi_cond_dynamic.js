@@ -258,6 +258,7 @@ function normalizeMatrixItem(item, index) {
     const rawChunkIndex = item?.chunk_index;
     const chunkNumber = item?.chunk_number_1_based ?? (Number.isFinite(Number(rawChunkIndex)) ? Number(rawChunkIndex) + 1 : "-");
     const frame = item?.frame_1_based ?? (frameMatch ? Number(frameMatch[1]) : null);
+    const displayKind = item?.display_kind ?? item?.kind ?? "image";
     return {
         ...(typeof item === "object" && item !== null ? item : {}),
         filename,
@@ -266,14 +267,15 @@ function normalizeMatrixItem(item, index) {
         batch_index: item?.batch_index ?? item?.index ?? index,
         chunk_index: rawChunkIndex ?? "-",
         chunk_number_1_based: chunkNumber,
-        kind: item?.kind ?? "image",
+        kind: item?.kind ?? displayKind,
+        display_kind: displayKind,
         frame_1_based: frame,
         output_range_1_based_inclusive: item?.output_range_1_based_inclusive,
         label:
             item?.label ??
-            `${String(item?.batch_index ?? item?.index ?? index).padStart(3, "0")} | chunk ${chunkNumber} | ${
-                item?.kind ?? "image"
-            }${frame ? ` | frame ${frame}` : ""}`,
+            `${String(item?.batch_index ?? item?.index ?? index).padStart(3, "0")} | chunk ${chunkNumber} | ${displayKind}${
+                frame ? ` | frame ${frame}` : ""
+            }`,
     };
 }
 

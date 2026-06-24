@@ -30,7 +30,7 @@ function normalizeItem(item, index) {
     const batchIndex = item?.batch_index ?? item?.index ?? index;
     const rawChunkIndex = item?.chunk_index;
     const chunkNumber = item?.chunk_number_1_based ?? (Number.isFinite(Number(rawChunkIndex)) ? Number(rawChunkIndex) + 1 : "-");
-    const kind = item?.kind ?? "image";
+    const kind = item?.display_kind ?? item?.kind ?? "image";
     const frame = item?.frame_1_based ?? (frameMatch ? Number(frameMatch[1]) : null);
     const fallbackLabel = `${String(batchIndex).padStart(3, "0")} | chunk ${chunkNumber} | ${kind}${
         frame ? ` | frame ${frame}` : ""
@@ -43,7 +43,8 @@ function normalizeItem(item, index) {
         batch_index: batchIndex,
         chunk_index: rawChunkIndex ?? "-",
         chunk_number_1_based: chunkNumber,
-        kind,
+        kind: item?.kind ?? kind,
+        display_kind: kind,
         frame_1_based: frame,
         output_range_1_based_inclusive: item?.output_range_1_based_inclusive,
         label: item?.label ?? fallbackLabel,
