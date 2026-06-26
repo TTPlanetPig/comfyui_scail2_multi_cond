@@ -1260,19 +1260,26 @@ def _square_bbox_from_bbox(
     side = int(math.ceil(max(box_w, box_h) * (1.0 + max(0.0, float(padding_ratio)) * 2.0)))
     align = max(1, int(align))
     side = max(align, int(math.ceil(side / align) * align))
-    side = min(side, max(int(width), int(height)))
+    side = min(side, int(width), int(height))
+    return _fixed_square_bbox_from_bbox(bbox, width, height, side)
+
+
+def _fixed_square_bbox_from_bbox(
+    bbox: tuple[int, int, int, int],
+    width: int,
+    height: int,
+    side: int,
+) -> tuple[int, int, int, int]:
+    x0, y0, x1, y1 = _clamp_bbox(bbox, width, height)
+    side = max(1, min(int(side), int(width), int(height)))
     cx = (x0 + x1) / 2.0
     cy = (y0 + y1) / 2.0
     sx0 = int(round(cx - side / 2.0))
     sy0 = int(round(cy - side / 2.0))
-    sx0 = max(0, min(int(width) - side, sx0)) if side <= int(width) else 0
-    sy0 = max(0, min(int(height) - side, sy0)) if side <= int(height) else 0
-    sx1 = min(int(width), sx0 + side)
-    sy1 = min(int(height), sy0 + side)
-    if sx1 - sx0 != sy1 - sy0:
-        side = min(sx1 - sx0, sy1 - sy0)
-        sx1 = sx0 + side
-        sy1 = sy0 + side
+    sx0 = max(0, min(int(width) - side, sx0))
+    sy0 = max(0, min(int(height) - side, sy0))
+    sx1 = sx0 + side
+    sy1 = sy0 + side
     return _clamp_bbox((sx0, sy0, sx1, sy1), width, height)
 
 
@@ -1281,25 +1288,21 @@ def _crop_video_by_manifest(
     masks: torch.Tensor,
     bboxes: list[tuple[int, int, int, int]],
 ) -> tuple[torch.Tensor, torch.Tensor, list[dict[str, Any]]]:
-    import torch.nn.functional as F
-
     _frame_count, height, width, channels = video.shape
-    crop_side = max(max(x1 - x0, y1 - y0) for x0, y0, x1, y1 in bboxes)
+    if not bboxes:
+        raise ValueError("crop manifest requires at least one bbox.")
+    crop_side = int(bboxes[0][2] - bboxes[0][0])
+    if crop_side <= 0 or int(bboxes[0][3] - bboxes[0][1]) != crop_side:
+        raise ValueError("crop manifest bboxes must be square.")
     crops: list[torch.Tensor] = []
     crop_masks: list[torch.Tensor] = []
     frames: list[dict[str, Any]] = []
     for index, bbox in enumerate(bboxes):
         x0, y0, x1, y1 = bbox
+        if int(x1 - x0) != crop_side or int(y1 - y0) != crop_side:
+            raise ValueError("all crop manifest bboxes must have the same fixed square size.")
         crop = video[index : index + 1, y0:y1, x0:x1, :]
         crop_mask = masks[index : index + 1, y0:y1, x0:x1]
-        if int(crop.shape[1]) != crop_side or int(crop.shape[2]) != crop_side:
-            crop = F.interpolate(
-                crop.movedim(-1, 1),
-                size=(crop_side, crop_side),
-                mode="bilinear",
-                align_corners=False,
-            ).movedim(1, -1)
-            crop_mask = _resize_mask_batch(crop_mask, crop_side, crop_side)
         crops.append(crop.cpu())
         crop_masks.append(crop_mask.cpu())
         frames.append(
@@ -2721,8 +2724,16 @@ class SCAIL2HeadTrackCrop:
         raw_bboxes = [_head_bbox_from_mask_frame(masks[index], int(width), int(height)) for index in range(int(frame_count))]
         filled_bboxes = _interpolate_missing_bboxes(raw_bboxes)
         smoothed = _smooth_bboxes(filled_bboxes, int(width), int(height), float(temporal_smoothing))
+        first_square_bbox = _square_bbox_from_bbox(
+            smoothed[0],
+            int(width),
+            int(height),
+            float(crop_padding_ratio),
+            int(square_align),
+        )
+        fixed_crop_size = int(first_square_bbox[2] - first_square_bbox[0])
         square_bboxes = [
-            _square_bbox_from_bbox(bbox, int(width), int(height), float(crop_padding_ratio), int(square_align))
+            _fixed_square_bbox_from_bbox(bbox, int(width), int(height), fixed_crop_size)
             for bbox in smoothed
         ]
         paste_masks = _constrain_masks_to_bboxes(masks, smoothed, int(width), int(height))
@@ -2736,8 +2747,10 @@ class SCAIL2HeadTrackCrop:
             "mask_source": mask_source,
             "crop_padding_ratio": float(crop_padding_ratio),
             "square_align": int(square_align),
+            "fixed_crop_size": int(fixed_crop_size),
+            "fixed_crop_anchor_frame": 0,
             "temporal_smoothing": float(temporal_smoothing),
-            "bbox_strategy": "compact_mask_or_head_from_large_mask",
+            "bbox_strategy": "first_frame_fixed_square_from_face_mask",
             "crop_bbox_field": "bbox",
             "mask_bbox_field": "mask_bbox",
             "mask_expand_px": int(mask_expand_px),

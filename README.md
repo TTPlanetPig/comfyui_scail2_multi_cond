@@ -108,8 +108,10 @@ The output `face_crop_video` is the square face-neighborhood crop. The output
 `crop_masks` is constrained to the detected face/head box inside that square,
 and `crop_manifest.frames[].bbox` records the square's full-body paste position
 while `crop_manifest.frames[].mask_bbox` records the tighter face/head mask
-position. For full-body 9:16 videos, start with `crop_padding_ratio` around
-`0.35` to `0.5`.
+position. The crop size is fixed from the first tracked frame after padding and
+stored as `crop_manifest.fixed_crop_size`; later frames move that same absolute
+pixel square instead of resizing per-frame crops. For full-body 9:16 videos,
+start with `crop_padding_ratio` around `0.35` to `0.5`.
 
 For the face crop pass, use either existing long-video scheduler:
 
