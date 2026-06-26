@@ -82,6 +82,41 @@ you fill `object_indices = 1` to select the second person in the driving video
 and the reference image only has one person, also filtering the reference by `1`
 would make the reference mask empty.
 
+### SCAIL-2 Face Detail Refinement
+
+Adds a second-pass face refinement path without replacing either long-video
+scheduler. The intended workflow is:
+
+```text
+SCAIL-2 Scheduled Long Video / Internal SAM.frames  # full-body pass
+  -> SCAIL-2 Head Track Crop
+  -> SCAIL-2 Scheduled Long Video / Internal SAM    # face crop pass
+  -> SCAIL-2 Face Composite Back
+  -> VHS_VideoCombine
+```
+
+`SCAIL-2 Head Track Crop` crops a stable square head video from the generated
+full-body frames. Connect a `head_masks` MASK when available. If your ComfyUI
+build exposes a SAM3 track-to-mask node, you can instead connect `sam_model`
+and `head_conditioning`; otherwise the node will ask for `head_masks`.
+
+For the face crop pass, use either existing long-video scheduler:
+
+- external-mask scheduler if you want to preview/adjust masks;
+- internal-SAM scheduler if you want the crop video tracked inside the node.
+
+Connect `face_crop_video` to the second scheduler's `pose_video`, and reuse the
+same `segment_plan`, `max_chunk_frames`, `overlap_frames`, and
+`boundary_overlap` settings as the full-body pass. Connect high-resolution face
+references to `reference_N`; if the whole clip should use one face, point every
+segment at reference `1`.
+
+`SCAIL-2 Face Composite Back` pastes the refined crop back into the original
+full-body frames using the crop manifest and mask. `color_correction` can be
+enabled or disabled. When enabled, `local_mean_std` matches the refined face
+crop to the target paste area before feather blending; when disabled, the node
+only blends by mask.
+
 ### SCAIL-2 Multi Reference Colored Mask
 
 Builds SCAIL-2 colored masks for multiple reference tracks in one place.

@@ -4,6 +4,7 @@ import gc
 import hashlib
 import inspect
 import json
+import math
 from typing import Any, Optional
 
 import torch
@@ -1033,6 +1034,235 @@ def _match_chunk_color_like_original(
     fallback["method"] = "fallback_rgb_overlap"
     fallback["fallback_reason"] = fallback_reason
     return corrected, fallback
+
+
+def _normalize_video_mask(mask: torch.Tensor, frame_count: int, height: int, width: int, name: str = "mask") -> torch.Tensor:
+    if not isinstance(mask, torch.Tensor):
+        raise ValueError(f"{name} must be a ComfyUI MASK tensor.")
+    value = mask.detach().cpu().float()
+    if value.ndim == 4:
+        value = value[..., 0]
+    if value.ndim != 3:
+        raise ValueError(f"{name} must have shape [B,H,W] or [B,H,W,C].")
+    if int(value.shape[0]) == 1 and int(frame_count) > 1:
+        value = value.repeat(int(frame_count), 1, 1)
+    if int(value.shape[0]) != int(frame_count):
+        raise ValueError(f"{name} frame count {int(value.shape[0])} does not match video frame count {frame_count}.")
+    if int(value.shape[1]) != int(height) or int(value.shape[2]) != int(width):
+        import torch.nn.functional as F
+
+        value = F.interpolate(
+            value.unsqueeze(1),
+            size=(int(height), int(width)),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(1)
+    return value.clamp(0, 1).contiguous()
+
+
+def _resize_mask_batch(mask: torch.Tensor, height: int, width: int, mode: str = "bilinear") -> torch.Tensor:
+    import torch.nn.functional as F
+
+    value = mask.detach().float()
+    if value.ndim == 3:
+        value = value.unsqueeze(1)
+    elif value.ndim == 4:
+        value = value.movedim(-1, 1)
+    else:
+        raise ValueError("mask must have shape [B,H,W] or [B,H,W,C].")
+    kwargs = {"mode": mode}
+    if mode in {"bilinear", "bicubic"}:
+        kwargs["align_corners"] = False
+    return F.interpolate(value, size=(int(height), int(width)), **kwargs).squeeze(1).clamp(0, 1).contiguous()
+
+
+def _binary_mask_morph(mask: torch.Tensor, expand_px: int = 0, contract_px: int = 0, blur_px: int = 0) -> torch.Tensor:
+    import torch.nn.functional as F
+
+    value = mask.detach().float().clamp(0, 1)
+    if value.ndim == 3:
+        value = value.unsqueeze(1)
+    elif value.ndim == 4:
+        value = value.movedim(-1, 1)
+    else:
+        raise ValueError("mask must have shape [B,H,W] or [B,H,W,C].")
+    value = (value > 0.05).float()
+    if int(expand_px) > 0:
+        kernel = int(expand_px) * 2 + 1
+        value = F.max_pool2d(value, kernel_size=kernel, stride=1, padding=int(expand_px))
+    if int(contract_px) > 0:
+        kernel = int(contract_px) * 2 + 1
+        value = 1.0 - F.max_pool2d(1.0 - value, kernel_size=kernel, stride=1, padding=int(contract_px))
+    if int(blur_px) > 0:
+        kernel = int(blur_px) * 2 + 1
+        value = F.avg_pool2d(value, kernel_size=kernel, stride=1, padding=int(blur_px))
+    return value.squeeze(1).clamp(0, 1).contiguous()
+
+
+def _bbox_from_mask_frame(mask: torch.Tensor) -> Optional[tuple[int, int, int, int]]:
+    coords = torch.nonzero(mask > 0.05, as_tuple=False)
+    if int(coords.shape[0]) <= 0:
+        return None
+    y0 = int(coords[:, 0].min().item())
+    y1 = int(coords[:, 0].max().item()) + 1
+    x0 = int(coords[:, 1].min().item())
+    x1 = int(coords[:, 1].max().item()) + 1
+    return x0, y0, x1, y1
+
+
+def _interpolate_missing_bboxes(raw: list[Optional[tuple[int, int, int, int]]]) -> list[tuple[int, int, int, int]]:
+    if not raw:
+        return []
+    valid = [index for index, bbox in enumerate(raw) if bbox is not None]
+    if not valid:
+        raise ValueError("head mask did not contain any detectable head region.")
+    out: list[tuple[int, int, int, int]] = [raw[valid[0]]] * len(raw)  # type: ignore[list-item]
+    for left_pos, left_index in enumerate(valid):
+        left_bbox = raw[left_index]
+        next_index = valid[left_pos + 1] if left_pos + 1 < len(valid) else None
+        if left_bbox is None:
+            continue
+        out[left_index] = left_bbox
+        end = next_index if next_index is not None else len(raw)
+        if next_index is None or raw[next_index] is None:
+            for index in range(left_index + 1, end):
+                out[index] = left_bbox
+            continue
+        right_bbox = raw[next_index]
+        gap = max(1, next_index - left_index)
+        for index in range(left_index + 1, next_index):
+            alpha = (index - left_index) / gap
+            out[index] = tuple(
+                int(round(float(left_bbox[channel]) * (1.0 - alpha) + float(right_bbox[channel]) * alpha))
+                for channel in range(4)
+            )
+    for index in range(0, valid[0]):
+        out[index] = raw[valid[0]]  # type: ignore[assignment]
+    return out
+
+
+def _smooth_bboxes(
+    bboxes: list[tuple[int, int, int, int]],
+    width: int,
+    height: int,
+    smoothing: float,
+) -> list[tuple[int, int, int, int]]:
+    if not bboxes:
+        return []
+    alpha = max(0.0, min(0.98, float(smoothing)))
+    previous = [float(value) for value in bboxes[0]]
+    smoothed: list[tuple[int, int, int, int]] = []
+    for bbox in bboxes:
+        current = [float(value) for value in bbox]
+        previous = [previous[index] * alpha + current[index] * (1.0 - alpha) for index in range(4)]
+        smoothed.append(_clamp_bbox(tuple(int(round(value)) for value in previous), width, height))
+    return smoothed
+
+
+def _square_bbox_from_bbox(
+    bbox: tuple[int, int, int, int],
+    width: int,
+    height: int,
+    padding_ratio: float,
+    align: int,
+) -> tuple[int, int, int, int]:
+    x0, y0, x1, y1 = _clamp_bbox(bbox, width, height)
+    box_w = max(1, x1 - x0)
+    box_h = max(1, y1 - y0)
+    side = int(math.ceil(max(box_w, box_h) * (1.0 + max(0.0, float(padding_ratio)) * 2.0)))
+    align = max(1, int(align))
+    side = max(align, int(math.ceil(side / align) * align))
+    side = min(side, max(int(width), int(height)))
+    cx = (x0 + x1) / 2.0
+    cy = (y0 + y1) / 2.0
+    sx0 = int(round(cx - side / 2.0))
+    sy0 = int(round(cy - side / 2.0))
+    sx0 = max(0, min(int(width) - side, sx0)) if side <= int(width) else 0
+    sy0 = max(0, min(int(height) - side, sy0)) if side <= int(height) else 0
+    sx1 = min(int(width), sx0 + side)
+    sy1 = min(int(height), sy0 + side)
+    if sx1 - sx0 != sy1 - sy0:
+        side = min(sx1 - sx0, sy1 - sy0)
+        sx1 = sx0 + side
+        sy1 = sy0 + side
+    return _clamp_bbox((sx0, sy0, sx1, sy1), width, height)
+
+
+def _crop_video_by_manifest(
+    video: torch.Tensor,
+    masks: torch.Tensor,
+    bboxes: list[tuple[int, int, int, int]],
+) -> tuple[torch.Tensor, torch.Tensor, list[dict[str, Any]]]:
+    import torch.nn.functional as F
+
+    _frame_count, height, width, channels = video.shape
+    crop_side = max(max(x1 - x0, y1 - y0) for x0, y0, x1, y1 in bboxes)
+    crops: list[torch.Tensor] = []
+    crop_masks: list[torch.Tensor] = []
+    frames: list[dict[str, Any]] = []
+    for index, bbox in enumerate(bboxes):
+        x0, y0, x1, y1 = bbox
+        crop = video[index : index + 1, y0:y1, x0:x1, :]
+        crop_mask = masks[index : index + 1, y0:y1, x0:x1]
+        if int(crop.shape[1]) != crop_side or int(crop.shape[2]) != crop_side:
+            crop = F.interpolate(
+                crop.movedim(-1, 1),
+                size=(crop_side, crop_side),
+                mode="bilinear",
+                align_corners=False,
+            ).movedim(1, -1)
+            crop_mask = _resize_mask_batch(crop_mask, crop_side, crop_side)
+        crops.append(crop.cpu())
+        crop_masks.append(crop_mask.cpu())
+        frames.append(
+            {
+                "frame": int(index),
+                "bbox": [int(x0), int(y0), int(x1), int(y1)],
+                "crop_size": int(crop_side),
+                "source_size": [int(width), int(height)],
+                "channels": int(channels),
+            }
+        )
+    return torch.cat(crops, dim=0).clamp(0, 1), torch.cat(crop_masks, dim=0).clamp(0, 1), frames
+
+
+def _parse_crop_manifest(crop_manifest: str) -> dict[str, Any]:
+    try:
+        manifest = json.loads(str(crop_manifest or "").strip())
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"crop_manifest must be valid JSON: {exc}") from exc
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("frames"), list):
+        raise ValueError("crop_manifest must contain a frames array.")
+    return manifest
+
+
+def _local_mean_std_color_match(source: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, dict[str, Any]]:
+    weight = mask.clamp(0, 1).to(dtype=torch.float32)
+    if weight.ndim == 3:
+        weight = weight.unsqueeze(-1)
+    total = weight.sum(dim=(1, 2), keepdim=True).clamp_min(1e-4)
+    src = source[:, :, :, :3].to(torch.float32)
+    dst = target[:, :, :, :3].to(torch.float32)
+    src_mean = (src * weight).sum(dim=(1, 2), keepdim=True) / total
+    dst_mean = (dst * weight).sum(dim=(1, 2), keepdim=True) / total
+    src_var = (((src - src_mean) ** 2) * weight).sum(dim=(1, 2), keepdim=True) / total
+    dst_var = (((dst - dst_mean) ** 2) * weight).sum(dim=(1, 2), keepdim=True) / total
+    scale = (dst_var.sqrt() / src_var.sqrt().clamp_min(1e-4)).clamp(0.82, 1.22)
+    shift = (dst_mean - src_mean * scale).clamp(-0.12, 0.12)
+    corrected = source.clone()
+    corrected[:, :, :, :3] = (src * scale + shift).clamp(0, 1).to(dtype=source.dtype)
+    return corrected, {"method": "local_mean_std", "applied": True}
+
+
+def _draw_manifest_debug(video: torch.Tensor, frames: list[dict[str, Any]], max_frames: int = 12) -> torch.Tensor:
+    count = min(int(max_frames), int(video.shape[0]), len(frames))
+    previews: list[torch.Tensor] = []
+    for index in range(count):
+        preview = video[index : index + 1, :, :, :3].detach().cpu().clone()
+        bbox = frames[index].get("bbox", [0, 0, int(video.shape[2]), int(video.shape[1])])
+        _draw_rect(preview, tuple(int(value) for value in bbox), (0.1, 0.9, 0.25))
+        previews.append(preview)
+    return torch.cat(previews, dim=0).contiguous() if previews else video[:1, :, :, :3].detach().cpu().contiguous()
 
 
 class SCAIL2SegmentPlanner:
@@ -2116,6 +2346,250 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
         return result
 
 
+def _try_track_data_to_mask(track_data, frame_count: int, height: int, width: int) -> Optional[tuple[torch.Tensor, dict[str, Any]]]:
+    try:
+        import nodes
+    except Exception:
+        return None
+    mappings = getattr(nodes, "NODE_CLASS_MAPPINGS", {})
+    candidates = []
+    for name, node_cls in mappings.items():
+        haystack = f"{name} {getattr(node_cls, '__name__', '')}".lower()
+        if "sam3" not in haystack or "mask" not in haystack:
+            continue
+        return_types = tuple(getattr(node_cls, "RETURN_TYPES", ()) or ())
+        if return_types and "MASK" not in return_types:
+            continue
+        candidates.append((name, node_cls))
+    for name, node_cls in candidates:
+        try:
+            node = node_cls()
+            function_name = getattr(node, "FUNCTION", getattr(node_cls, "FUNCTION", None))
+            if not function_name or not hasattr(node, function_name):
+                continue
+            fn = getattr(node, function_name)
+            kwargs: dict[str, Any] = {}
+            unsupported = False
+            for param_name, param in inspect.signature(fn).parameters.items():
+                if param_name == "self":
+                    continue
+                lower = param_name.lower()
+                if "track" in lower:
+                    kwargs[param_name] = track_data
+                elif lower in {"width", "w"}:
+                    kwargs[param_name] = int(width)
+                elif lower in {"height", "h"}:
+                    kwargs[param_name] = int(height)
+                elif lower in {"frame_count", "frames", "length"}:
+                    kwargs[param_name] = int(frame_count)
+                elif param.default is inspect._empty and param.kind not in (
+                    inspect.Parameter.VAR_POSITIONAL,
+                    inspect.Parameter.VAR_KEYWORD,
+                ):
+                    unsupported = True
+                    break
+            if unsupported:
+                continue
+            result = _node_result(fn(**kwargs))
+            mask = next((value for value in result if isinstance(value, torch.Tensor)), None)
+            if mask is None:
+                continue
+            normalized = _normalize_video_mask(mask, frame_count, height, width, name=f"{name}_mask")
+            return normalized, {"node": name, "function": function_name}
+        except Exception:
+            continue
+    return None
+
+
+class SCAIL2HeadTrackCrop:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "full_body_video": ("IMAGE",),
+                "crop_padding_ratio": ("FLOAT", {"default": 0.65, "min": 0.0, "max": 3.0, "step": 0.05}),
+                "square_align": ("INT", {"default": 32, "min": 1, "max": 256, "step": 1}),
+                "temporal_smoothing": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 0.98, "step": 0.05}),
+                "mask_expand_px": ("INT", {"default": 8, "min": 0, "max": 128, "step": 1}),
+                "mask_blur_px": ("INT", {"default": 4, "min": 0, "max": 64, "step": 1}),
+                "sam_detection_threshold": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "sam_max_objects": ("INT", {"default": 1, "min": 1, "max": 8, "step": 1}),
+                "sam_detect_interval": ("INT", {"default": 2, "min": 1, "max": 999, "step": 1}),
+            },
+            "optional": {
+                "head_masks": ("MASK",),
+                "sam_model": ("MODEL",),
+                "head_conditioning": ("CONDITIONING",),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK", "STRING", "IMAGE")
+    RETURN_NAMES = ("face_crop_video", "crop_masks", "crop_manifest", "debug_preview")
+    FUNCTION = "crop"
+    CATEGORY = f"{CATEGORY}/Face Detail"
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        fingerprint_inputs: dict[str, Any] = {}
+        for key in sorted(kwargs):
+            value = kwargs[key]
+            fingerprint_inputs[key] = value if isinstance(value, (str, int, float, bool)) or value is None else type(value).__name__
+        return _stable_fingerprint(fingerprint_inputs)
+
+    def crop(
+        self,
+        full_body_video: torch.Tensor,
+        crop_padding_ratio: float,
+        square_align: int,
+        temporal_smoothing: float,
+        mask_expand_px: int,
+        mask_blur_px: int,
+        sam_detection_threshold: float,
+        sam_max_objects: int,
+        sam_detect_interval: int,
+        head_masks: Optional[torch.Tensor] = None,
+        sam_model=None,
+        head_conditioning=None,
+    ):
+        if not isinstance(full_body_video, torch.Tensor) or full_body_video.ndim != 4:
+            raise ValueError("full_body_video must be a ComfyUI IMAGE tensor.")
+        video = full_body_video.detach().cpu().float().clamp(0, 1).contiguous()
+        frame_count, height, width, _channels = video.shape
+        mask_source = {"source": "head_masks"}
+        if head_masks is not None:
+            masks = _normalize_video_mask(head_masks, int(frame_count), int(height), int(width), name="head_masks")
+        elif sam_model is not None and head_conditioning is not None:
+            track_data = _run_sam3_track(
+                video,
+                sam_model,
+                head_conditioning,
+                detection_threshold=float(sam_detection_threshold),
+                max_objects=int(sam_max_objects),
+                detect_interval=int(sam_detect_interval),
+            )
+            converted = _try_track_data_to_mask(track_data, int(frame_count), int(height), int(width))
+            if converted is None:
+                raise RuntimeError(
+                    "SAM3 track data could not be converted to a regular MASK in this ComfyUI build. "
+                    "Connect a head_masks MASK output to SCAIL-2 Head Track Crop."
+                )
+            masks, converter = converted
+            mask_source = {"source": "sam3_dynamic_converter", "converter": converter}
+        else:
+            raise ValueError("Connect head_masks, or connect sam_model and head_conditioning if your ComfyUI exposes SAM3 mask conversion.")
+
+        masks = _binary_mask_morph(masks, expand_px=int(mask_expand_px), blur_px=int(mask_blur_px))
+        raw_bboxes = [_bbox_from_mask_frame(masks[index]) for index in range(int(frame_count))]
+        filled_bboxes = _interpolate_missing_bboxes(raw_bboxes)
+        smoothed = _smooth_bboxes(filled_bboxes, int(width), int(height), float(temporal_smoothing))
+        square_bboxes = [
+            _square_bbox_from_bbox(bbox, int(width), int(height), float(crop_padding_ratio), int(square_align))
+            for bbox in smoothed
+        ]
+        face_crop_video, crop_masks, frames = _crop_video_by_manifest(video, masks, square_bboxes)
+        manifest = {
+            "version": 1,
+            "source_shape": _shape(video),
+            "crop_shape": _shape(face_crop_video),
+            "mask_source": mask_source,
+            "crop_padding_ratio": float(crop_padding_ratio),
+            "square_align": int(square_align),
+            "temporal_smoothing": float(temporal_smoothing),
+            "mask_expand_px": int(mask_expand_px),
+            "mask_blur_px": int(mask_blur_px),
+            "missing_mask_frames": [int(index) for index, bbox in enumerate(raw_bboxes) if bbox is None],
+            "frames": frames,
+        }
+        debug_preview = _draw_manifest_debug(video, frames)
+        return (face_crop_video, crop_masks, json.dumps(manifest, indent=2), debug_preview)
+
+
+class SCAIL2FaceCompositeBack:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "full_body_video": ("IMAGE",),
+                "refined_face_video": ("IMAGE",),
+                "crop_masks": ("MASK",),
+                "crop_manifest": ("STRING", {"default": "", "multiline": True, "forceInput": True}),
+                "feather_px": ("INT", {"default": 8, "min": 0, "max": 128, "step": 1}),
+                "mask_contract_px": ("INT", {"default": 0, "min": 0, "max": 128, "step": 1}),
+                "color_correction": ("BOOLEAN", {"default": True}),
+                "color_match_method": (["local_mean_std", "none"], {"default": "local_mean_std"}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING", "IMAGE")
+    RETURN_NAMES = ("frames", "summary", "debug_preview")
+    FUNCTION = "composite"
+    CATEGORY = f"{CATEGORY}/Face Detail"
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        fingerprint_inputs: dict[str, Any] = {}
+        for key in sorted(kwargs):
+            value = kwargs[key]
+            fingerprint_inputs[key] = value if isinstance(value, (str, int, float, bool)) or value is None else type(value).__name__
+        return _stable_fingerprint(fingerprint_inputs)
+
+    def composite(
+        self,
+        full_body_video: torch.Tensor,
+        refined_face_video: torch.Tensor,
+        crop_masks: torch.Tensor,
+        crop_manifest: str,
+        feather_px: int,
+        mask_contract_px: int,
+        color_correction: bool,
+        color_match_method: str,
+    ):
+        if not isinstance(full_body_video, torch.Tensor) or full_body_video.ndim != 4:
+            raise ValueError("full_body_video must be a ComfyUI IMAGE tensor.")
+        if not isinstance(refined_face_video, torch.Tensor) or refined_face_video.ndim != 4:
+            raise ValueError("refined_face_video must be a ComfyUI IMAGE tensor.")
+        manifest = _parse_crop_manifest(crop_manifest)
+        frames_manifest = manifest["frames"]
+        frame_count = int(full_body_video.shape[0])
+        if int(refined_face_video.shape[0]) != frame_count or len(frames_manifest) != frame_count:
+            raise ValueError("full_body_video, refined_face_video, and crop_manifest must have the same frame count.")
+        full = full_body_video.detach().cpu().float().clamp(0, 1).contiguous()
+        refined = refined_face_video.detach().cpu().float().clamp(0, 1).contiguous()
+        masks = _normalize_video_mask(crop_masks, frame_count, int(refined.shape[1]), int(refined.shape[2]), name="crop_masks")
+        masks = _binary_mask_morph(masks, contract_px=int(mask_contract_px), blur_px=int(feather_px))
+        output = full.clone()
+        color_events: list[dict[str, Any]] = []
+        for index, item in enumerate(frames_manifest):
+            bbox = item.get("bbox")
+            if not isinstance(bbox, list) or len(bbox) != 4:
+                raise ValueError(f"crop_manifest frame {index} is missing bbox.")
+            x0, y0, x1, y1 = [int(value) for value in bbox]
+            x0, y0, x1, y1 = _clamp_bbox((x0, y0, x1, y1), int(full.shape[2]), int(full.shape[1]))
+            target_h = max(1, y1 - y0)
+            target_w = max(1, x1 - x0)
+            face = _resize_image_tensor_like(refined[index : index + 1, :, :, :3], torch.empty((1, target_h, target_w, 3)), mode="bilinear")
+            mask = _resize_mask_batch(masks[index : index + 1], target_h, target_w).unsqueeze(-1)
+            target = output[index : index + 1, y0:y1, x0:x1, :3]
+            if bool(color_correction) and str(color_match_method) == "local_mean_std":
+                face, color_info = _local_mean_std_color_match(face, target, mask)
+                if index < 12:
+                    color_events.append({"frame": int(index), **color_info})
+            mixed = torch.lerp(target, face[:, :, :, :3], mask).clamp(0, 1)
+            output[index : index + 1, y0:y1, x0:x1, :3] = mixed
+        debug_preview = _draw_manifest_debug(output, frames_manifest)
+        summary = {
+            "source_shape": _shape(full),
+            "refined_face_shape": _shape(refined),
+            "output_shape": _shape(output),
+            "feather_px": int(feather_px),
+            "mask_contract_px": int(mask_contract_px),
+            "color_correction": bool(color_correction),
+            "color_match_method": str(color_match_method) if bool(color_correction) else "none",
+            "sample_color_events": color_events,
+        }
+        return (output.contiguous().clamp(0, 1), json.dumps(summary, indent=2), debug_preview)
+
+
 class SCAIL2KeyframeMatrixViewer:
     @classmethod
     def INPUT_TYPES(cls):
@@ -2183,6 +2657,8 @@ NODE_CLASS_MAPPINGS = {
     "SCAIL2MultiReferenceColoredMask": SCAIL2MultiReferenceColoredMask,
     "SCAIL2ScheduledLongVideo": SCAIL2ScheduledLongVideo,
     "SCAIL2ScheduledLongVideoWithSAM": SCAIL2ScheduledLongVideoWithSAM,
+    "SCAIL2HeadTrackCrop": SCAIL2HeadTrackCrop,
+    "SCAIL2FaceCompositeBack": SCAIL2FaceCompositeBack,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -2193,4 +2669,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SCAIL2MultiReferenceColoredMask": "SCAIL-2 Multi Reference Colored Mask",
     "SCAIL2ScheduledLongVideo": "SCAIL-2 Scheduled Long Video",
     "SCAIL2ScheduledLongVideoWithSAM": "SCAIL-2 Scheduled Long Video (Internal SAM)",
+    "SCAIL2HeadTrackCrop": "SCAIL-2 Head Track Crop",
+    "SCAIL2FaceCompositeBack": "SCAIL-2 Face Composite Back",
 }
