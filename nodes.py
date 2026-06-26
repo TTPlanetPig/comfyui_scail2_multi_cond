@@ -1110,6 +1110,57 @@ def _bbox_from_mask_frame(mask: torch.Tensor) -> Optional[tuple[int, int, int, i
     return x0, y0, x1, y1
 
 
+def _head_bbox_from_mask_frame(mask: torch.Tensor, width: int, height: int) -> Optional[tuple[int, int, int, int]]:
+    full_bbox = _bbox_from_mask_frame(mask)
+    if full_bbox is None:
+        return None
+
+    x0, y0, x1, y1 = full_bbox
+    box_w = max(1, x1 - x0)
+    box_h = max(1, y1 - y0)
+    frame_area = max(1, int(width) * int(height))
+    box_area = box_w * box_h
+    looks_like_body = (
+        box_h > int(height) * 0.38
+        or box_w > int(width) * 0.70
+        or box_area > frame_area * 0.20
+    )
+    if not looks_like_body:
+        return full_bbox
+
+    band_h = max(8, min(box_h, int(round(box_h * 0.16))))
+    head_band = mask[y0 : y0 + band_h, x0:x1] > 0.05
+    coords = torch.nonzero(head_band, as_tuple=False)
+    if int(coords.shape[0]) > 0:
+        xs = coords[:, 1].float() + float(x0)
+        top_y = int(coords[:, 0].min().item()) + y0
+        if int(xs.numel()) >= 10:
+            sorted_xs = torch.sort(xs).values
+            q_low = float(sorted_xs[int((int(sorted_xs.numel()) - 1) * 0.10)].item())
+            q_high = float(sorted_xs[int((int(sorted_xs.numel()) - 1) * 0.90)].item())
+        else:
+            q_low = float(xs.min().item())
+            q_high = float(xs.max().item())
+        center_x = (q_low + q_high) / 2.0
+        measured_w = max(1, int(round(q_high - q_low + 1.0)))
+    else:
+        center_x = (x0 + x1) / 2.0
+        top_y = y0
+        measured_w = 1
+
+    max_head_side = max(16, int(round(min(int(width), int(height)) * 0.22)))
+    estimated_side = max(
+        16,
+        measured_w,
+        int(round(box_h * 0.16)),
+        int(round(min(int(width), int(height)) * 0.08)),
+    )
+    side = min(max_head_side, estimated_side, max(1, box_h), max(1, int(width)))
+    hx0 = int(round(center_x - side / 2.0))
+    hy0 = int(top_y)
+    return _clamp_bbox((hx0, hy0, hx0 + side, hy0 + side), int(width), int(height))
+
+
 def _clamp_bbox(bbox: tuple[int, int, int, int], width: int, height: int) -> tuple[int, int, int, int]:
     x0, y0, x1, y1 = bbox
     width = max(1, int(width))
@@ -2527,7 +2578,7 @@ class SCAIL2HeadTrackCrop:
             raise ValueError("Connect head_masks, or connect sam_model and head_conditioning if your ComfyUI exposes SAM3 mask conversion.")
 
         masks = _binary_mask_morph(masks, expand_px=int(mask_expand_px), blur_px=int(mask_blur_px))
-        raw_bboxes = [_bbox_from_mask_frame(masks[index]) for index in range(int(frame_count))]
+        raw_bboxes = [_head_bbox_from_mask_frame(masks[index], int(width), int(height)) for index in range(int(frame_count))]
         filled_bboxes = _interpolate_missing_bboxes(raw_bboxes)
         smoothed = _smooth_bboxes(filled_bboxes, int(width), int(height), float(temporal_smoothing))
         square_bboxes = [
@@ -2543,6 +2594,7 @@ class SCAIL2HeadTrackCrop:
             "crop_padding_ratio": float(crop_padding_ratio),
             "square_align": int(square_align),
             "temporal_smoothing": float(temporal_smoothing),
+            "bbox_strategy": "compact_mask_or_head_from_large_mask",
             "mask_expand_px": int(mask_expand_px),
             "mask_blur_px": int(mask_blur_px),
             "missing_mask_frames": [int(index) for index, bbox in enumerate(raw_bboxes) if bbox is None],

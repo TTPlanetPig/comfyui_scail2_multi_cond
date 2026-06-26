@@ -98,7 +98,10 @@ SCAIL-2 Scheduled Long Video / Internal SAM.frames  # full-body pass
 `SCAIL-2 Head Track Crop` crops a stable square head video from the generated
 full-body frames. Connect a `head_masks` MASK when available. If your ComfyUI
 build exposes a SAM3 track-to-mask node, you can instead connect `sam_model`
-and `head_conditioning`; otherwise the node will ask for `head_masks`.
+and `head_conditioning`; otherwise the node will ask for `head_masks`. When a
+SAM or colored-mask fallback returns a full-body or upper-body mask, the crop
+node estimates the head box from the top of that tracked region instead of using
+the whole body box, which keeps 9:16 full-body videos cropped around the face.
 
 For the face crop pass, use either existing long-video scheduler:
 
