@@ -1148,7 +1148,7 @@ def _head_bbox_from_mask_frame(mask: torch.Tensor, width: int, height: int) -> O
         top_y = y0
         measured_w = 1
 
-    max_head_side = max(16, int(round(min(int(width), int(height)) * 0.22)))
+    max_head_side = max(16, int(round(min(int(width), int(height)) * 0.18)))
     estimated_side = max(
         16,
         measured_w,
@@ -1181,6 +1181,21 @@ def _draw_rect(image: torch.Tensor, bbox: tuple[int, int, int, int], color: tupl
     image[:, max(y1 - thickness, y0) : y1, x0:x1, :3] = rgb
     image[:, y0:y1, x0 : min(x0 + thickness, x1), :3] = rgb
     image[:, y0:y1, max(x1 - thickness, x0) : x1, :3] = rgb
+
+
+def _constrain_masks_to_bboxes(
+    masks: torch.Tensor,
+    bboxes: list[tuple[int, int, int, int]],
+    width: int,
+    height: int,
+) -> torch.Tensor:
+    constrained = torch.zeros_like(masks)
+    for index, bbox in enumerate(bboxes[: int(masks.shape[0])]):
+        x0, y0, x1, y1 = _clamp_bbox(bbox, int(width), int(height))
+        constrained[index, y0:y1, x0:x1] = masks[index, y0:y1, x0:x1]
+        if float(constrained[index].max().item()) <= 0.05:
+            constrained[index, y0:y1, x0:x1] = 1.0
+    return constrained.clamp(0, 1).contiguous()
 
 
 def _interpolate_missing_bboxes(raw: list[Optional[tuple[int, int, int, int]]]) -> list[tuple[int, int, int, int]]:
@@ -2474,13 +2489,113 @@ def _try_track_data_to_mask(track_data, frame_count: int, height: int, width: in
     return None
 
 
+def _coerce_track_mask_tensor(
+    value: torch.Tensor,
+    frame_count: int,
+    height: int,
+    width: int,
+) -> Optional[torch.Tensor]:
+    tensor = value.detach().cpu().float()
+    if int(tensor.numel()) <= 0:
+        return None
+    if float(tensor.min().item()) < 0.0 or float(tensor.max().item()) > 1.0:
+        tensor = torch.sigmoid(tensor)
+
+    if tensor.ndim == 2 and int(tensor.shape[0]) == int(height) and int(tensor.shape[1]) == int(width):
+        tensor = tensor.unsqueeze(0).repeat(int(frame_count), 1, 1)
+    elif tensor.ndim == 3:
+        if int(tensor.shape[0]) == int(frame_count) and int(tensor.shape[1]) == int(height) and int(tensor.shape[2]) == int(width):
+            pass
+        elif int(tensor.shape[-2]) == int(height) and int(tensor.shape[-1]) == int(width):
+            tensor = tensor.amax(dim=0, keepdim=True).repeat(int(frame_count), 1, 1)
+        else:
+            return None
+    elif tensor.ndim == 4:
+        if int(tensor.shape[0]) == int(frame_count) and int(tensor.shape[-2]) == int(height) and int(tensor.shape[-1]) == int(width):
+            tensor = tensor.amax(dim=1)
+        elif int(tensor.shape[1]) == int(frame_count) and int(tensor.shape[-2]) == int(height) and int(tensor.shape[-1]) == int(width):
+            tensor = tensor.amax(dim=0)
+        elif int(tensor.shape[0]) == int(frame_count) and int(tensor.shape[1]) == int(height) and int(tensor.shape[2]) == int(width):
+            tensor = tensor.amax(dim=-1)
+        else:
+            return None
+    else:
+        return None
+
+    if tensor.ndim != 3:
+        return None
+    try:
+        normalized = _normalize_video_mask(tensor, int(frame_count), int(height), int(width), name="sam3_track_tensor")
+    except Exception:
+        return None
+    if float(normalized.max().item()) <= 0.05:
+        return None
+    return normalized
+
+
+def _extract_track_data_mask(track_data, frame_count: int, height: int, width: int) -> Optional[tuple[torch.Tensor, dict[str, Any]]]:
+    seen: set[int] = set()
+    candidates: list[tuple[float, str, torch.Tensor]] = []
+    preferred_tokens = ("mask", "seg", "pred", "logit")
+    blocked_tokens = ("image", "frame", "video", "rgb")
+
+    def visit(value, path: str, depth: int = 0) -> None:
+        if depth > 8:
+            return
+        marker = id(value)
+        if marker in seen:
+            return
+        seen.add(marker)
+
+        if isinstance(value, torch.Tensor):
+            mask = _coerce_track_mask_tensor(value, int(frame_count), int(height), int(width))
+            if mask is None:
+                return
+            density = float((mask > 0.05).float().mean().item())
+            if density <= 0.0 or density >= 0.95:
+                return
+            path_lower = path.lower()
+            if any(token in path_lower for token in blocked_tokens):
+                return
+            preferred = any(token in path_lower for token in preferred_tokens)
+            if not preferred and density > 0.35:
+                return
+            score = abs(density - 0.045) + (0.0 if preferred else 0.25)
+            candidates.append((score, path, mask))
+            return
+
+        if isinstance(value, dict):
+            for key, item in value.items():
+                visit(item, f"{path}.{key}", depth + 1)
+            return
+
+        if isinstance(value, (list, tuple)):
+            for index, item in enumerate(value):
+                visit(item, f"{path}[{index}]", depth + 1)
+            return
+
+        for attr in ("masks", "mask", "pred_masks", "mask_logits", "segments", "outputs"):
+            if hasattr(value, attr):
+                try:
+                    visit(getattr(value, attr), f"{path}.{attr}", depth + 1)
+                except Exception:
+                    continue
+
+    visit(track_data, "track_data")
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0])
+    score, path, mask = candidates[0]
+    return mask, {"source": "sam3_track_data_tensor", "path": path, "score": float(score)}
+
+
 class SCAIL2HeadTrackCrop:
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
                 "full_body_video": ("IMAGE",),
-                "crop_padding_ratio": ("FLOAT", {"default": 0.65, "min": 0.0, "max": 3.0, "step": 0.05}),
+                "crop_padding_ratio": ("FLOAT", {"default": 0.45, "min": 0.0, "max": 3.0, "step": 0.05}),
                 "square_align": ("INT", {"default": 32, "min": 1, "max": 256, "step": 1}),
                 "temporal_smoothing": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 0.98, "step": 0.05}),
                 "mask_expand_px": ("INT", {"default": 8, "min": 0, "max": 128, "step": 1}),
@@ -2541,34 +2656,24 @@ class SCAIL2HeadTrackCrop:
                 detect_interval=int(sam_detect_interval),
             )
             conversion_errors: list[str] = []
-            try:
-                colored_mask, _reference_mask = _create_scail_masks(
-                    track_data,
-                    track_data,
-                    "",
-                    "area",
-                    True,
-                )
-                masks = _normalize_video_mask(
-                    colored_mask,
-                    int(frame_count),
-                    int(height),
-                    int(width),
-                    name="sam3_scail_colored_mask",
-                )
-                mask_source = {"source": "sam3_scail_colored_mask", "sort_by": "area"}
-            except Exception as exc:
-                conversion_errors.append(f"SCAIL2ColoredMask:{type(exc).__name__}:{exc}")
+            extracted = _extract_track_data_mask(track_data, int(frame_count), int(height), int(width))
+            if extracted is not None:
+                masks, extractor = extracted
+                mask_source = extractor
+            else:
+                conversion_errors.append("SAM3TrackDataTensor:no_matching_mask_tensor")
                 converted = _try_track_data_to_mask(track_data, int(frame_count), int(height), int(width))
-                if converted is None:
+                if converted is not None:
+                    masks, converter = converted
+                    mask_source = {"source": "sam3_dynamic_converter", "converter": converter}
+                else:
+                    conversion_errors.append("SAM3DynamicConverter:no_converter_matched")
                     detail = "; ".join(conversion_errors) if conversion_errors else "no converter matched"
                     raise RuntimeError(
-                        "SAM3 track data could not be converted to a regular MASK in this ComfyUI build. "
-                        "Connect a head_masks MASK output to SCAIL-2 Head Track Crop. "
+                        "SAM3 track data could not be converted to a regular face/head MASK in this ComfyUI build. "
+                        "Connect a real face/head MASK to head_masks, or use a ComfyUI SAM3 node that outputs MASK. "
                         f"Conversion detail: {detail}"
                     )
-                masks, converter = converted
-                mask_source = {"source": "sam3_dynamic_converter", "converter": converter, "fallback_after": conversion_errors}
             if float(masks.max().item()) <= 0.05:
                 raise RuntimeError(
                     "SAM3 tracking produced an empty head mask. Try a more specific prompt such as 'face' or 'head', "
@@ -2585,7 +2690,10 @@ class SCAIL2HeadTrackCrop:
             _square_bbox_from_bbox(bbox, int(width), int(height), float(crop_padding_ratio), int(square_align))
             for bbox in smoothed
         ]
-        face_crop_video, crop_masks, frames = _crop_video_by_manifest(video, masks, square_bboxes)
+        paste_masks = _constrain_masks_to_bboxes(masks, smoothed, int(width), int(height))
+        face_crop_video, crop_masks, frames = _crop_video_by_manifest(video, paste_masks, square_bboxes)
+        for frame, mask_bbox in zip(frames, smoothed):
+            frame["mask_bbox"] = [int(value) for value in mask_bbox]
         manifest = {
             "version": 1,
             "source_shape": _shape(video),
@@ -2595,6 +2703,8 @@ class SCAIL2HeadTrackCrop:
             "square_align": int(square_align),
             "temporal_smoothing": float(temporal_smoothing),
             "bbox_strategy": "compact_mask_or_head_from_large_mask",
+            "crop_bbox_field": "bbox",
+            "mask_bbox_field": "mask_bbox",
             "mask_expand_px": int(mask_expand_px),
             "mask_blur_px": int(mask_blur_px),
             "missing_mask_frames": [int(index) for index, bbox in enumerate(raw_bboxes) if bbox is None],
