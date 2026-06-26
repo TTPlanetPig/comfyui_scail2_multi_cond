@@ -860,6 +860,58 @@ def _resize_image_tensor_like(image: torch.Tensor, target: torch.Tensor, *, mode
     return resized.to(dtype=target.dtype).contiguous()
 
 
+def _fit_image_to_size(
+    image: torch.Tensor,
+    target_h: int,
+    target_w: int,
+    *,
+    fit_mode: str = "center_crop",
+    mode: str = "bilinear",
+) -> torch.Tensor:
+    import torch.nn.functional as F
+
+    target_h = max(1, int(target_h))
+    target_w = max(1, int(target_w))
+    if int(image.shape[1]) == target_h and int(image.shape[2]) == target_w:
+        return image.contiguous()
+    normalized = str(fit_mode or "center_crop").strip()
+    if normalized not in {"center_crop", "pad", "stretch"}:
+        normalized = "center_crop"
+    if normalized == "stretch":
+        return _resize_image_tensor_like(image, torch.empty((1, target_h, target_w, int(image.shape[-1]))), mode=mode)
+
+    src_h = max(1, int(image.shape[1]))
+    src_w = max(1, int(image.shape[2]))
+    scale = max(target_h / src_h, target_w / src_w) if normalized == "center_crop" else min(target_h / src_h, target_w / src_w)
+    resize_h = max(1, int(round(src_h * scale)))
+    resize_w = max(1, int(round(src_w * scale)))
+    kwargs = {"align_corners": False} if mode in {"bilinear", "bicubic"} else {}
+    resized = F.interpolate(
+        image.detach().float().movedim(-1, 1),
+        size=(resize_h, resize_w),
+        mode=mode,
+        **kwargs,
+    ).movedim(1, -1)
+    if int(resized.shape[1]) > target_h:
+        y0 = (int(resized.shape[1]) - target_h) // 2
+        resized = resized[:, y0 : y0 + target_h, :, :]
+        resize_h = target_h
+    if int(resized.shape[2]) > target_w:
+        x0 = (int(resized.shape[2]) - target_w) // 2
+        resized = resized[:, :, x0 : x0 + target_w, :]
+        resize_w = target_w
+    if normalized == "center_crop":
+        y0 = max(0, (resize_h - target_h) // 2)
+        x0 = max(0, (resize_w - target_w) // 2)
+        return resized[:, y0 : y0 + target_h, x0 : x0 + target_w, :].to(dtype=image.dtype).contiguous()
+
+    fitted = torch.zeros((int(image.shape[0]), target_h, target_w, int(image.shape[-1])), dtype=resized.dtype, device=resized.device)
+    y0 = max(0, (target_h - resize_h) // 2)
+    x0 = max(0, (target_w - resize_w) // 2)
+    fitted[:, y0 : y0 + resize_h, x0 : x0 + resize_w, :] = resized
+    return fitted.to(dtype=image.dtype).contiguous()
+
+
 def _sample_for_decode(*, model, positive, negative, sampler, sigmas, latent, seed: int, cfg: float) -> dict:
     from comfy_extras.nodes_custom_sampler import SamplerCustom
 
@@ -2834,6 +2886,7 @@ class SCAIL2FaceCompositeBack:
                 "mask_contract_px": ("INT", {"default": 0, "min": 0, "max": 128, "step": 1}),
                 "color_correction": ("BOOLEAN", {"default": True}),
                 "color_match_method": (["local_mean_std", "none"], {"default": "local_mean_std"}),
+                "face_fit_mode": (["center_crop", "pad", "stretch"], {"default": "center_crop"}),
             }
         }
 
@@ -2860,6 +2913,7 @@ class SCAIL2FaceCompositeBack:
         mask_contract_px: int,
         color_correction: bool,
         color_match_method: str,
+        face_fit_mode: str = "center_crop",
     ):
         if not isinstance(full_body_video, torch.Tensor) or full_body_video.ndim != 4:
             raise ValueError("full_body_video must be a ComfyUI IMAGE tensor.")
@@ -2874,6 +2928,9 @@ class SCAIL2FaceCompositeBack:
         refined = refined_face_video.detach().cpu().float().clamp(0, 1).contiguous()
         masks = _normalize_video_mask(crop_masks, frame_count, int(refined.shape[1]), int(refined.shape[2]), name="crop_masks")
         masks = _binary_mask_morph(masks, contract_px=int(mask_contract_px), blur_px=int(feather_px))
+        normalized_face_fit_mode = str(face_fit_mode or "center_crop").strip()
+        if normalized_face_fit_mode not in {"center_crop", "pad", "stretch"}:
+            normalized_face_fit_mode = "center_crop"
         output = full.clone()
         color_events: list[dict[str, Any]] = []
         for index, item in enumerate(frames_manifest):
@@ -2884,8 +2941,21 @@ class SCAIL2FaceCompositeBack:
             x0, y0, x1, y1 = _clamp_bbox((x0, y0, x1, y1), int(full.shape[2]), int(full.shape[1]))
             target_h = max(1, y1 - y0)
             target_w = max(1, x1 - x0)
-            face = _resize_image_tensor_like(refined[index : index + 1, :, :, :3], torch.empty((1, target_h, target_w, 3)), mode="bilinear")
-            mask = _resize_mask_batch(masks[index : index + 1], target_h, target_w).unsqueeze(-1)
+            face = _fit_image_to_size(
+                refined[index : index + 1, :, :, :3],
+                target_h,
+                target_w,
+                fit_mode=normalized_face_fit_mode,
+                mode="bilinear",
+            )
+            mask_image = masks[index : index + 1].unsqueeze(-1)
+            mask = _fit_image_to_size(
+                mask_image,
+                target_h,
+                target_w,
+                fit_mode=normalized_face_fit_mode,
+                mode="nearest",
+            ).clamp(0, 1)
             target = output[index : index + 1, y0:y1, x0:x1, :3]
             if bool(color_correction) and str(color_match_method) == "local_mean_std":
                 face, color_info = _local_mean_std_color_match(face, target, mask)
@@ -2900,6 +2970,7 @@ class SCAIL2FaceCompositeBack:
             "output_shape": _shape(output),
             "feather_px": int(feather_px),
             "mask_contract_px": int(mask_contract_px),
+            "face_fit_mode": normalized_face_fit_mode,
             "color_correction": bool(color_correction),
             "color_match_method": str(color_match_method) if bool(color_correction) else "none",
             "sample_color_events": color_events,
