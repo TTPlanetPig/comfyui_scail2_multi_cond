@@ -120,7 +120,9 @@ start with `crop_padding_ratio` around `0.35` to `0.5`.
 - `fixed_canvas`: computes the smallest padded square that covers the tracked
   face/head region across the whole clip, then uses that same fixed full-body
   bbox for every frame. Use this when the second pass should refine a stable
-  local camera region while the head moves inside it.
+  local camera region while the head moves inside it. Obvious oversized head
+  bbox outliers are ignored when building this canvas so a single SAM miss does
+  not expand the crop to the upper body.
 
 For the face crop pass, use either existing long-video scheduler:
 

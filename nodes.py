@@ -1118,12 +1118,15 @@ def _head_bbox_from_mask_frame(mask: torch.Tensor, width: int, height: int) -> O
     x0, y0, x1, y1 = full_bbox
     box_w = max(1, x1 - x0)
     box_h = max(1, y1 - y0)
+    min_frame_side = max(1, min(int(width), int(height)))
+    max_head_side = max(16, int(round(min_frame_side * 0.18)))
     frame_area = max(1, int(width) * int(height))
     box_area = box_w * box_h
     looks_like_body = (
-        box_h > int(height) * 0.38
-        or box_w > int(width) * 0.70
-        or box_area > frame_area * 0.20
+        box_h > int(height) * 0.28
+        or box_w > int(width) * 0.45
+        or max(box_w, box_h) > max_head_side * 1.35
+        or box_area > frame_area * 0.08
     )
     if not looks_like_body:
         return full_bbox
@@ -1148,12 +1151,11 @@ def _head_bbox_from_mask_frame(mask: torch.Tensor, width: int, height: int) -> O
         top_y = y0
         measured_w = 1
 
-    max_head_side = max(16, int(round(min(int(width), int(height)) * 0.18)))
     estimated_side = max(
         16,
         measured_w,
         int(round(box_h * 0.16)),
-        int(round(min(int(width), int(height)) * 0.08)),
+        int(round(min_frame_side * 0.08)),
     )
     side = min(max_head_side, estimated_side, max(1, box_h), max(1, int(width)))
     hx0 = int(round(center_x - side / 2.0))
@@ -1276,6 +1278,20 @@ def _union_bbox_from_bboxes(
     x1 = max(int(bbox[2]) for bbox in bboxes)
     y1 = max(int(bbox[3]) for bbox in bboxes)
     return _clamp_bbox((x0, y0, x1, y1), int(width), int(height))
+
+
+def _filter_head_bbox_outliers(bboxes: list[tuple[int, int, int, int]]) -> list[tuple[int, int, int, int]]:
+    if len(bboxes) < 5:
+        return bboxes
+    sides = sorted(max(int(x1 - x0), int(y1 - y0)) for x0, y0, x1, y1 in bboxes)
+    median_side = max(1, sides[len(sides) // 2])
+    max_side = max(median_side * 2.0, median_side + 48.0)
+    filtered = [
+        bbox
+        for bbox in bboxes
+        if max(int(bbox[2] - bbox[0]), int(bbox[3] - bbox[1])) <= max_side
+    ]
+    return filtered if len(filtered) >= max(3, len(bboxes) // 2) else bboxes
 
 
 def _fixed_square_bbox_from_bbox(
@@ -2743,8 +2759,11 @@ class SCAIL2HeadTrackCrop:
         normalized_crop_mode = str(crop_mode or "center_follow").strip() or "center_follow"
         if normalized_crop_mode not in {"center_follow", "fixed_canvas"}:
             normalized_crop_mode = "center_follow"
+        canvas_bbox_source_count = len(smoothed)
         if normalized_crop_mode == "fixed_canvas":
-            canvas_source_bbox = _union_bbox_from_bboxes(smoothed, int(width), int(height))
+            canvas_bboxes = _filter_head_bbox_outliers(smoothed)
+            canvas_bbox_source_count = len(canvas_bboxes)
+            canvas_source_bbox = _union_bbox_from_bboxes(canvas_bboxes, int(width), int(height))
             canvas_bbox = _square_bbox_from_bbox(
                 canvas_source_bbox,
                 int(width),
@@ -2787,6 +2806,8 @@ class SCAIL2HeadTrackCrop:
             "fixed_crop_size": int(fixed_crop_size),
             "fixed_crop_anchor_frame": fixed_crop_anchor_frame,
             "canvas_source_bbox": [int(value) for value in canvas_source_bbox],
+            "canvas_bbox_source_count": int(canvas_bbox_source_count),
+            "canvas_bbox_filtered_count": int(len(smoothed) - canvas_bbox_source_count),
             "temporal_smoothing": float(temporal_smoothing),
             "bbox_strategy": bbox_strategy,
             "crop_bbox_field": "bbox",
