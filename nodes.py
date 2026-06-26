@@ -1264,6 +1264,20 @@ def _square_bbox_from_bbox(
     return _fixed_square_bbox_from_bbox(bbox, width, height, side)
 
 
+def _union_bbox_from_bboxes(
+    bboxes: list[tuple[int, int, int, int]],
+    width: int,
+    height: int,
+) -> tuple[int, int, int, int]:
+    if not bboxes:
+        raise ValueError("cannot build a fixed canvas without at least one bbox.")
+    x0 = min(int(bbox[0]) for bbox in bboxes)
+    y0 = min(int(bbox[1]) for bbox in bboxes)
+    x1 = max(int(bbox[2]) for bbox in bboxes)
+    y1 = max(int(bbox[3]) for bbox in bboxes)
+    return _clamp_bbox((x0, y0, x1, y1), int(width), int(height))
+
+
 def _fixed_square_bbox_from_bbox(
     bbox: tuple[int, int, int, int],
     width: int,
@@ -2641,6 +2655,7 @@ class SCAIL2HeadTrackCrop:
                 "sam_detection_threshold": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "sam_max_objects": ("INT", {"default": 1, "min": 1, "max": 8, "step": 1}),
                 "sam_detect_interval": ("INT", {"default": 2, "min": 1, "max": 999, "step": 1}),
+                "crop_mode": (["center_follow", "fixed_canvas"], {"default": "center_follow"}),
             },
             "optional": {
                 "head_masks": ("MASK",),
@@ -2673,6 +2688,7 @@ class SCAIL2HeadTrackCrop:
         sam_detection_threshold: float,
         sam_max_objects: int,
         sam_detect_interval: int,
+        crop_mode: str = "center_follow",
         head_masks: Optional[torch.Tensor] = None,
         sam_model=None,
         head_conditioning=None,
@@ -2724,18 +2740,38 @@ class SCAIL2HeadTrackCrop:
         raw_bboxes = [_head_bbox_from_mask_frame(masks[index], int(width), int(height)) for index in range(int(frame_count))]
         filled_bboxes = _interpolate_missing_bboxes(raw_bboxes)
         smoothed = _smooth_bboxes(filled_bboxes, int(width), int(height), float(temporal_smoothing))
-        first_square_bbox = _square_bbox_from_bbox(
-            smoothed[0],
-            int(width),
-            int(height),
-            float(crop_padding_ratio),
-            int(square_align),
-        )
-        fixed_crop_size = int(first_square_bbox[2] - first_square_bbox[0])
-        square_bboxes = [
-            _fixed_square_bbox_from_bbox(bbox, int(width), int(height), fixed_crop_size)
-            for bbox in smoothed
-        ]
+        normalized_crop_mode = str(crop_mode or "center_follow").strip() or "center_follow"
+        if normalized_crop_mode not in {"center_follow", "fixed_canvas"}:
+            normalized_crop_mode = "center_follow"
+        if normalized_crop_mode == "fixed_canvas":
+            canvas_source_bbox = _union_bbox_from_bboxes(smoothed, int(width), int(height))
+            canvas_bbox = _square_bbox_from_bbox(
+                canvas_source_bbox,
+                int(width),
+                int(height),
+                float(crop_padding_ratio),
+                int(square_align),
+            )
+            fixed_crop_size = int(canvas_bbox[2] - canvas_bbox[0])
+            square_bboxes = [canvas_bbox for _index in range(int(frame_count))]
+            bbox_strategy = "fixed_canvas_union_from_face_masks"
+            fixed_crop_anchor_frame: Optional[int] = None
+        else:
+            first_square_bbox = _square_bbox_from_bbox(
+                smoothed[0],
+                int(width),
+                int(height),
+                float(crop_padding_ratio),
+                int(square_align),
+            )
+            fixed_crop_size = int(first_square_bbox[2] - first_square_bbox[0])
+            square_bboxes = [
+                _fixed_square_bbox_from_bbox(bbox, int(width), int(height), fixed_crop_size)
+                for bbox in smoothed
+            ]
+            canvas_source_bbox = smoothed[0]
+            bbox_strategy = "first_frame_fixed_square_from_face_mask"
+            fixed_crop_anchor_frame = 0
         paste_masks = _constrain_masks_to_bboxes(masks, smoothed, int(width), int(height))
         face_crop_video, crop_masks, frames = _crop_video_by_manifest(video, paste_masks, square_bboxes)
         for frame, mask_bbox in zip(frames, smoothed):
@@ -2745,12 +2781,14 @@ class SCAIL2HeadTrackCrop:
             "source_shape": _shape(video),
             "crop_shape": _shape(face_crop_video),
             "mask_source": mask_source,
+            "crop_mode": normalized_crop_mode,
             "crop_padding_ratio": float(crop_padding_ratio),
             "square_align": int(square_align),
             "fixed_crop_size": int(fixed_crop_size),
-            "fixed_crop_anchor_frame": 0,
+            "fixed_crop_anchor_frame": fixed_crop_anchor_frame,
+            "canvas_source_bbox": [int(value) for value in canvas_source_bbox],
             "temporal_smoothing": float(temporal_smoothing),
-            "bbox_strategy": "first_frame_fixed_square_from_face_mask",
+            "bbox_strategy": bbox_strategy,
             "crop_bbox_field": "bbox",
             "mask_bbox_field": "mask_bbox",
             "mask_expand_px": int(mask_expand_px),

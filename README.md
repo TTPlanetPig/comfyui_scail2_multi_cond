@@ -113,6 +113,15 @@ stored as `crop_manifest.fixed_crop_size`; later frames move that same absolute
 pixel square instead of resizing per-frame crops. For full-body 9:16 videos,
 start with `crop_padding_ratio` around `0.35` to `0.5`.
 
+`crop_mode` controls how the square crop is placed:
+
+- `center_follow`: keeps the crop size fixed from the first tracked frame, then
+  follows the face center frame by frame.
+- `fixed_canvas`: computes the smallest padded square that covers the tracked
+  face/head region across the whole clip, then uses that same fixed full-body
+  bbox for every frame. Use this when the second pass should refine a stable
+  local camera region while the head moves inside it.
+
 For the face crop pass, use either existing long-video scheduler:
 
 - external-mask scheduler if you want to preview/adjust masks;
