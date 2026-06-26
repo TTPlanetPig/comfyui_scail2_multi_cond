@@ -1041,7 +1041,7 @@ def _normalize_video_mask(mask: torch.Tensor, frame_count: int, height: int, wid
         raise ValueError(f"{name} must be a ComfyUI MASK tensor.")
     value = mask.detach().cpu().float()
     if value.ndim == 4:
-        value = value[..., 0]
+        value = value.amax(dim=-1)
     if value.ndim != 3:
         raise ValueError(f"{name} must have shape [B,H,W] or [B,H,W,C].")
     if int(value.shape[0]) == 1 and int(frame_count) > 1:
@@ -2467,14 +2467,40 @@ class SCAIL2HeadTrackCrop:
                 max_objects=int(sam_max_objects),
                 detect_interval=int(sam_detect_interval),
             )
-            converted = _try_track_data_to_mask(track_data, int(frame_count), int(height), int(width))
-            if converted is None:
-                raise RuntimeError(
-                    "SAM3 track data could not be converted to a regular MASK in this ComfyUI build. "
-                    "Connect a head_masks MASK output to SCAIL-2 Head Track Crop."
+            conversion_errors: list[str] = []
+            try:
+                colored_mask, _reference_mask = _create_scail_masks(
+                    track_data,
+                    track_data,
+                    "",
+                    "area",
+                    True,
                 )
-            masks, converter = converted
-            mask_source = {"source": "sam3_dynamic_converter", "converter": converter}
+                masks = _normalize_video_mask(
+                    colored_mask,
+                    int(frame_count),
+                    int(height),
+                    int(width),
+                    name="sam3_scail_colored_mask",
+                )
+                mask_source = {"source": "sam3_scail_colored_mask", "sort_by": "area"}
+            except Exception as exc:
+                conversion_errors.append(f"SCAIL2ColoredMask:{type(exc).__name__}:{exc}")
+                converted = _try_track_data_to_mask(track_data, int(frame_count), int(height), int(width))
+                if converted is None:
+                    detail = "; ".join(conversion_errors) if conversion_errors else "no converter matched"
+                    raise RuntimeError(
+                        "SAM3 track data could not be converted to a regular MASK in this ComfyUI build. "
+                        "Connect a head_masks MASK output to SCAIL-2 Head Track Crop. "
+                        f"Conversion detail: {detail}"
+                    )
+                masks, converter = converted
+                mask_source = {"source": "sam3_dynamic_converter", "converter": converter, "fallback_after": conversion_errors}
+            if float(masks.max().item()) <= 0.05:
+                raise RuntimeError(
+                    "SAM3 tracking produced an empty head mask. Try a more specific prompt such as 'face' or 'head', "
+                    "increase sam_max_objects, lower sam_detection_threshold, or connect an explicit head_masks MASK."
+                )
         else:
             raise ValueError("Connect head_masks, or connect sam_model and head_conditioning if your ComfyUI exposes SAM3 mask conversion.")
 
