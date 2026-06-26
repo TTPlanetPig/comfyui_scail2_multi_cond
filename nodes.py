@@ -2533,7 +2533,42 @@ def _coerce_track_mask_tensor(
     return normalized
 
 
+def _extract_packed_sam3_track_mask(track_data, frame_count: int, height: int, width: int) -> Optional[tuple[torch.Tensor, dict[str, Any]]]:
+    if not isinstance(track_data, dict) or "packed_masks" not in track_data:
+        return None
+    packed = track_data.get("packed_masks")
+    if packed is None:
+        return None
+    try:
+        from comfy.ldm.sam3.tracker import unpack_masks
+        import torch.nn.functional as F
+
+        unpacked = unpack_masks(packed.detach().cpu())
+    except Exception:
+        return None
+    if not isinstance(unpacked, torch.Tensor) or unpacked.ndim != 4:
+        return None
+
+    if int(unpacked.shape[0]) != int(frame_count):
+        return None
+    union = unpacked.float().amax(dim=1, keepdim=True)
+    if int(union.shape[-2]) != int(height) or int(union.shape[-1]) != int(width):
+        union = F.interpolate(union, size=(int(height), int(width)), mode="nearest")
+    mask = union[:, 0].float().clamp(0, 1).contiguous()
+    if float(mask.max().item()) <= 0.05:
+        return None
+    return mask, {
+        "source": "sam3_packed_masks",
+        "objects": int(unpacked.shape[1]),
+        "packed_shape": _shape(packed),
+    }
+
+
 def _extract_track_data_mask(track_data, frame_count: int, height: int, width: int) -> Optional[tuple[torch.Tensor, dict[str, Any]]]:
+    packed = _extract_packed_sam3_track_mask(track_data, int(frame_count), int(height), int(width))
+    if packed is not None:
+        return packed
+
     seen: set[int] = set()
     candidates: list[tuple[float, str, torch.Tensor]] = []
     preferred_tokens = ("mask", "seg", "pred", "logit")
