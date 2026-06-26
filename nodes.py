@@ -1110,6 +1110,28 @@ def _bbox_from_mask_frame(mask: torch.Tensor) -> Optional[tuple[int, int, int, i
     return x0, y0, x1, y1
 
 
+def _clamp_bbox(bbox: tuple[int, int, int, int], width: int, height: int) -> tuple[int, int, int, int]:
+    x0, y0, x1, y1 = bbox
+    width = max(1, int(width))
+    height = max(1, int(height))
+    x0 = max(0, min(width - 1, int(x0)))
+    y0 = max(0, min(height - 1, int(y0)))
+    x1 = max(x0 + 1, min(width, int(x1)))
+    y1 = max(y0 + 1, min(height, int(y1)))
+    return x0, y0, x1, y1
+
+
+def _draw_rect(image: torch.Tensor, bbox: tuple[int, int, int, int], color: tuple[float, float, float]) -> None:
+    _batch, height, width, _channels = image.shape
+    x0, y0, x1, y1 = _clamp_bbox(bbox, int(width), int(height))
+    thickness = max(1, min(int(width), int(height)) // 160)
+    rgb = torch.tensor(color, dtype=image.dtype, device=image.device).view(1, 1, 3)
+    image[:, y0 : min(y0 + thickness, y1), x0:x1, :3] = rgb
+    image[:, max(y1 - thickness, y0) : y1, x0:x1, :3] = rgb
+    image[:, y0:y1, x0 : min(x0 + thickness, x1), :3] = rgb
+    image[:, y0:y1, max(x1 - thickness, x0) : x1, :3] = rgb
+
+
 def _interpolate_missing_bboxes(raw: list[Optional[tuple[int, int, int, int]]]) -> list[tuple[int, int, int, int]]:
     if not raw:
         return []
