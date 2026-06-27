@@ -2942,6 +2942,8 @@ class SCAIL2FaceCompositeBack:
                 "color_match_method": (["local_mean_std", "none"], {"default": "local_mean_std"}),
                 "face_fit_mode": (["center_crop", "pad", "stretch"], {"default": "center_crop"}),
                 "frame_mismatch_mode": (["trim_to_shortest", "error"], {"default": "trim_to_shortest"}),
+                "stitch_mask_expand_px": ("INT", {"default": 0, "min": 0, "max": 128, "step": 1}),
+                "stitch_mask_resize_mode": (["bilinear", "nearest"], {"default": "bilinear"}),
             }
         }
 
@@ -2970,6 +2972,8 @@ class SCAIL2FaceCompositeBack:
         color_match_method: str,
         face_fit_mode: str = "center_crop",
         frame_mismatch_mode: str = "trim_to_shortest",
+        stitch_mask_expand_px: int = 0,
+        stitch_mask_resize_mode: str = "bilinear",
     ):
         if not isinstance(full_body_video, torch.Tensor) or full_body_video.ndim != 4:
             raise ValueError("full_body_video must be a ComfyUI IMAGE tensor.")
@@ -3006,10 +3010,18 @@ class SCAIL2FaceCompositeBack:
         full = full_body_video[:frame_count].detach().cpu().float().clamp(0, 1).contiguous()
         refined = refined_face_video[:frame_count].detach().cpu().float().clamp(0, 1).contiguous()
         masks = _normalize_video_mask(crop_masks, frame_count, int(refined.shape[1]), int(refined.shape[2]), name="crop_masks")
-        masks = _binary_mask_morph(masks, contract_px=int(mask_contract_px), blur_px=int(feather_px))
+        masks = _binary_mask_morph(
+            masks,
+            expand_px=int(stitch_mask_expand_px),
+            contract_px=int(mask_contract_px),
+            blur_px=int(feather_px),
+        )
         normalized_face_fit_mode = str(face_fit_mode or "center_crop").strip()
         if normalized_face_fit_mode not in {"center_crop", "pad", "stretch"}:
             normalized_face_fit_mode = "center_crop"
+        normalized_stitch_mask_resize_mode = str(stitch_mask_resize_mode or "bilinear").strip()
+        if normalized_stitch_mask_resize_mode not in {"bilinear", "nearest"}:
+            normalized_stitch_mask_resize_mode = "bilinear"
         output = full.clone()
         color_events: list[dict[str, Any]] = []
         for index, item in enumerate(frames_manifest):
@@ -3033,7 +3045,7 @@ class SCAIL2FaceCompositeBack:
                 target_h,
                 target_w,
                 fit_mode=normalized_face_fit_mode,
-                mode="nearest",
+                mode=normalized_stitch_mask_resize_mode,
             ).clamp(0, 1)
             target = output[index : index + 1, y0:y1, x0:x1, :3]
             if bool(color_correction) and str(color_match_method) == "local_mean_std":
@@ -3063,6 +3075,8 @@ class SCAIL2FaceCompositeBack:
             "frame_mismatch_mode": normalized_frame_mismatch_mode,
             "feather_px": int(feather_px),
             "mask_contract_px": int(mask_contract_px),
+            "stitch_mask_expand_px": int(stitch_mask_expand_px),
+            "stitch_mask_resize_mode": normalized_stitch_mask_resize_mode,
             "face_fit_mode": normalized_face_fit_mode,
             "color_correction": bool(color_correction),
             "color_match_method": str(color_match_method) if bool(color_correction) else "none",

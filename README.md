@@ -153,6 +153,11 @@ and falls back to the legacy `bbox` field for old workflows.
 video, refined face video, crop masks, and crop manifest. `trim_to_shortest`
 is the default and trims all inputs to the shortest available frame count,
 discarding extra trailing frames. `error` keeps the old strict validation.
+For edge cleanup, `feather_px` blurs the stitch mask, `mask_contract_px` pulls
+the mask edge inward, and `stitch_mask_expand_px` can grow it outward before
+feathering. `stitch_mask_resize_mode` defaults to `bilinear` so soft feathered
+masks stay soft when the refined crop is resized back to the original bbox;
+`nearest` is available only for hard-mask debugging.
 
 ### SCAIL-2 Multi Reference Colored Mask
 
