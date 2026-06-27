@@ -1391,7 +1391,10 @@ def _crop_video_by_manifest(
             {
                 "frame": int(index),
                 "bbox": [int(x0), int(y0), int(x1), int(y1)],
+                "crop_to_canvas_bbox": [int(x0), int(y0), int(x1), int(y1)],
+                "canvas_to_original_bbox": [0, 0, int(width), int(height)],
                 "crop_size": int(crop_side),
+                "original_crop_size": [int(crop_side), int(crop_side)],
                 "source_size": [int(width), int(height)],
                 "channels": int(channels),
             }
@@ -1432,7 +1435,10 @@ def _draw_manifest_debug(video: torch.Tensor, frames: list[dict[str, Any]], max_
     previews: list[torch.Tensor] = []
     for index in range(count):
         preview = video[index : index + 1, :, :, :3].detach().cpu().clone()
-        bbox = frames[index].get("bbox", [0, 0, int(video.shape[2]), int(video.shape[1])])
+        bbox = frames[index].get(
+            "crop_to_canvas_bbox",
+            frames[index].get("bbox", [0, 0, int(video.shape[2]), int(video.shape[1])]),
+        )
         _draw_rect(preview, tuple(int(value) for value in bbox), (0.1, 0.9, 0.25))
         previews.append(preview)
     return torch.cat(previews, dim=0).contiguous() if previews else video[:1, :, :, :3].detach().cpu().contiguous()
@@ -2887,6 +2893,7 @@ class SCAIL2FaceCompositeBack:
                 "color_correction": ("BOOLEAN", {"default": True}),
                 "color_match_method": (["local_mean_std", "none"], {"default": "local_mean_std"}),
                 "face_fit_mode": (["center_crop", "pad", "stretch"], {"default": "center_crop"}),
+                "frame_mismatch_mode": (["trim_to_shortest", "error"], {"default": "trim_to_shortest"}),
             }
         }
 
@@ -2914,6 +2921,7 @@ class SCAIL2FaceCompositeBack:
         color_correction: bool,
         color_match_method: str,
         face_fit_mode: str = "center_crop",
+        frame_mismatch_mode: str = "trim_to_shortest",
     ):
         if not isinstance(full_body_video, torch.Tensor) or full_body_video.ndim != 4:
             raise ValueError("full_body_video must be a ComfyUI IMAGE tensor.")
@@ -2921,11 +2929,34 @@ class SCAIL2FaceCompositeBack:
             raise ValueError("refined_face_video must be a ComfyUI IMAGE tensor.")
         manifest = _parse_crop_manifest(crop_manifest)
         frames_manifest = manifest["frames"]
-        frame_count = int(full_body_video.shape[0])
-        if int(refined_face_video.shape[0]) != frame_count or len(frames_manifest) != frame_count:
-            raise ValueError("full_body_video, refined_face_video, and crop_manifest must have the same frame count.")
-        full = full_body_video.detach().cpu().float().clamp(0, 1).contiguous()
-        refined = refined_face_video.detach().cpu().float().clamp(0, 1).contiguous()
+        full_frame_count = int(full_body_video.shape[0])
+        refined_frame_count = int(refined_face_video.shape[0])
+        manifest_frame_count = len(frames_manifest)
+        if not isinstance(crop_masks, torch.Tensor) or crop_masks.ndim not in {3, 4}:
+            raise ValueError("crop_masks must be a ComfyUI MASK tensor.")
+        mask_frame_count = int(crop_masks.shape[0])
+        normalized_frame_mismatch_mode = str(frame_mismatch_mode or "trim_to_shortest").strip()
+        if normalized_frame_mismatch_mode not in {"trim_to_shortest", "error"}:
+            normalized_frame_mismatch_mode = "trim_to_shortest"
+        if normalized_frame_mismatch_mode == "error":
+            if (
+                refined_frame_count != full_frame_count
+                or manifest_frame_count != full_frame_count
+                or mask_frame_count not in {1, full_frame_count}
+            ):
+                raise ValueError("full_body_video, refined_face_video, crop_masks, and crop_manifest must have the same frame count.")
+            frame_count = full_frame_count
+        else:
+            frame_count_candidates = [full_frame_count, refined_frame_count, manifest_frame_count]
+            if mask_frame_count > 1:
+                frame_count_candidates.append(mask_frame_count)
+            frame_count = min(frame_count_candidates)
+            if frame_count <= 0:
+                raise ValueError("composite inputs produced no usable frames after trimming to the shortest input.")
+            frames_manifest = frames_manifest[:frame_count]
+            crop_masks = crop_masks[:frame_count] if mask_frame_count > 1 else crop_masks
+        full = full_body_video[:frame_count].detach().cpu().float().clamp(0, 1).contiguous()
+        refined = refined_face_video[:frame_count].detach().cpu().float().clamp(0, 1).contiguous()
         masks = _normalize_video_mask(crop_masks, frame_count, int(refined.shape[1]), int(refined.shape[2]), name="crop_masks")
         masks = _binary_mask_morph(masks, contract_px=int(mask_contract_px), blur_px=int(feather_px))
         normalized_face_fit_mode = str(face_fit_mode or "center_crop").strip()
@@ -2934,9 +2965,9 @@ class SCAIL2FaceCompositeBack:
         output = full.clone()
         color_events: list[dict[str, Any]] = []
         for index, item in enumerate(frames_manifest):
-            bbox = item.get("bbox")
+            bbox = item.get("crop_to_canvas_bbox", item.get("bbox"))
             if not isinstance(bbox, list) or len(bbox) != 4:
-                raise ValueError(f"crop_manifest frame {index} is missing bbox.")
+                raise ValueError(f"crop_manifest frame {index} is missing crop_to_canvas_bbox/bbox.")
             x0, y0, x1, y1 = [int(value) for value in bbox]
             x0, y0, x1, y1 = _clamp_bbox((x0, y0, x1, y1), int(full.shape[2]), int(full.shape[1]))
             target_h = max(1, y1 - y0)
@@ -2968,6 +2999,20 @@ class SCAIL2FaceCompositeBack:
             "source_shape": _shape(full),
             "refined_face_shape": _shape(refined),
             "output_shape": _shape(output),
+            "input_frame_counts": {
+                "full_body_video": int(full_frame_count),
+                "refined_face_video": int(refined_frame_count),
+                "crop_masks": int(mask_frame_count),
+                "crop_manifest": int(manifest_frame_count),
+            },
+            "used_frame_count": int(frame_count),
+            "trimmed_tail_frames": {
+                "full_body_video": max(0, int(full_frame_count) - int(frame_count)),
+                "refined_face_video": max(0, int(refined_frame_count) - int(frame_count)),
+                "crop_masks": 0 if int(mask_frame_count) == 1 else max(0, int(mask_frame_count) - int(frame_count)),
+                "crop_manifest": max(0, int(manifest_frame_count) - int(frame_count)),
+            },
+            "frame_mismatch_mode": normalized_frame_mismatch_mode,
             "feather_px": int(feather_px),
             "mask_contract_px": int(mask_contract_px),
             "face_fit_mode": normalized_face_fit_mode,

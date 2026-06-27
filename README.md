@@ -142,7 +142,15 @@ crop to the target paste area before feather blending; when disabled, the node
 only blends by mask. `face_fit_mode` controls how refined face frames whose
 resolution changed are matched back to the manifest bbox: `center_crop` keeps
 aspect ratio and crops the center, `pad` keeps aspect ratio and pads, and
-`stretch` directly resizes to the bbox.
+`stretch` directly resizes to the bbox. The crop manifest also includes
+CropAndStitch-style coordinate fields such as `crop_to_canvas_bbox` and
+`canvas_to_original_bbox`; the composite node reads `crop_to_canvas_bbox` first
+and falls back to the legacy `bbox` field for old workflows.
+
+`frame_mismatch_mode` controls tail-frame mismatches between the full-body
+video, refined face video, crop masks, and crop manifest. `trim_to_shortest`
+is the default and trims all inputs to the shortest available frame count,
+discarding extra trailing frames. `error` keeps the old strict validation.
 
 ### SCAIL-2 Multi Reference Colored Mask
 
