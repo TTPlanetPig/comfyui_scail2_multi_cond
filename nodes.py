@@ -3039,7 +3039,14 @@ class SCAIL2FaceCompositeBack:
             crop_masks = crop_masks[:frame_count] if mask_frame_count > 1 else crop_masks
         full = full_body_video[:frame_count].detach().cpu().float().clamp(0, 1).contiguous()
         refined = refined_face_video[:frame_count].detach().cpu().float().clamp(0, 1).contiguous()
-        masks = _normalize_video_mask(crop_masks, frame_count, int(refined.shape[1]), int(refined.shape[2]), name="crop_masks")
+        first_bbox = frames_manifest[0].get("crop_to_canvas_bbox", frames_manifest[0].get("bbox"))
+        if not isinstance(first_bbox, list) or len(first_bbox) != 4:
+            raise ValueError("crop_manifest frame 0 is missing crop_to_canvas_bbox/bbox.")
+        fx0, fy0, fx1, fy1 = [int(value) for value in first_bbox]
+        fx0, fy0, fx1, fy1 = _clamp_bbox((fx0, fy0, fx1, fy1), int(full.shape[2]), int(full.shape[1]))
+        crop_canvas_h = max(1, int(fy1 - fy0))
+        crop_canvas_w = max(1, int(fx1 - fx0))
+        masks = _normalize_video_mask(crop_masks, frame_count, crop_canvas_h, crop_canvas_w, name="crop_masks")
         masks = _binary_mask_morph(
             masks,
             expand_px=int(stitch_mask_expand_px),
@@ -3075,14 +3082,14 @@ class SCAIL2FaceCompositeBack:
                 fit_mode=normalized_face_fit_mode,
                 mode="bilinear",
             )
-            mask_image = masks[index : index + 1].unsqueeze(-1)
-            mask = _fit_image_to_size(
-                mask_image,
-                target_h,
-                target_w,
-                fit_mode=normalized_face_fit_mode,
-                mode=normalized_stitch_mask_resize_mode,
-            ).clamp(0, 1)
+            mask = masks[index : index + 1].unsqueeze(-1)
+            if int(mask.shape[1]) != target_h or int(mask.shape[2]) != target_w:
+                mask = _resize_image_tensor_like(
+                    mask,
+                    torch.empty((1, target_h, target_w, 1)),
+                    mode=normalized_stitch_mask_resize_mode,
+                )
+            mask = mask.clamp(0, 1)
             target = output[index : index + 1, y0:y1, x0:x1, :3]
             if bool(color_correction) and str(color_match_method) == "local_mean_std":
                 face, color_info = _local_mean_std_color_match(face, target, mask)
@@ -3095,6 +3102,8 @@ class SCAIL2FaceCompositeBack:
             "source_shape": _shape(full),
             "refined_face_shape": _shape(refined),
             "output_shape": _shape(output),
+            "crop_canvas_shape": [int(frame_count), int(crop_canvas_h), int(crop_canvas_w), 3],
+            "crop_mask_shape": _shape(masks),
             "input_frame_counts": {
                 "full_body_video": int(full_frame_count),
                 "refined_face_video": int(refined_frame_count),

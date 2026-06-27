@@ -145,9 +145,12 @@ segment at reference `1`.
 full-body frames using the crop manifest and mask. `color_correction` can be
 enabled or disabled. When enabled, `local_mean_std` matches the refined face
 crop to the target paste area before feather blending; when disabled, the node
-only blends by mask. `face_fit_mode` controls how refined face frames whose
-resolution changed are matched back to the manifest bbox: `center_crop` keeps
-aspect ratio and crops the center, `pad` keeps aspect ratio and pads, and
+only blends by mask. The node keeps `crop_masks` in the original crop canvas
+recorded by the manifest, applies mask cleanup there, then fits the refined
+face video back to that same crop canvas before blending and pasting the crop
+back to the full-body frame. `face_fit_mode` controls how refined face frames
+whose resolution changed are matched back to the manifest bbox: `center_crop`
+keeps aspect ratio and crops the center, `pad` keeps aspect ratio and pads, and
 `stretch` directly resizes to the bbox. The crop manifest also includes
 CropAndStitch-style coordinate fields such as `crop_to_canvas_bbox` and
 `canvas_to_original_bbox`; the composite node reads `crop_to_canvas_bbox` first
