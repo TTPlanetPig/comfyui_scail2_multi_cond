@@ -112,6 +112,10 @@ full-body paste position, `crop_manifest.frames[].mask_bbox` records the mask
 bbox used for crop placement, and `crop_manifest.frames[].detected_mask_bbox`
 records the direct detected bbox when that frame had mask pixels. For full-body
 9:16 videos, start with `crop_padding_ratio` around `0.35` to `0.5`.
+Keep `square_align` at `32` for SCAIL-2 face-detail passes. The crop node keeps
+the square side on that alignment even near the frame edge; for example, on a
+720-wide source the largest aligned crop is 704, so the second SCAIL pass can
+use the crop resolution exactly instead of silently flooring it from 720 to 704.
 `mask_component_mode` defaults to `largest`, which keeps only the largest
 connected mask region per frame before bbox calculation, so small body fragments
 do not expand the crop canvas. Use `all` only when you need to inspect the raw

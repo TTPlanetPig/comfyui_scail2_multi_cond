@@ -1366,6 +1366,14 @@ def _smooth_bboxes(
     return smoothed
 
 
+def _max_aligned_square_side(width: int, height: int, align: int) -> int:
+    max_side = max(1, min(int(width), int(height)))
+    align = max(1, int(align))
+    if align <= 1 or max_side < align:
+        return max_side
+    return max(align, (max_side // align) * align)
+
+
 def _square_bbox_from_bbox(
     bbox: tuple[int, int, int, int],
     width: int,
@@ -1379,7 +1387,7 @@ def _square_bbox_from_bbox(
     side = int(math.ceil(max(box_w, box_h) * (1.0 + max(0.0, float(padding_ratio)) * 2.0)))
     align = max(1, int(align))
     side = max(align, int(math.ceil(side / align) * align))
-    side = min(side, int(width), int(height))
+    side = min(side, _max_aligned_square_side(int(width), int(height), align))
     return _fixed_square_bbox_from_bbox(bbox, width, height, side)
 
 
@@ -2921,6 +2929,7 @@ class SCAIL2HeadTrackCrop:
             "crop_mode": normalized_crop_mode,
             "crop_padding_ratio": float(crop_padding_ratio),
             "square_align": int(square_align),
+            "crop_size_aligned": bool(int(fixed_crop_size) % max(1, int(square_align)) == 0),
             "fixed_crop_size": int(fixed_crop_size),
             "fixed_crop_anchor_frame": fixed_crop_anchor_frame,
             "canvas_source_bbox": [int(value) for value in canvas_source_bbox],
