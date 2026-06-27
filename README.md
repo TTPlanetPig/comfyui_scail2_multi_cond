@@ -112,6 +112,10 @@ full-body paste position, `crop_manifest.frames[].mask_bbox` records the mask
 bbox used for crop placement, and `crop_manifest.frames[].detected_mask_bbox`
 records the direct detected bbox when that frame had mask pixels. For full-body
 9:16 videos, start with `crop_padding_ratio` around `0.35` to `0.5`.
+`mask_component_mode` defaults to `largest`, which keeps only the largest
+connected mask region per frame before bbox calculation, so small body fragments
+do not expand the crop canvas. Use `all` only when you need to inspect the raw
+mask exactly as it came from SAM or the external mask input.
 
 `crop_mode` controls how the square crop is placed:
 

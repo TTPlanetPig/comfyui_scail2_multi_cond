@@ -1162,6 +1162,122 @@ def _bbox_from_mask_frame(mask: torch.Tensor) -> Optional[tuple[int, int, int, i
     return x0, y0, x1, y1
 
 
+def _largest_component_mask_numpy(binary):
+    import numpy as np
+
+    if int(binary.sum()) <= 0:
+        return binary.astype(bool), {"components": 0, "largest_area": 0, "removed_area": 0}
+
+    try:
+        import cv2
+
+        component_count, labels, stats, _centroids = cv2.connectedComponentsWithStats(binary.astype("uint8"), connectivity=8)
+        if int(component_count) <= 1:
+            area = int(binary.sum())
+            return binary.astype(bool), {"components": 1, "largest_area": area, "removed_area": 0}
+        areas = stats[1:, cv2.CC_STAT_AREA]
+        largest_label = int(np.argmax(areas)) + 1
+        largest_area = int(areas[largest_label - 1])
+        total_area = int(binary.sum())
+        return labels == largest_label, {
+            "components": int(component_count) - 1,
+            "largest_area": largest_area,
+            "removed_area": max(0, total_area - largest_area),
+        }
+    except Exception:
+        pass
+
+    try:
+        from scipy import ndimage
+
+        labels, component_count = ndimage.label(binary, structure=np.ones((3, 3), dtype=np.uint8))
+        if int(component_count) <= 1:
+            area = int(binary.sum())
+            return binary.astype(bool), {"components": int(component_count), "largest_area": area, "removed_area": 0}
+        areas = np.bincount(labels.reshape(-1))[1:]
+        largest_label = int(np.argmax(areas)) + 1
+        largest_area = int(areas[largest_label - 1])
+        total_area = int(binary.sum())
+        return labels == largest_label, {
+            "components": int(component_count),
+            "largest_area": largest_area,
+            "removed_area": max(0, total_area - largest_area),
+        }
+    except Exception:
+        pass
+
+    from collections import deque
+
+    binary_bool = binary.astype(bool)
+    height, width = binary_bool.shape
+    visited = np.zeros_like(binary_bool, dtype=bool)
+    best_pixels: list[tuple[int, int]] = []
+    component_count = 0
+    for start_y, start_x in np.argwhere(binary_bool):
+        start_y = int(start_y)
+        start_x = int(start_x)
+        if visited[start_y, start_x]:
+            continue
+        component_count += 1
+        pixels: list[tuple[int, int]] = []
+        queue = deque([(start_y, start_x)])
+        visited[start_y, start_x] = True
+        while queue:
+            y, x = queue.popleft()
+            pixels.append((y, x))
+            for ny in range(max(0, y - 1), min(height, y + 2)):
+                for nx in range(max(0, x - 1), min(width, x + 2)):
+                    if visited[ny, nx] or not binary_bool[ny, nx]:
+                        continue
+                    visited[ny, nx] = True
+                    queue.append((ny, nx))
+        if len(pixels) > len(best_pixels):
+            best_pixels = pixels
+
+    keep = np.zeros_like(binary_bool, dtype=bool)
+    for y, x in best_pixels:
+        keep[y, x] = True
+    total_area = int(binary_bool.sum())
+    largest_area = int(len(best_pixels))
+    return keep, {
+        "components": int(component_count),
+        "largest_area": largest_area,
+        "removed_area": max(0, total_area - largest_area),
+    }
+
+
+def _keep_largest_mask_components(mask: torch.Tensor) -> tuple[torch.Tensor, dict[str, Any]]:
+    import numpy as np
+
+    value = mask.detach().cpu().float().clamp(0, 1)
+    if value.ndim != 3:
+        raise ValueError("mask must have shape [B,H,W].")
+    kept_frames: list[torch.Tensor] = []
+    frame_stats: list[dict[str, int]] = []
+    for index in range(int(value.shape[0])):
+        frame = value[index]
+        binary = (frame > 0.05).numpy().astype(np.uint8)
+        keep, stats = _largest_component_mask_numpy(binary)
+        keep_tensor = torch.from_numpy(keep).to(dtype=frame.dtype)
+        kept_frames.append((frame * keep_tensor).clamp(0, 1))
+        frame_stats.append({"frame": int(index), **stats})
+
+    frames_with_components = [item for item in frame_stats if int(item["components"]) > 0]
+    frames_with_removed = [item for item in frame_stats if int(item["removed_area"]) > 0]
+    largest_areas = [int(item["largest_area"]) for item in frames_with_components]
+    summary = {
+        "frames": int(value.shape[0]),
+        "frames_with_components": int(len(frames_with_components)),
+        "frames_with_removed_components": int(len(frames_with_removed)),
+        "max_components": max((int(item["components"]) for item in frame_stats), default=0),
+        "removed_pixels_total": int(sum(int(item["removed_area"]) for item in frame_stats)),
+        "largest_pixels_min": int(min(largest_areas)) if largest_areas else 0,
+        "largest_pixels_max": int(max(largest_areas)) if largest_areas else 0,
+        "sample_removed_frames": frames_with_removed[:12],
+    }
+    return torch.stack(kept_frames, dim=0).contiguous(), summary
+
+
 def _clamp_bbox(bbox: tuple[int, int, int, int], width: int, height: int) -> tuple[int, int, int, int]:
     x0, y0, x1, y1 = bbox
     width = max(1, int(width))
@@ -2648,6 +2764,7 @@ class SCAIL2HeadTrackCrop:
                 "sam_max_objects": ("INT", {"default": 1, "min": 1, "max": 8, "step": 1}),
                 "sam_detect_interval": ("INT", {"default": 2, "min": 1, "max": 999, "step": 1}),
                 "crop_mode": (["center_follow", "fixed_canvas"], {"default": "center_follow"}),
+                "mask_component_mode": (["largest", "all"], {"default": "largest"}),
             },
             "optional": {
                 "head_masks": ("MASK",),
@@ -2681,6 +2798,7 @@ class SCAIL2HeadTrackCrop:
         sam_max_objects: int,
         sam_detect_interval: int,
         crop_mode: str = "center_follow",
+        mask_component_mode: str = "largest",
         head_masks: Optional[torch.Tensor] = None,
         sam_model=None,
         head_conditioning=None,
@@ -2727,6 +2845,13 @@ class SCAIL2HeadTrackCrop:
                 )
         else:
             raise ValueError("Connect head_masks, or connect sam_model and head_conditioning if your ComfyUI exposes SAM3 mask conversion.")
+
+        normalized_mask_component_mode = str(mask_component_mode or "largest").strip()
+        if normalized_mask_component_mode not in {"largest", "all"}:
+            normalized_mask_component_mode = "largest"
+        component_summary: Optional[dict[str, Any]] = None
+        if normalized_mask_component_mode == "largest":
+            masks, component_summary = _keep_largest_mask_components(masks)
 
         masks = _binary_mask_morph(masks, expand_px=int(mask_expand_px), blur_px=int(mask_blur_px))
         raw_bboxes = [_bbox_from_mask_frame(masks[index]) for index in range(int(frame_count))]
@@ -2790,7 +2915,9 @@ class SCAIL2HeadTrackCrop:
             "mask_bbox_field": "mask_bbox",
             "tracking_bbox_field": "tracking_bbox",
             "detected_mask_bbox_field": "detected_mask_bbox",
-            "mask_handling": "crop original mask directly; no inner head-box estimation or bbox clipping",
+            "mask_handling": "crop mask directly after optional largest-component filtering; no inner head-box estimation or bbox clipping",
+            "mask_component_mode": normalized_mask_component_mode,
+            "mask_component_summary": component_summary,
             "mask_expand_px": int(mask_expand_px),
             "mask_blur_px": int(mask_blur_px),
             "missing_mask_frames": [int(index) for index, bbox in enumerate(raw_bboxes) if bbox is None],
