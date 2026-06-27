@@ -157,7 +157,9 @@ For edge cleanup, `feather_px` blurs the stitch mask, `mask_contract_px` pulls
 the mask edge inward, and `stitch_mask_expand_px` can grow it outward before
 feathering. `stitch_mask_resize_mode` defaults to `bilinear` so soft feathered
 masks stay soft when the refined crop is resized back to the original bbox;
-`nearest` is available only for hard-mask debugging.
+`nearest` is available only for hard-mask debugging. `stitch_offset_x_px` and
+`stitch_offset_y_px` apply a final pixel-level paste offset; use negative
+`stitch_offset_x_px` if the pasted face appears a little too far right.
 
 ### SCAIL-2 Multi Reference Colored Mask
 

@@ -1289,6 +1289,23 @@ def _clamp_bbox(bbox: tuple[int, int, int, int], width: int, height: int) -> tup
     return x0, y0, x1, y1
 
 
+def _offset_bbox_within_bounds(
+    bbox: tuple[int, int, int, int],
+    width: int,
+    height: int,
+    offset_x: int,
+    offset_y: int,
+) -> tuple[int, int, int, int]:
+    x0, y0, x1, y1 = _clamp_bbox(bbox, int(width), int(height))
+    box_w = max(1, int(x1 - x0))
+    box_h = max(1, int(y1 - y0))
+    max_x0 = max(0, int(width) - box_w)
+    max_y0 = max(0, int(height) - box_h)
+    shifted_x0 = max(0, min(max_x0, int(x0) + int(offset_x)))
+    shifted_y0 = max(0, min(max_y0, int(y0) + int(offset_y)))
+    return shifted_x0, shifted_y0, shifted_x0 + box_w, shifted_y0 + box_h
+
+
 def _draw_rect(image: torch.Tensor, bbox: tuple[int, int, int, int], color: tuple[float, float, float]) -> None:
     _batch, height, width, _channels = image.shape
     x0, y0, x1, y1 = _clamp_bbox(bbox, int(width), int(height))
@@ -2944,6 +2961,8 @@ class SCAIL2FaceCompositeBack:
                 "frame_mismatch_mode": (["trim_to_shortest", "error"], {"default": "trim_to_shortest"}),
                 "stitch_mask_expand_px": ("INT", {"default": 0, "min": 0, "max": 128, "step": 1}),
                 "stitch_mask_resize_mode": (["bilinear", "nearest"], {"default": "bilinear"}),
+                "stitch_offset_x_px": ("INT", {"default": 0, "min": -128, "max": 128, "step": 1}),
+                "stitch_offset_y_px": ("INT", {"default": 0, "min": -128, "max": 128, "step": 1}),
             }
         }
 
@@ -2974,6 +2993,8 @@ class SCAIL2FaceCompositeBack:
         frame_mismatch_mode: str = "trim_to_shortest",
         stitch_mask_expand_px: int = 0,
         stitch_mask_resize_mode: str = "bilinear",
+        stitch_offset_x_px: int = 0,
+        stitch_offset_y_px: int = 0,
     ):
         if not isinstance(full_body_video, torch.Tensor) or full_body_video.ndim != 4:
             raise ValueError("full_body_video must be a ComfyUI IMAGE tensor.")
@@ -3029,7 +3050,13 @@ class SCAIL2FaceCompositeBack:
             if not isinstance(bbox, list) or len(bbox) != 4:
                 raise ValueError(f"crop_manifest frame {index} is missing crop_to_canvas_bbox/bbox.")
             x0, y0, x1, y1 = [int(value) for value in bbox]
-            x0, y0, x1, y1 = _clamp_bbox((x0, y0, x1, y1), int(full.shape[2]), int(full.shape[1]))
+            x0, y0, x1, y1 = _offset_bbox_within_bounds(
+                (x0, y0, x1, y1),
+                int(full.shape[2]),
+                int(full.shape[1]),
+                int(stitch_offset_x_px),
+                int(stitch_offset_y_px),
+            )
             target_h = max(1, y1 - y0)
             target_w = max(1, x1 - x0)
             face = _fit_image_to_size(
@@ -3077,6 +3104,8 @@ class SCAIL2FaceCompositeBack:
             "mask_contract_px": int(mask_contract_px),
             "stitch_mask_expand_px": int(stitch_mask_expand_px),
             "stitch_mask_resize_mode": normalized_stitch_mask_resize_mode,
+            "stitch_offset_x_px": int(stitch_offset_x_px),
+            "stitch_offset_y_px": int(stitch_offset_y_px),
             "face_fit_mode": normalized_face_fit_mode,
             "color_correction": bool(color_correction),
             "color_match_method": str(color_match_method) if bool(color_correction) else "none",
