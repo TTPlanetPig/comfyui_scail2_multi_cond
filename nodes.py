@@ -18,6 +18,7 @@ DEFAULT_PLAN = """# frames | reference | prompt | negative | boundary_overlap
 73 | 3 | third segment prompt | | 1
 157 | 4 | fourth segment prompt | | 1
 """
+_INSIGHTFACE_APP_CACHE: dict[tuple[str, str, int], Any] = {}
 
 
 def _shape(value: Any) -> list[int]:
@@ -1276,6 +1277,197 @@ def _keep_largest_mask_components(mask: torch.Tensor) -> tuple[torch.Tensor, dic
         "sample_removed_frames": frames_with_removed[:12],
     }
     return torch.stack(kept_frames, dim=0).contiguous(), summary
+
+
+def _image_batch_frame_to_rgb_uint8(image: torch.Tensor, index: int, name: str) -> Any:
+    if not isinstance(image, torch.Tensor) or image.ndim != 4:
+        raise ValueError(f"{name} must be a ComfyUI IMAGE tensor.")
+    frame_count = int(image.shape[0])
+    if frame_count <= 0:
+        raise ValueError(f"{name} has no frames.")
+    frame_index = max(0, min(frame_count - 1, int(index)))
+    frame = image[frame_index].detach().cpu().float().clamp(0, 1)
+    if int(frame.shape[-1]) > 3:
+        frame = frame[..., :3]
+    if int(frame.shape[-1]) < 3:
+        frame = frame[..., :1].repeat(1, 1, 3)
+    return (frame.numpy() * 255.0).round().astype("uint8")
+
+
+def _rgb_uint8_to_image_tensor(image: Any) -> torch.Tensor:
+    import numpy as np
+
+    value = np.asarray(image)
+    if value.ndim != 3 or int(value.shape[-1]) < 3:
+        raise ValueError("image array must have shape [H,W,3].")
+    value = value[:, :, :3].astype("float32") / 255.0
+    return torch.from_numpy(value).unsqueeze(0).contiguous().clamp(0, 1)
+
+
+def _insightface_providers(provider_mode: str) -> tuple[str, list[str], int]:
+    normalized = str(provider_mode or "auto").strip().lower()
+    available: list[str] = []
+    try:
+        import onnxruntime as ort
+
+        available = list(ort.get_available_providers())
+    except Exception:
+        available = []
+
+    if normalized == "cpu":
+        return "cpu", ["CPUExecutionProvider"], -1
+    if normalized == "cuda":
+        if not available or "CUDAExecutionProvider" in available:
+            return "cuda", ["CUDAExecutionProvider", "CPUExecutionProvider"], 0
+        raise RuntimeError(
+            "onnxruntime does not expose CUDAExecutionProvider. Install onnxruntime-gpu or set provider to cpu."
+        )
+    if "CUDAExecutionProvider" in available:
+        return "cuda", ["CUDAExecutionProvider", "CPUExecutionProvider"], 0
+    return "cpu", ["CPUExecutionProvider"], -1
+
+
+def _get_insightface_app(model_name: str, provider_mode: str, det_size: int):
+    try:
+        from insightface.app import FaceAnalysis
+    except Exception as exc:
+        raise RuntimeError(
+            "SCAIL-2 Align Reference Face To Crop requires InsightFace. Install insightface and "
+            "onnxruntime-gpu (or onnxruntime for CPU), and make sure the InsightFace model such as "
+            "buffalo_l is available."
+        ) from exc
+
+    provider_key, providers, ctx_id = _insightface_providers(provider_mode)
+    normalized_model = str(model_name or "buffalo_l").strip() or "buffalo_l"
+    normalized_det_size = max(160, min(2048, int(det_size)))
+    cache_key = (normalized_model, provider_key, normalized_det_size)
+    app = _INSIGHTFACE_APP_CACHE.get(cache_key)
+    if app is None:
+        app = FaceAnalysis(name=normalized_model, providers=providers)
+        app.prepare(ctx_id=ctx_id, det_size=(normalized_det_size, normalized_det_size))
+        _INSIGHTFACE_APP_CACHE[cache_key] = app
+    return app, {"model_name": normalized_model, "provider": provider_key, "det_size": int(normalized_det_size)}
+
+
+def _select_insightface_face(faces: list[Any], image_w: int, image_h: int, select_mode: str, name: str) -> Any:
+    if not faces:
+        raise RuntimeError(f"InsightFace detected no face in {name}. Use a clearer frame/reference image.")
+    normalized = str(select_mode or "largest").strip()
+    if normalized not in {"largest", "center"}:
+        normalized = "largest"
+
+    def bbox(face) -> tuple[float, float, float, float]:
+        value = getattr(face, "bbox", None)
+        if value is None or len(value) != 4:
+            raise RuntimeError(f"InsightFace face in {name} did not include a bbox.")
+        return tuple(float(item) for item in value)
+
+    if normalized == "center":
+        cx = float(image_w) / 2.0
+        cy = float(image_h) / 2.0
+        return min(
+            faces,
+            key=lambda face: (
+                ((bbox(face)[0] + bbox(face)[2]) * 0.5 - cx) ** 2
+                + ((bbox(face)[1] + bbox(face)[3]) * 0.5 - cy) ** 2
+            ),
+        )
+    return max(faces, key=lambda face: max(0.0, bbox(face)[2] - bbox(face)[0]) * max(0.0, bbox(face)[3] - bbox(face)[1]))
+
+
+def _face_bbox_info(face: Any, image_w: int, image_h: int) -> dict[str, Any]:
+    bbox = getattr(face, "bbox", None)
+    if bbox is None or len(bbox) != 4:
+        raise RuntimeError("InsightFace face did not include a bbox.")
+    x0, y0, x1, y1 = [float(value) for value in bbox]
+    x0 = max(0.0, min(float(image_w), x0))
+    y0 = max(0.0, min(float(image_h), y0))
+    x1 = max(x0 + 1.0, min(float(image_w), x1))
+    y1 = max(y0 + 1.0, min(float(image_h), y1))
+    score = getattr(face, "det_score", None)
+    return {
+        "bbox": [float(x0), float(y0), float(x1), float(y1)],
+        "bbox_int": [int(round(x0)), int(round(y0)), int(round(x1)), int(round(y1))],
+        "center": [float((x0 + x1) * 0.5), float((y0 + y1) * 0.5)],
+        "size": [float(x1 - x0), float(y1 - y0)],
+        "score": float(score) if score is not None else None,
+    }
+
+
+def _extract_reference_window_no_resize(
+    image_rgb: Any,
+    x0: int,
+    y0: int,
+    canvas_w: int,
+    canvas_h: int,
+    padding_mode: str,
+) -> tuple[Any, dict[str, Any]]:
+    import numpy as np
+
+    height, width = int(image_rgb.shape[0]), int(image_rgb.shape[1])
+    canvas_w = max(1, int(canvas_w))
+    canvas_h = max(1, int(canvas_h))
+    x1 = int(x0) + canvas_w
+    y1 = int(y0) + canvas_h
+    crop_x0 = max(0, int(x0))
+    crop_y0 = max(0, int(y0))
+    crop_x1 = min(width, int(x1))
+    crop_y1 = min(height, int(y1))
+    if crop_x1 <= crop_x0 or crop_y1 <= crop_y0:
+        raise RuntimeError("reference crop window did not overlap the reference image.")
+    crop = image_rgb[crop_y0:crop_y1, crop_x0:crop_x1, :3]
+    pad_left = max(0, -int(x0))
+    pad_top = max(0, -int(y0))
+    pad_right = max(0, int(x1) - width)
+    pad_bottom = max(0, int(y1) - height)
+    normalized = str(padding_mode or "edge").strip()
+    if normalized not in {"edge", "reflect", "black", "white", "mean"}:
+        normalized = "edge"
+
+    if pad_left or pad_top or pad_right or pad_bottom:
+        if normalized in {"black", "white", "mean"}:
+            if normalized == "white":
+                fill = np.array([255, 255, 255], dtype=np.uint8)
+            elif normalized == "mean":
+                fill = image_rgb[:, :, :3].reshape(-1, 3).mean(axis=0).round().astype(np.uint8)
+            else:
+                fill = np.array([0, 0, 0], dtype=np.uint8)
+            output = np.empty((canvas_h, canvas_w, 3), dtype=np.uint8)
+            output[:, :, :] = fill.reshape(1, 1, 3)
+            output[pad_top : pad_top + int(crop.shape[0]), pad_left : pad_left + int(crop.shape[1]), :] = crop
+        else:
+            try:
+                np_mode = "edge" if normalized == "edge" else "reflect"
+                output = np.pad(
+                    crop,
+                    ((pad_top, pad_bottom), (pad_left, pad_right), (0, 0)),
+                    mode=np_mode,
+                )
+            except Exception:
+                output = np.pad(
+                    crop,
+                    ((pad_top, pad_bottom), (pad_left, pad_right), (0, 0)),
+                    mode="edge",
+                )
+    else:
+        output = crop
+    output = output[:canvas_h, :canvas_w, :3]
+    if int(output.shape[0]) != canvas_h or int(output.shape[1]) != canvas_w:
+        fixed = np.empty((canvas_h, canvas_w, 3), dtype=np.uint8)
+        fixed[:, :, :] = output[-1:, -1:, :]
+        fixed[: int(output.shape[0]), : int(output.shape[1]), :] = output
+        output = fixed
+    return output.astype(np.uint8), {
+        "window_xyxy": [int(x0), int(y0), int(x1), int(y1)],
+        "source_overlap_xyxy": [int(crop_x0), int(crop_y0), int(crop_x1), int(crop_y1)],
+        "padding": {
+            "left": int(pad_left),
+            "top": int(pad_top),
+            "right": int(pad_right),
+            "bottom": int(pad_bottom),
+            "mode": normalized,
+        },
+    }
 
 
 def _clamp_bbox(bbox: tuple[int, int, int, int], width: int, height: int) -> tuple[int, int, int, int]:
@@ -2953,6 +3145,167 @@ class SCAIL2HeadTrackCrop:
         return (face_crop_video, crop_masks, json.dumps(manifest, indent=2), debug_preview)
 
 
+class SCAIL2AlignReferenceFaceToCrop:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "face_crop_video": ("IMAGE",),
+                "reference_image": ("IMAGE",),
+                "target_frame_index": ("INT", {"default": 0, "min": 0, "max": 999999, "step": 1}),
+                "face_scale": ("FLOAT", {"default": 1.0, "min": 0.25, "max": 4.0, "step": 0.01}),
+                "x_offset_ratio": ("FLOAT", {"default": 0.0, "min": -0.5, "max": 0.5, "step": 0.005}),
+                "y_offset_ratio": ("FLOAT", {"default": 0.0, "min": -0.5, "max": 0.5, "step": 0.005}),
+                "face_size_basis": (["bbox_width", "bbox_height"], {"default": "bbox_width"}),
+                "target_face_select": (["center", "largest"], {"default": "center"}),
+                "reference_face_select": (["largest", "center"], {"default": "largest"}),
+                "padding_mode": (["edge", "reflect", "black", "white", "mean"], {"default": "edge"}),
+                "insightface_model": (["buffalo_l", "buffalo_s"], {"default": "buffalo_l"}),
+                "provider": (["auto", "cuda", "cpu"], {"default": "auto"}),
+                "det_size": ("INT", {"default": 640, "min": 160, "max": 2048, "step": 32}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "IMAGE", "STRING")
+    RETURN_NAMES = ("aligned_reference_image", "debug_preview", "summary")
+    FUNCTION = "align"
+    CATEGORY = f"{CATEGORY}/Face Detail"
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        fingerprint_inputs: dict[str, Any] = {}
+        for key in sorted(kwargs):
+            value = kwargs[key]
+            fingerprint_inputs[key] = value if isinstance(value, (str, int, float, bool)) or value is None else type(value).__name__
+        return _stable_fingerprint(fingerprint_inputs)
+
+    def align(
+        self,
+        face_crop_video: torch.Tensor,
+        reference_image: torch.Tensor,
+        target_frame_index: int = 0,
+        face_scale: float = 1.0,
+        x_offset_ratio: float = 0.0,
+        y_offset_ratio: float = 0.0,
+        face_size_basis: str = "bbox_width",
+        target_face_select: str = "center",
+        reference_face_select: str = "largest",
+        padding_mode: str = "edge",
+        insightface_model: str = "buffalo_l",
+        provider: str = "auto",
+        det_size: int = 640,
+    ):
+        target_rgb = _image_batch_frame_to_rgb_uint8(face_crop_video, int(target_frame_index), "face_crop_video")
+        reference_rgb = _image_batch_frame_to_rgb_uint8(reference_image, 0, "reference_image")
+        target_h, target_w = int(target_rgb.shape[0]), int(target_rgb.shape[1])
+        ref_h, ref_w = int(reference_rgb.shape[0]), int(reference_rgb.shape[1])
+        if target_h <= 0 or target_w <= 0 or ref_h <= 0 or ref_w <= 0:
+            raise ValueError("face_crop_video and reference_image must contain non-empty images.")
+
+        app, model_info = _get_insightface_app(str(insightface_model), str(provider), int(det_size))
+        target_faces = app.get(target_rgb[:, :, ::-1].copy())
+        reference_faces = app.get(reference_rgb[:, :, ::-1].copy())
+        target_face = _select_insightface_face(
+            list(target_faces),
+            int(target_w),
+            int(target_h),
+            str(target_face_select),
+            "face_crop_video target frame",
+        )
+        reference_face = _select_insightface_face(
+            list(reference_faces),
+            int(ref_w),
+            int(ref_h),
+            str(reference_face_select),
+            "reference_image",
+        )
+        target_info = _face_bbox_info(target_face, int(target_w), int(target_h))
+        reference_info = _face_bbox_info(reference_face, int(ref_w), int(ref_h))
+
+        target_aspect = float(target_w) / max(1.0, float(target_h))
+        normalized_basis = str(face_size_basis or "bbox_width").strip()
+        if normalized_basis not in {"bbox_width", "bbox_height"}:
+            normalized_basis = "bbox_width"
+        scale = max(0.25, min(4.0, float(face_scale)))
+        if normalized_basis == "bbox_height":
+            target_relative_size = float(target_info["size"][1]) / max(1.0, float(target_h))
+            reference_size = float(reference_info["size"][1])
+            canvas_h = int(round(reference_size / max(1e-6, target_relative_size * scale)))
+            canvas_w = int(round(float(canvas_h) * target_aspect))
+        else:
+            target_relative_size = float(target_info["size"][0]) / max(1.0, float(target_w))
+            reference_size = float(reference_info["size"][0])
+            canvas_w = int(round(reference_size / max(1e-6, target_relative_size * scale)))
+            canvas_h = int(round(float(canvas_w) / max(1e-6, target_aspect)))
+        canvas_w = max(1, canvas_w)
+        canvas_h = max(1, canvas_h)
+
+        target_relative_center_x = float(target_info["center"][0]) / max(1.0, float(target_w)) + float(x_offset_ratio)
+        target_relative_center_y = float(target_info["center"][1]) / max(1.0, float(target_h)) + float(y_offset_ratio)
+        ref_center_x = float(reference_info["center"][0])
+        ref_center_y = float(reference_info["center"][1])
+        window_x0 = int(round(ref_center_x - target_relative_center_x * float(canvas_w)))
+        window_y0 = int(round(ref_center_y - target_relative_center_y * float(canvas_h)))
+        aligned_rgb, window_info = _extract_reference_window_no_resize(
+            reference_rgb,
+            window_x0,
+            window_y0,
+            int(canvas_w),
+            int(canvas_h),
+            str(padding_mode),
+        )
+        aligned_reference = _rgb_uint8_to_image_tensor(aligned_rgb)
+
+        target_preview = _rgb_uint8_to_image_tensor(target_rgb)
+        target_marked = target_preview.clone()
+        _draw_rect(target_marked, tuple(int(value) for value in target_info["bbox_int"]), (0.1, 0.9, 0.25))
+        aligned_preview = _resize_image_batch(aligned_reference, int(target_h), int(target_w), mode="bilinear")
+        sx = float(target_w) / max(1.0, float(canvas_w))
+        sy = float(target_h) / max(1.0, float(canvas_h))
+        ref_bbox = reference_info["bbox"]
+        aligned_bbox = (
+            int(round((float(ref_bbox[0]) - float(window_x0)) * sx)),
+            int(round((float(ref_bbox[1]) - float(window_y0)) * sy)),
+            int(round((float(ref_bbox[2]) - float(window_x0)) * sx)),
+            int(round((float(ref_bbox[3]) - float(window_y0)) * sy)),
+        )
+        aligned_marked = aligned_preview.clone()
+        _draw_rect(aligned_marked, aligned_bbox, (0.95, 0.25, 0.15))
+        debug_preview = torch.cat([target_marked, aligned_marked], dim=2).contiguous().clamp(0, 1)
+
+        aligned_face_bbox = [
+            float(ref_bbox[0]) - float(window_x0),
+            float(ref_bbox[1]) - float(window_y0),
+            float(ref_bbox[2]) - float(window_x0),
+            float(ref_bbox[3]) - float(window_y0),
+        ]
+        summary = {
+            "method": "insightface_bbox_ratio_crop_pad_no_resize",
+            "insightface": model_info,
+            "target_frame_index": int(max(0, min(int(face_crop_video.shape[0]) - 1, int(target_frame_index)))),
+            "target_crop_shape": [1, int(target_h), int(target_w), 3],
+            "reference_shape": [1, int(ref_h), int(ref_w), 3],
+            "aligned_reference_shape": _shape(aligned_reference),
+            "reference_pixels_resized": False,
+            "output_aspect": float(canvas_w / max(1, canvas_h)),
+            "target_aspect": float(target_aspect),
+            "face_scale": float(scale),
+            "x_offset_ratio": float(x_offset_ratio),
+            "y_offset_ratio": float(y_offset_ratio),
+            "face_size_basis": normalized_basis,
+            "target_face": target_info,
+            "reference_face": reference_info,
+            "aligned_reference_face_bbox": [float(value) for value in aligned_face_bbox],
+            "target_relative_center": [float(target_relative_center_x), float(target_relative_center_y)],
+            "target_relative_face_size": float(target_relative_size),
+            "reference_face_size_px": float(reference_size),
+            "reference_window": window_info,
+            "debug_preview": "left is target crop frame, right is aligned reference resized only for visual comparison",
+            "connect_to": "Use aligned_reference_image as the face-detail pass reference_N input.",
+        }
+        return (aligned_reference.contiguous().clamp(0, 1), debug_preview, json.dumps(summary, indent=2))
+
+
 class SCAIL2FaceCompositeBack:
     @classmethod
     def INPUT_TYPES(cls):
@@ -3200,6 +3553,7 @@ NODE_CLASS_MAPPINGS = {
     "SCAIL2ScheduledLongVideo": SCAIL2ScheduledLongVideo,
     "SCAIL2ScheduledLongVideoWithSAM": SCAIL2ScheduledLongVideoWithSAM,
     "SCAIL2HeadTrackCrop": SCAIL2HeadTrackCrop,
+    "SCAIL2AlignReferenceFaceToCrop": SCAIL2AlignReferenceFaceToCrop,
     "SCAIL2FaceCompositeBack": SCAIL2FaceCompositeBack,
 }
 
@@ -3212,5 +3566,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SCAIL2ScheduledLongVideo": "SCAIL-2 Scheduled Long Video",
     "SCAIL2ScheduledLongVideoWithSAM": "SCAIL-2 Scheduled Long Video (Internal SAM)",
     "SCAIL2HeadTrackCrop": "SCAIL-2 Head Track Crop",
+    "SCAIL2AlignReferenceFaceToCrop": "SCAIL-2 Align Reference Face To Crop",
     "SCAIL2FaceCompositeBack": "SCAIL-2 Face Composite Back",
 }

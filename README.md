@@ -135,6 +135,31 @@ For the face crop pass, use either existing long-video scheduler:
 - external-mask scheduler if you want to preview/adjust masks;
 - internal-SAM scheduler if you want the crop video tracked inside the node.
 
+Optional reference pre-alignment:
+
+```text
+SCAIL-2 Head Track Crop.face_crop_video + high-res face reference
+  -> SCAIL-2 Align Reference Face To Crop
+  -> aligned_reference_image
+  -> face crop pass reference_N
+```
+
+`SCAIL-2 Align Reference Face To Crop` uses InsightFace detection to compare the
+first selected crop frame with the high-resolution reference image. It then
+builds a new reference image whose aspect ratio matches the crop frame and whose
+face position/face width matches the crop frame. The node does not shrink the
+reference pixels to the crop resolution. It crops the reference at original
+pixel density, and when the computed window reaches outside the reference image
+it pads the missing edge according to `padding_mode`. This keeps the reference
+as sharp as possible while giving the second SCAIL pass a face reference whose
+layout already matches the crop. Use `face_scale` only for intentional small
+corrections: values above `1.0` make the reference face larger inside the output
+window, and values below `1.0` make it smaller.
+
+This node requires `insightface` plus `onnxruntime-gpu` for CUDA or
+`onnxruntime` for CPU. The recommended model is `buffalo_l`; `buffalo_s` is
+available when a smaller model is preferred.
+
 Connect `face_crop_video` to the second scheduler's `pose_video`, and reuse the
 same `segment_plan`, `max_chunk_frames`, `overlap_frames`, and
 `boundary_overlap` settings as the full-body pass. Connect high-resolution face
