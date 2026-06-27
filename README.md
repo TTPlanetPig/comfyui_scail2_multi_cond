@@ -144,10 +144,10 @@ SCAIL-2 Head Track Crop.face_crop_video + high-res face reference
   -> face crop pass reference_N
 ```
 
-`SCAIL-2 Align Reference Face To Crop` uses InsightFace detection to compare the
-first selected crop frame with the high-resolution reference image. It then
-builds a new reference image whose aspect ratio matches the crop frame and whose
-face position/face width matches the crop frame. The node does not shrink the
+`SCAIL-2 Align Reference Face To Crop` uses a face detector to compare the first
+selected crop frame with the high-resolution reference image. It then builds a
+new reference image whose aspect ratio matches the crop frame and whose face
+position/face width matches the crop frame. The node does not shrink the
 reference pixels to the crop resolution. It crops the reference at original
 pixel density, and when the computed window reaches outside the reference image
 it pads the missing edge according to `padding_mode`. This keeps the reference
@@ -156,9 +156,21 @@ layout already matches the crop. Use `face_scale` only for intentional small
 corrections: values above `1.0` make the reference face larger inside the output
 window, and values below `1.0` make it smaller.
 
-This node requires `insightface` plus `onnxruntime-gpu` for CUDA or
+`face_detector_backend` defaults to `auto`. In auto mode the node tries
+InsightFace first, then falls back to MediaPipe if InsightFace is not installed
+or fails to load/detect a face. Use `insightface` when you want the strongest
+detector and already have `insightface` plus `onnxruntime-gpu` installed. Use
+`mediapipe` when you want the easiest install path:
+
+```text
+python -m pip install mediapipe
+```
+
+For InsightFace, install `insightface` plus `onnxruntime-gpu` for CUDA or
 `onnxruntime` for CPU. The recommended model is `buffalo_l`; `buffalo_s` is
-available when a smaller model is preferred.
+available when a smaller model is preferred. The MediaPipe backend uses the
+built-in face detection solution, so it does not require a separate `.task`
+model file.
 
 Connect `face_crop_video` to the second scheduler's `pose_video`, and reuse the
 same `segment_plan`, `max_chunk_frames`, `overlap_frames`, and

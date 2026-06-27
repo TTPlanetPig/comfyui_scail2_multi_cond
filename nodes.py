@@ -19,6 +19,7 @@ DEFAULT_PLAN = """# frames | reference | prompt | negative | boundary_overlap
 157 | 4 | fourth segment prompt | | 1
 """
 _INSIGHTFACE_APP_CACHE: dict[tuple[str, str, int], Any] = {}
+_MEDIAPIPE_FACE_DETECTION_CACHE: dict[tuple[int, float], Any] = {}
 
 
 def _shape(value: Any) -> list[int]:
@@ -1349,30 +1350,28 @@ def _get_insightface_app(model_name: str, provider_mode: str, det_size: int):
     return app, {"model_name": normalized_model, "provider": provider_key, "det_size": int(normalized_det_size)}
 
 
-def _select_insightface_face(faces: list[Any], image_w: int, image_h: int, select_mode: str, name: str) -> Any:
-    if not faces:
-        raise RuntimeError(f"InsightFace detected no face in {name}. Use a clearer frame/reference image.")
+def _select_face_info(
+    candidates: list[dict[str, Any]],
+    image_w: int,
+    image_h: int,
+    select_mode: str,
+    name: str,
+    backend: str,
+) -> dict[str, Any]:
+    if not candidates:
+        raise RuntimeError(f"{backend} detected no face in {name}. Use a clearer frame/reference image.")
     normalized = str(select_mode or "largest").strip()
     if normalized not in {"largest", "center"}:
         normalized = "largest"
-
-    def bbox(face) -> tuple[float, float, float, float]:
-        value = getattr(face, "bbox", None)
-        if value is None or len(value) != 4:
-            raise RuntimeError(f"InsightFace face in {name} did not include a bbox.")
-        return tuple(float(item) for item in value)
 
     if normalized == "center":
         cx = float(image_w) / 2.0
         cy = float(image_h) / 2.0
         return min(
-            faces,
-            key=lambda face: (
-                ((bbox(face)[0] + bbox(face)[2]) * 0.5 - cx) ** 2
-                + ((bbox(face)[1] + bbox(face)[3]) * 0.5 - cy) ** 2
-            ),
+            candidates,
+            key=lambda item: (float(item["center"][0]) - cx) ** 2 + (float(item["center"][1]) - cy) ** 2,
         )
-    return max(faces, key=lambda face: max(0.0, bbox(face)[2] - bbox(face)[0]) * max(0.0, bbox(face)[3] - bbox(face)[1]))
+    return max(candidates, key=lambda item: float(item["size"][0]) * float(item["size"][1]))
 
 
 def _face_bbox_info(face: Any, image_w: int, image_h: int) -> dict[str, Any]:
@@ -1392,6 +1391,173 @@ def _face_bbox_info(face: Any, image_w: int, image_h: int) -> dict[str, Any]:
         "size": [float(x1 - x0), float(y1 - y0)],
         "score": float(score) if score is not None else None,
     }
+
+
+def _detect_face_info_insightface(
+    image_rgb: Any,
+    select_mode: str,
+    name: str,
+    insightface_model: str,
+    provider: str,
+    det_size: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    image_h, image_w = int(image_rgb.shape[0]), int(image_rgb.shape[1])
+    app, model_info = _get_insightface_app(str(insightface_model), str(provider), int(det_size))
+    faces = list(app.get(image_rgb[:, :, ::-1].copy()))
+    candidates = [_face_bbox_info(face, int(image_w), int(image_h)) for face in faces]
+    selected = _select_face_info(candidates, int(image_w), int(image_h), str(select_mode), str(name), "InsightFace")
+    return selected, {"backend": "insightface", **model_info, "candidate_count": int(len(candidates))}
+
+
+def _get_mediapipe_face_detector(model_selection: str, min_detection_confidence: float):
+    try:
+        import mediapipe as mp
+    except Exception as exc:
+        raise RuntimeError(
+            "MediaPipe fallback requires mediapipe. Install it with: python -m pip install mediapipe"
+        ) from exc
+
+    normalized = str(model_selection or "full_range").strip()
+    model_selection_id = 0 if normalized == "short_range" else 1
+    confidence = max(0.01, min(0.99, float(min_detection_confidence)))
+    cache_key = (int(model_selection_id), round(confidence, 4))
+    detector = _MEDIAPIPE_FACE_DETECTION_CACHE.get(cache_key)
+    if detector is None:
+        detector = mp.solutions.face_detection.FaceDetection(
+            model_selection=int(model_selection_id),
+            min_detection_confidence=float(confidence),
+        )
+        _MEDIAPIPE_FACE_DETECTION_CACHE[cache_key] = detector
+    return detector, {
+        "backend": "mediapipe",
+        "model_selection": "short_range" if model_selection_id == 0 else "full_range",
+        "min_detection_confidence": float(confidence),
+    }
+
+
+def _detect_face_info_mediapipe(
+    image_rgb: Any,
+    select_mode: str,
+    name: str,
+    model_selection: str,
+    min_detection_confidence: float,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    image_h, image_w = int(image_rgb.shape[0]), int(image_rgb.shape[1])
+    detector, model_info = _get_mediapipe_face_detector(str(model_selection), float(min_detection_confidence))
+    result = detector.process(image_rgb)
+    detections = list(getattr(result, "detections", None) or [])
+    candidates: list[dict[str, Any]] = []
+    for detection in detections:
+        location_data = getattr(detection, "location_data", None)
+        relative_bbox = getattr(location_data, "relative_bounding_box", None)
+        if relative_bbox is None:
+            continue
+        x0 = float(relative_bbox.xmin) * float(image_w)
+        y0 = float(relative_bbox.ymin) * float(image_h)
+        x1 = x0 + float(relative_bbox.width) * float(image_w)
+        y1 = y0 + float(relative_bbox.height) * float(image_h)
+        x0 = max(0.0, min(float(image_w), x0))
+        y0 = max(0.0, min(float(image_h), y0))
+        x1 = max(x0 + 1.0, min(float(image_w), x1))
+        y1 = max(y0 + 1.0, min(float(image_h), y1))
+        score_values = list(getattr(detection, "score", None) or [])
+        keypoints: list[list[float]] = []
+        for keypoint in list(getattr(location_data, "relative_keypoints", None) or []):
+            keypoints.append([float(keypoint.x) * float(image_w), float(keypoint.y) * float(image_h)])
+        candidates.append(
+            {
+                "bbox": [float(x0), float(y0), float(x1), float(y1)],
+                "bbox_int": [int(round(x0)), int(round(y0)), int(round(x1)), int(round(y1))],
+                "center": [float((x0 + x1) * 0.5), float((y0 + y1) * 0.5)],
+                "size": [float(x1 - x0), float(y1 - y0)],
+                "score": float(score_values[0]) if score_values else None,
+                "keypoints": keypoints,
+            }
+        )
+    selected = _select_face_info(candidates, int(image_w), int(image_h), str(select_mode), str(name), "MediaPipe")
+    return selected, {**model_info, "candidate_count": int(len(candidates))}
+
+
+def _detect_face_pair(
+    target_rgb: Any,
+    reference_rgb: Any,
+    backend: str,
+    target_select: str,
+    reference_select: str,
+    insightface_model: str,
+    provider: str,
+    det_size: int,
+    mediapipe_model_selection: str,
+    mediapipe_min_detection_confidence: float,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    requested_backend = str(backend or "auto").strip()
+    if requested_backend not in {"auto", "insightface", "mediapipe"}:
+        requested_backend = "auto"
+
+    def run_insightface() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        target_info, target_model = _detect_face_info_insightface(
+            target_rgb,
+            str(target_select),
+            "face_crop_video target frame",
+            str(insightface_model),
+            str(provider),
+            int(det_size),
+        )
+        reference_info, reference_model = _detect_face_info_insightface(
+            reference_rgb,
+            str(reference_select),
+            "reference_image",
+            str(insightface_model),
+            str(provider),
+            int(det_size),
+        )
+        return target_info, reference_info, {
+            "requested_backend": requested_backend,
+            "backend_used": "insightface",
+            "target": target_model,
+            "reference": reference_model,
+        }
+
+    def run_mediapipe(auto_fallback_reason: Optional[str] = None) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        target_info, target_model = _detect_face_info_mediapipe(
+            target_rgb,
+            str(target_select),
+            "face_crop_video target frame",
+            str(mediapipe_model_selection),
+            float(mediapipe_min_detection_confidence),
+        )
+        reference_info, reference_model = _detect_face_info_mediapipe(
+            reference_rgb,
+            str(reference_select),
+            "reference_image",
+            str(mediapipe_model_selection),
+            float(mediapipe_min_detection_confidence),
+        )
+        detector_info = {
+            "requested_backend": requested_backend,
+            "backend_used": "mediapipe",
+            "target": target_model,
+            "reference": reference_model,
+        }
+        if auto_fallback_reason:
+            detector_info["auto_fallback_from_insightface"] = auto_fallback_reason
+        return target_info, reference_info, detector_info
+
+    if requested_backend == "insightface":
+        return run_insightface()
+    if requested_backend == "mediapipe":
+        return run_mediapipe()
+
+    try:
+        return run_insightface()
+    except Exception as insightface_exc:
+        try:
+            return run_mediapipe(str(insightface_exc))
+        except Exception as mediapipe_exc:
+            raise RuntimeError(
+                "Auto face detector failed with both InsightFace and MediaPipe. "
+                f"InsightFace error: {insightface_exc}; MediaPipe error: {mediapipe_exc}"
+            ) from mediapipe_exc
 
 
 def _extract_reference_window_no_resize(
@@ -3163,6 +3329,12 @@ class SCAIL2AlignReferenceFaceToCrop:
                 "insightface_model": (["buffalo_l", "buffalo_s"], {"default": "buffalo_l"}),
                 "provider": (["auto", "cuda", "cpu"], {"default": "auto"}),
                 "det_size": ("INT", {"default": 640, "min": 160, "max": 2048, "step": 32}),
+                "face_detector_backend": (["auto", "insightface", "mediapipe"], {"default": "auto"}),
+                "mediapipe_model_selection": (["full_range", "short_range"], {"default": "full_range"}),
+                "mediapipe_min_detection_confidence": (
+                    "FLOAT",
+                    {"default": 0.5, "min": 0.01, "max": 0.99, "step": 0.01},
+                ),
             }
         }
 
@@ -3194,6 +3366,9 @@ class SCAIL2AlignReferenceFaceToCrop:
         insightface_model: str = "buffalo_l",
         provider: str = "auto",
         det_size: int = 640,
+        face_detector_backend: str = "auto",
+        mediapipe_model_selection: str = "full_range",
+        mediapipe_min_detection_confidence: float = 0.5,
     ):
         target_rgb = _image_batch_frame_to_rgb_uint8(face_crop_video, int(target_frame_index), "face_crop_video")
         reference_rgb = _image_batch_frame_to_rgb_uint8(reference_image, 0, "reference_image")
@@ -3202,25 +3377,18 @@ class SCAIL2AlignReferenceFaceToCrop:
         if target_h <= 0 or target_w <= 0 or ref_h <= 0 or ref_w <= 0:
             raise ValueError("face_crop_video and reference_image must contain non-empty images.")
 
-        app, model_info = _get_insightface_app(str(insightface_model), str(provider), int(det_size))
-        target_faces = app.get(target_rgb[:, :, ::-1].copy())
-        reference_faces = app.get(reference_rgb[:, :, ::-1].copy())
-        target_face = _select_insightface_face(
-            list(target_faces),
-            int(target_w),
-            int(target_h),
+        target_info, reference_info, detector_info = _detect_face_pair(
+            target_rgb,
+            reference_rgb,
+            str(face_detector_backend),
             str(target_face_select),
-            "face_crop_video target frame",
-        )
-        reference_face = _select_insightface_face(
-            list(reference_faces),
-            int(ref_w),
-            int(ref_h),
             str(reference_face_select),
-            "reference_image",
+            str(insightface_model),
+            str(provider),
+            int(det_size),
+            str(mediapipe_model_selection),
+            float(mediapipe_min_detection_confidence),
         )
-        target_info = _face_bbox_info(target_face, int(target_w), int(target_h))
-        reference_info = _face_bbox_info(reference_face, int(ref_w), int(ref_h))
 
         target_aspect = float(target_w) / max(1.0, float(target_h))
         normalized_basis = str(face_size_basis or "bbox_width").strip()
@@ -3284,8 +3452,9 @@ class SCAIL2AlignReferenceFaceToCrop:
             float(ref_bbox[3]) - float(window_y0),
         ]
         summary = {
-            "method": "insightface_bbox_ratio_crop_pad_no_resize",
-            "insightface": model_info,
+            "method": "face_detector_bbox_ratio_crop_pad_no_resize",
+            "face_detector": detector_info,
+            "insightface": detector_info if detector_info.get("backend_used") == "insightface" else None,
             "target_frame_index": int(max(0, min(int(face_crop_video.shape[0]) - 1, int(target_frame_index)))),
             "target_crop_shape": [1, int(target_h), int(target_w), 3],
             "reference_shape": [1, int(ref_h), int(ref_w), 3],
