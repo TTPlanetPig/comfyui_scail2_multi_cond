@@ -3259,7 +3259,11 @@ class SCAIL2AlignReferenceFaceToCrop:
         target_preview = _rgb_uint8_to_image_tensor(target_rgb)
         target_marked = target_preview.clone()
         _draw_rect(target_marked, tuple(int(value) for value in target_info["bbox_int"]), (0.1, 0.9, 0.25))
-        aligned_preview = _resize_image_batch(aligned_reference, int(target_h), int(target_w), mode="bilinear")
+        aligned_preview = _resize_image_tensor_like(
+            aligned_reference,
+            torch.empty((1, int(target_h), int(target_w), 3)),
+            mode="bilinear",
+        )
         sx = float(target_w) / max(1.0, float(canvas_w))
         sy = float(target_h) / max(1.0, float(canvas_h))
         ref_bbox = reference_info["bbox"]
