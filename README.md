@@ -111,7 +111,10 @@ while `crop_manifest.frames[].mask_bbox` records the tighter face/head mask
 position. The crop size is fixed from the first tracked frame after padding and
 stored as `crop_manifest.fixed_crop_size`; later frames move that same absolute
 pixel square instead of resizing per-frame crops. For full-body 9:16 videos,
-start with `crop_padding_ratio` around `0.35` to `0.5`.
+start with `crop_padding_ratio` around `0.35` to `0.5`. If the crop area is
+correct but the face mask itself looks clipped by a smaller inner box, increase
+`mask_bbox_padding_ratio`; this expands the internal mask keep-box without
+changing the outer square crop.
 
 `crop_mode` controls how the square crop is placed:
 

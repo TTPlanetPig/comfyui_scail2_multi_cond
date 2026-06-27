@@ -1226,6 +1226,21 @@ def _clamp_bbox(bbox: tuple[int, int, int, int], width: int, height: int) -> tup
     return x0, y0, x1, y1
 
 
+def _expand_bbox(
+    bbox: tuple[int, int, int, int],
+    width: int,
+    height: int,
+    padding_ratio: float = 0.0,
+    padding_px: int = 0,
+) -> tuple[int, int, int, int]:
+    x0, y0, x1, y1 = _clamp_bbox(bbox, int(width), int(height))
+    box_w = max(1, int(x1 - x0))
+    box_h = max(1, int(y1 - y0))
+    pad_x = int(round(box_w * max(0.0, float(padding_ratio)))) + max(0, int(padding_px))
+    pad_y = int(round(box_h * max(0.0, float(padding_ratio)))) + max(0, int(padding_px))
+    return _clamp_bbox((x0 - pad_x, y0 - pad_y, x1 + pad_x, y1 + pad_y), int(width), int(height))
+
+
 def _draw_rect(image: torch.Tensor, bbox: tuple[int, int, int, int], color: tuple[float, float, float]) -> None:
     _batch, height, width, _channels = image.shape
     x0, y0, x1, y1 = _clamp_bbox(bbox, int(width), int(height))
@@ -2730,6 +2745,7 @@ class SCAIL2HeadTrackCrop:
                 "sam_max_objects": ("INT", {"default": 1, "min": 1, "max": 8, "step": 1}),
                 "sam_detect_interval": ("INT", {"default": 2, "min": 1, "max": 999, "step": 1}),
                 "crop_mode": (["center_follow", "fixed_canvas"], {"default": "center_follow"}),
+                "mask_bbox_padding_ratio": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 2.0, "step": 0.05}),
             },
             "optional": {
                 "head_masks": ("MASK",),
@@ -2763,6 +2779,7 @@ class SCAIL2HeadTrackCrop:
         sam_max_objects: int,
         sam_detect_interval: int,
         crop_mode: str = "center_follow",
+        mask_bbox_padding_ratio: float = 0.25,
         head_masks: Optional[torch.Tensor] = None,
         sam_model=None,
         head_conditioning=None,
@@ -2849,10 +2866,21 @@ class SCAIL2HeadTrackCrop:
             canvas_source_bbox = smoothed[0]
             bbox_strategy = "first_frame_fixed_square_from_face_mask"
             fixed_crop_anchor_frame = 0
-        paste_masks = _constrain_masks_to_bboxes(masks, smoothed, int(width), int(height))
+        paste_mask_bboxes = [
+            _expand_bbox(
+                bbox,
+                int(width),
+                int(height),
+                padding_ratio=float(mask_bbox_padding_ratio),
+                padding_px=int(mask_expand_px),
+            )
+            for bbox in smoothed
+        ]
+        paste_masks = _constrain_masks_to_bboxes(masks, paste_mask_bboxes, int(width), int(height))
         face_crop_video, crop_masks, frames = _crop_video_by_manifest(video, paste_masks, square_bboxes)
-        for frame, mask_bbox in zip(frames, smoothed):
+        for frame, mask_bbox, source_mask_bbox in zip(frames, paste_mask_bboxes, smoothed):
             frame["mask_bbox"] = [int(value) for value in mask_bbox]
+            frame["source_mask_bbox"] = [int(value) for value in source_mask_bbox]
         manifest = {
             "version": 1,
             "source_shape": _shape(video),
@@ -2870,6 +2898,8 @@ class SCAIL2HeadTrackCrop:
             "bbox_strategy": bbox_strategy,
             "crop_bbox_field": "bbox",
             "mask_bbox_field": "mask_bbox",
+            "source_mask_bbox_field": "source_mask_bbox",
+            "mask_bbox_padding_ratio": float(mask_bbox_padding_ratio),
             "mask_expand_px": int(mask_expand_px),
             "mask_blur_px": int(mask_blur_px),
             "missing_mask_frames": [int(index) for index, bbox in enumerate(raw_bboxes) if bbox is None],
