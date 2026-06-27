@@ -1162,59 +1162,6 @@ def _bbox_from_mask_frame(mask: torch.Tensor) -> Optional[tuple[int, int, int, i
     return x0, y0, x1, y1
 
 
-def _head_bbox_from_mask_frame(mask: torch.Tensor, width: int, height: int) -> Optional[tuple[int, int, int, int]]:
-    full_bbox = _bbox_from_mask_frame(mask)
-    if full_bbox is None:
-        return None
-
-    x0, y0, x1, y1 = full_bbox
-    box_w = max(1, x1 - x0)
-    box_h = max(1, y1 - y0)
-    min_frame_side = max(1, min(int(width), int(height)))
-    max_head_side = max(16, int(round(min_frame_side * 0.18)))
-    frame_area = max(1, int(width) * int(height))
-    box_area = box_w * box_h
-    looks_like_body = (
-        box_h > int(height) * 0.28
-        or box_w > int(width) * 0.45
-        or max(box_w, box_h) > max_head_side * 1.35
-        or box_area > frame_area * 0.08
-    )
-    if not looks_like_body:
-        return full_bbox
-
-    band_h = max(8, min(box_h, int(round(box_h * 0.16))))
-    head_band = mask[y0 : y0 + band_h, x0:x1] > 0.05
-    coords = torch.nonzero(head_band, as_tuple=False)
-    if int(coords.shape[0]) > 0:
-        xs = coords[:, 1].float() + float(x0)
-        top_y = int(coords[:, 0].min().item()) + y0
-        if int(xs.numel()) >= 10:
-            sorted_xs = torch.sort(xs).values
-            q_low = float(sorted_xs[int((int(sorted_xs.numel()) - 1) * 0.10)].item())
-            q_high = float(sorted_xs[int((int(sorted_xs.numel()) - 1) * 0.90)].item())
-        else:
-            q_low = float(xs.min().item())
-            q_high = float(xs.max().item())
-        center_x = (q_low + q_high) / 2.0
-        measured_w = max(1, int(round(q_high - q_low + 1.0)))
-    else:
-        center_x = (x0 + x1) / 2.0
-        top_y = y0
-        measured_w = 1
-
-    estimated_side = max(
-        16,
-        measured_w,
-        int(round(box_h * 0.16)),
-        int(round(min_frame_side * 0.08)),
-    )
-    side = min(max_head_side, estimated_side, max(1, box_h), max(1, int(width)))
-    hx0 = int(round(center_x - side / 2.0))
-    hy0 = int(top_y)
-    return _clamp_bbox((hx0, hy0, hx0 + side, hy0 + side), int(width), int(height))
-
-
 def _clamp_bbox(bbox: tuple[int, int, int, int], width: int, height: int) -> tuple[int, int, int, int]:
     x0, y0, x1, y1 = bbox
     width = max(1, int(width))
@@ -1226,21 +1173,6 @@ def _clamp_bbox(bbox: tuple[int, int, int, int], width: int, height: int) -> tup
     return x0, y0, x1, y1
 
 
-def _expand_bbox(
-    bbox: tuple[int, int, int, int],
-    width: int,
-    height: int,
-    padding_ratio: float = 0.0,
-    padding_px: int = 0,
-) -> tuple[int, int, int, int]:
-    x0, y0, x1, y1 = _clamp_bbox(bbox, int(width), int(height))
-    box_w = max(1, int(x1 - x0))
-    box_h = max(1, int(y1 - y0))
-    pad_x = int(round(box_w * max(0.0, float(padding_ratio)))) + max(0, int(padding_px))
-    pad_y = int(round(box_h * max(0.0, float(padding_ratio)))) + max(0, int(padding_px))
-    return _clamp_bbox((x0 - pad_x, y0 - pad_y, x1 + pad_x, y1 + pad_y), int(width), int(height))
-
-
 def _draw_rect(image: torch.Tensor, bbox: tuple[int, int, int, int], color: tuple[float, float, float]) -> None:
     _batch, height, width, _channels = image.shape
     x0, y0, x1, y1 = _clamp_bbox(bbox, int(width), int(height))
@@ -1250,21 +1182,6 @@ def _draw_rect(image: torch.Tensor, bbox: tuple[int, int, int, int], color: tupl
     image[:, max(y1 - thickness, y0) : y1, x0:x1, :3] = rgb
     image[:, y0:y1, x0 : min(x0 + thickness, x1), :3] = rgb
     image[:, y0:y1, max(x1 - thickness, x0) : x1, :3] = rgb
-
-
-def _constrain_masks_to_bboxes(
-    masks: torch.Tensor,
-    bboxes: list[tuple[int, int, int, int]],
-    width: int,
-    height: int,
-) -> torch.Tensor:
-    constrained = torch.zeros_like(masks)
-    for index, bbox in enumerate(bboxes[: int(masks.shape[0])]):
-        x0, y0, x1, y1 = _clamp_bbox(bbox, int(width), int(height))
-        constrained[index, y0:y1, x0:x1] = masks[index, y0:y1, x0:x1]
-        if float(constrained[index].max().item()) <= 0.05:
-            constrained[index, y0:y1, x0:x1] = 1.0
-    return constrained.clamp(0, 1).contiguous()
 
 
 def _interpolate_missing_bboxes(raw: list[Optional[tuple[int, int, int, int]]]) -> list[tuple[int, int, int, int]]:
@@ -1345,20 +1262,6 @@ def _union_bbox_from_bboxes(
     x1 = max(int(bbox[2]) for bbox in bboxes)
     y1 = max(int(bbox[3]) for bbox in bboxes)
     return _clamp_bbox((x0, y0, x1, y1), int(width), int(height))
-
-
-def _filter_head_bbox_outliers(bboxes: list[tuple[int, int, int, int]]) -> list[tuple[int, int, int, int]]:
-    if len(bboxes) < 5:
-        return bboxes
-    sides = sorted(max(int(x1 - x0), int(y1 - y0)) for x0, y0, x1, y1 in bboxes)
-    median_side = max(1, sides[len(sides) // 2])
-    max_side = max(median_side * 2.0, median_side + 48.0)
-    filtered = [
-        bbox
-        for bbox in bboxes
-        if max(int(bbox[2] - bbox[0]), int(bbox[3] - bbox[1])) <= max_side
-    ]
-    return filtered if len(filtered) >= max(3, len(bboxes) // 2) else bboxes
 
 
 def _fixed_square_bbox_from_bbox(
@@ -2745,7 +2648,6 @@ class SCAIL2HeadTrackCrop:
                 "sam_max_objects": ("INT", {"default": 1, "min": 1, "max": 8, "step": 1}),
                 "sam_detect_interval": ("INT", {"default": 2, "min": 1, "max": 999, "step": 1}),
                 "crop_mode": (["center_follow", "fixed_canvas"], {"default": "center_follow"}),
-                "mask_bbox_padding_ratio": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 2.0, "step": 0.05}),
             },
             "optional": {
                 "head_masks": ("MASK",),
@@ -2779,7 +2681,6 @@ class SCAIL2HeadTrackCrop:
         sam_max_objects: int,
         sam_detect_interval: int,
         crop_mode: str = "center_follow",
-        mask_bbox_padding_ratio: float = 0.25,
         head_masks: Optional[torch.Tensor] = None,
         sam_model=None,
         head_conditioning=None,
@@ -2828,17 +2729,15 @@ class SCAIL2HeadTrackCrop:
             raise ValueError("Connect head_masks, or connect sam_model and head_conditioning if your ComfyUI exposes SAM3 mask conversion.")
 
         masks = _binary_mask_morph(masks, expand_px=int(mask_expand_px), blur_px=int(mask_blur_px))
-        raw_bboxes = [_head_bbox_from_mask_frame(masks[index], int(width), int(height)) for index in range(int(frame_count))]
+        raw_bboxes = [_bbox_from_mask_frame(masks[index]) for index in range(int(frame_count))]
         filled_bboxes = _interpolate_missing_bboxes(raw_bboxes)
         smoothed = _smooth_bboxes(filled_bboxes, int(width), int(height), float(temporal_smoothing))
         normalized_crop_mode = str(crop_mode or "center_follow").strip() or "center_follow"
         if normalized_crop_mode not in {"center_follow", "fixed_canvas"}:
             normalized_crop_mode = "center_follow"
-        canvas_bbox_source_count = len(smoothed)
+        canvas_bbox_source_count = len(filled_bboxes)
         if normalized_crop_mode == "fixed_canvas":
-            canvas_bboxes = _filter_head_bbox_outliers(smoothed)
-            canvas_bbox_source_count = len(canvas_bboxes)
-            canvas_source_bbox = _union_bbox_from_bboxes(canvas_bboxes, int(width), int(height))
+            canvas_source_bbox = _union_bbox_from_bboxes(filled_bboxes, int(width), int(height))
             canvas_bbox = _square_bbox_from_bbox(
                 canvas_source_bbox,
                 int(width),
@@ -2848,7 +2747,7 @@ class SCAIL2HeadTrackCrop:
             )
             fixed_crop_size = int(canvas_bbox[2] - canvas_bbox[0])
             square_bboxes = [canvas_bbox for _index in range(int(frame_count))]
-            bbox_strategy = "fixed_canvas_union_from_face_masks"
+            bbox_strategy = "fixed_canvas_union_from_mask_bboxes"
             fixed_crop_anchor_frame: Optional[int] = None
         else:
             first_square_bbox = _square_bbox_from_bbox(
@@ -2864,23 +2763,14 @@ class SCAIL2HeadTrackCrop:
                 for bbox in smoothed
             ]
             canvas_source_bbox = smoothed[0]
-            bbox_strategy = "first_frame_fixed_square_from_face_mask"
+            bbox_strategy = "first_frame_fixed_square_from_mask_bbox"
             fixed_crop_anchor_frame = 0
-        paste_mask_bboxes = [
-            _expand_bbox(
-                bbox,
-                int(width),
-                int(height),
-                padding_ratio=float(mask_bbox_padding_ratio),
-                padding_px=int(mask_expand_px),
-            )
-            for bbox in smoothed
-        ]
-        paste_masks = _constrain_masks_to_bboxes(masks, paste_mask_bboxes, int(width), int(height))
-        face_crop_video, crop_masks, frames = _crop_video_by_manifest(video, paste_masks, square_bboxes)
-        for frame, mask_bbox, source_mask_bbox in zip(frames, paste_mask_bboxes, smoothed):
+        face_crop_video, crop_masks, frames = _crop_video_by_manifest(video, masks, square_bboxes)
+        for index, (frame, mask_bbox, tracking_bbox) in enumerate(zip(frames, filled_bboxes, smoothed)):
             frame["mask_bbox"] = [int(value) for value in mask_bbox]
-            frame["source_mask_bbox"] = [int(value) for value in source_mask_bbox]
+            frame["tracking_bbox"] = [int(value) for value in tracking_bbox]
+            if raw_bboxes[index] is not None:
+                frame["detected_mask_bbox"] = [int(value) for value in raw_bboxes[index]]
         manifest = {
             "version": 1,
             "source_shape": _shape(video),
@@ -2893,13 +2783,14 @@ class SCAIL2HeadTrackCrop:
             "fixed_crop_anchor_frame": fixed_crop_anchor_frame,
             "canvas_source_bbox": [int(value) for value in canvas_source_bbox],
             "canvas_bbox_source_count": int(canvas_bbox_source_count),
-            "canvas_bbox_filtered_count": int(len(smoothed) - canvas_bbox_source_count),
+            "canvas_bbox_filtered_count": 0,
             "temporal_smoothing": float(temporal_smoothing),
             "bbox_strategy": bbox_strategy,
             "crop_bbox_field": "bbox",
             "mask_bbox_field": "mask_bbox",
-            "source_mask_bbox_field": "source_mask_bbox",
-            "mask_bbox_padding_ratio": float(mask_bbox_padding_ratio),
+            "tracking_bbox_field": "tracking_bbox",
+            "detected_mask_bbox_field": "detected_mask_bbox",
+            "mask_handling": "crop original mask directly; no inner head-box estimation or bbox clipping",
             "mask_expand_px": int(mask_expand_px),
             "mask_blur_px": int(mask_blur_px),
             "missing_mask_frames": [int(index) for index, bbox in enumerate(raw_bboxes) if bbox is None],

@@ -101,20 +101,17 @@ build exposes SAM3 tracking, you can instead connect `sam_model` and
 `head_conditioning`. The node first tries to extract the SAM3 face/head mask from
 that conditioned track data, then falls back only to ComfyUI nodes that output a
 regular `MASK`. It does not use SCAIL colored-mask fallback for face detail
-cropping. If SAM returns a full-body or upper-body mask, the crop node estimates
-the head box from the top of that tracked region instead of using the whole body
-box, which keeps 9:16 full-body videos cropped around the face.
+cropping, and it does not estimate a smaller head box from a larger body mask.
+The SAM/input mask is treated as the source of truth: if it returns a face mask,
+the crop follows the face; if it returns an upper-body mask, the crop will expose
+that mask problem instead of hiding it.
 The output `face_crop_video` is the square face-neighborhood crop. The output
-`crop_masks` is constrained to the detected face/head box inside that square,
-and `crop_manifest.frames[].bbox` records the square's full-body paste position
-while `crop_manifest.frames[].mask_bbox` records the tighter face/head mask
-position. The crop size is fixed from the first tracked frame after padding and
-stored as `crop_manifest.fixed_crop_size`; later frames move that same absolute
-pixel square instead of resizing per-frame crops. For full-body 9:16 videos,
-start with `crop_padding_ratio` around `0.35` to `0.5`. If the crop area is
-correct but the face mask itself looks clipped by a smaller inner box, increase
-`mask_bbox_padding_ratio`; this expands the internal mask keep-box without
-changing the outer square crop.
+`crop_masks` is the original face/head mask cropped into that square, without
+inner bbox clipping. `crop_manifest.frames[].bbox` records the square's
+full-body paste position, `crop_manifest.frames[].mask_bbox` records the mask
+bbox used for crop placement, and `crop_manifest.frames[].detected_mask_bbox`
+records the direct detected bbox when that frame had mask pixels. For full-body
+9:16 videos, start with `crop_padding_ratio` around `0.35` to `0.5`.
 
 `crop_mode` controls how the square crop is placed:
 
@@ -123,9 +120,7 @@ changing the outer square crop.
 - `fixed_canvas`: computes the smallest padded square that covers the tracked
   face/head region across the whole clip, then uses that same fixed full-body
   bbox for every frame. Use this when the second pass should refine a stable
-  local camera region while the head moves inside it. Obvious oversized head
-  bbox outliers are ignored when building this canvas so a single SAM miss does
-  not expand the crop to the upper body.
+  local camera region while the head moves inside it.
 
 For the face crop pass, use either existing long-video scheduler:
 
