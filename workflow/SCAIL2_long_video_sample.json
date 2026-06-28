@@ -870,15 +870,14 @@
       "widgets_values": [
         "# frames | reference | prompt | negative | boundary_overlap\n49 | 1 | 两个卡通大头娃娃在跳舞 | |\n121 | 2 | 第二段提示词 | | 1\n73 | 3 | 第三段提示词 | | 1\n157 | 4 | 第四段提示词 | | 1\n",
         1487,
-        "fixed",
         1,
         "animation",
         270,
         81,
         5,
         2,
-        0.5,
-        null
+        true,
+        "disk"
       ]
     },
     {

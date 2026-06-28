@@ -1617,7 +1617,6 @@
       "widgets_values": [
         "# frames | reference | prompt | negative | boundary_overlap\n49 | 1 | first segment prompt | |\n121 | 2 | second segment prompt | | 1\n73 | 3 | third segment prompt | | 1\n157 | 4 | fourth segment prompt | | 1\n",
         10763,
-        "fixed",
         1,
         "replacement",
         0,
@@ -1631,7 +1630,7 @@
         0.5,
         1,
         1,
-        2
+        "disk"
       ]
     },
     {
