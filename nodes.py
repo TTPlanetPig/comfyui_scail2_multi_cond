@@ -1730,12 +1730,27 @@ def _extract_reference_window_no_resize(
     canvas_w: int,
     canvas_h: int,
     padding_mode: str,
+    window_fit_mode: str = "shift_inside_reference",
 ) -> tuple[Any, dict[str, Any]]:
     import numpy as np
 
     height, width = int(image_rgb.shape[0]), int(image_rgb.shape[1])
     canvas_w = max(1, int(canvas_w))
     canvas_h = max(1, int(canvas_h))
+    requested_x0 = int(x0)
+    requested_y0 = int(y0)
+    requested_x1 = requested_x0 + canvas_w
+    requested_y1 = requested_y0 + canvas_h
+    normalized_fit_mode = str(window_fit_mode or "shift_inside_reference").strip()
+    if normalized_fit_mode not in {"shift_inside_reference", "strict_alignment"}:
+        normalized_fit_mode = "shift_inside_reference"
+    x0 = requested_x0
+    y0 = requested_y0
+    if normalized_fit_mode == "shift_inside_reference":
+        if canvas_w <= width:
+            x0 = max(0, min(int(x0), width - canvas_w))
+        if canvas_h <= height:
+            y0 = max(0, min(int(y0), height - canvas_h))
     x1 = int(x0) + canvas_w
     y1 = int(y0) + canvas_h
     crop_x0 = max(0, int(x0))
@@ -1787,7 +1802,10 @@ def _extract_reference_window_no_resize(
         fixed[: int(output.shape[0]), : int(output.shape[1]), :] = output
         output = fixed
     return output.astype(np.uint8), {
+        "fit_mode": normalized_fit_mode,
+        "requested_window_xyxy": [int(requested_x0), int(requested_y0), int(requested_x1), int(requested_y1)],
         "window_xyxy": [int(x0), int(y0), int(x1), int(y1)],
+        "window_shift_xy": [int(x0) - int(requested_x0), int(y0) - int(requested_y0)],
         "source_overlap_xyxy": [int(crop_x0), int(crop_y0), int(crop_x1), int(crop_y1)],
         "padding": {
             "left": int(pad_left),
@@ -1795,6 +1813,10 @@ def _extract_reference_window_no_resize(
             "right": int(pad_right),
             "bottom": int(pad_bottom),
             "mode": normalized,
+            "unavoidable": bool(
+                ((pad_left or pad_right) and canvas_w > width)
+                or ((pad_top or pad_bottom) and canvas_h > height)
+            ),
         },
     }
 
@@ -3545,6 +3567,10 @@ class SCAIL2AlignReferenceFaceToCrop:
                     "FLOAT",
                     {"default": 0.5, "min": 0.01, "max": 0.99, "step": 0.01},
                 ),
+                "window_fit_mode": (
+                    ["shift_inside_reference", "strict_alignment"],
+                    {"default": "shift_inside_reference"},
+                ),
             }
         }
 
@@ -3579,6 +3605,7 @@ class SCAIL2AlignReferenceFaceToCrop:
         face_detector_backend: str = "auto",
         mediapipe_model_selection: str = "full_range",
         mediapipe_min_detection_confidence: float = 0.5,
+        window_fit_mode: str = "shift_inside_reference",
     ):
         target_rgb = _image_batch_frame_to_rgb_uint8(face_crop_video, int(target_frame_index), "face_crop_video")
         reference_rgb = _image_batch_frame_to_rgb_uint8(reference_image, 0, "reference_image")
@@ -3631,8 +3658,11 @@ class SCAIL2AlignReferenceFaceToCrop:
             int(canvas_w),
             int(canvas_h),
             str(padding_mode),
+            str(window_fit_mode),
         )
         aligned_reference = _rgb_uint8_to_image_tensor(aligned_rgb)
+        actual_window_x0 = int(window_info["window_xyxy"][0])
+        actual_window_y0 = int(window_info["window_xyxy"][1])
 
         target_preview = _rgb_uint8_to_image_tensor(target_rgb)
         target_marked = target_preview.clone()
@@ -3646,23 +3676,23 @@ class SCAIL2AlignReferenceFaceToCrop:
         sy = float(target_h) / max(1.0, float(canvas_h))
         ref_bbox = reference_info["bbox"]
         aligned_bbox = (
-            int(round((float(ref_bbox[0]) - float(window_x0)) * sx)),
-            int(round((float(ref_bbox[1]) - float(window_y0)) * sy)),
-            int(round((float(ref_bbox[2]) - float(window_x0)) * sx)),
-            int(round((float(ref_bbox[3]) - float(window_y0)) * sy)),
+            int(round((float(ref_bbox[0]) - float(actual_window_x0)) * sx)),
+            int(round((float(ref_bbox[1]) - float(actual_window_y0)) * sy)),
+            int(round((float(ref_bbox[2]) - float(actual_window_x0)) * sx)),
+            int(round((float(ref_bbox[3]) - float(actual_window_y0)) * sy)),
         )
         aligned_marked = aligned_preview.clone()
         _draw_rect(aligned_marked, aligned_bbox, (0.95, 0.25, 0.15))
         debug_preview = torch.cat([target_marked, aligned_marked], dim=2).contiguous().clamp(0, 1)
 
         aligned_face_bbox = [
-            float(ref_bbox[0]) - float(window_x0),
-            float(ref_bbox[1]) - float(window_y0),
-            float(ref_bbox[2]) - float(window_x0),
-            float(ref_bbox[3]) - float(window_y0),
+            float(ref_bbox[0]) - float(actual_window_x0),
+            float(ref_bbox[1]) - float(actual_window_y0),
+            float(ref_bbox[2]) - float(actual_window_x0),
+            float(ref_bbox[3]) - float(actual_window_y0),
         ]
         summary = {
-            "method": "face_detector_bbox_ratio_crop_pad_no_resize",
+            "method": "face_detector_bbox_ratio_crop_fit_no_resize",
             "face_detector": detector_info,
             "insightface": detector_info if detector_info.get("backend_used") == "insightface" else None,
             "target_frame_index": int(max(0, min(int(face_crop_video.shape[0]) - 1, int(target_frame_index)))),
@@ -3682,6 +3712,7 @@ class SCAIL2AlignReferenceFaceToCrop:
             "target_relative_center": [float(target_relative_center_x), float(target_relative_center_y)],
             "target_relative_face_size": float(target_relative_size),
             "reference_face_size_px": float(reference_size),
+            "window_fit_mode": str(window_info.get("fit_mode", window_fit_mode)),
             "reference_window": window_info,
             "debug_preview": "left is target crop frame, right is aligned reference resized only for visual comparison",
             "connect_to": "Use aligned_reference_image as the face-detail pass reference_N input.",

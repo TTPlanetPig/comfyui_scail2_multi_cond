@@ -158,12 +158,16 @@ selected crop frame with the high-resolution reference image. It then builds a
 new reference image whose aspect ratio matches the crop frame and whose face
 position/face width matches the crop frame. The node does not shrink the
 reference pixels to the crop resolution. It crops the reference at original
-pixel density, and when the computed window reaches outside the reference image
-it pads the missing edge according to `padding_mode`. This keeps the reference
-as sharp as possible while giving the second SCAIL pass a face reference whose
-layout already matches the crop. Use `face_scale` only for intentional small
-corrections: values above `1.0` make the reference face larger inside the output
-window, and values below `1.0` make it smaller.
+pixel density. By default, `window_fit_mode=shift_inside_reference` moves the
+computed crop window back inside the reference image when that window can fit,
+so a large enough reference image will not get artificial padding. Padding is
+used only when the requested window is larger than the available reference
+image, or when `window_fit_mode=strict_alignment` is selected to preserve exact
+relative face placement. This keeps the reference as sharp as possible while
+giving the second SCAIL pass a face reference whose layout already matches the
+crop. Use `face_scale` only for intentional small corrections: values above
+`1.0` make the reference face larger inside the output window, and values below
+`1.0` make it smaller.
 
 `face_detector_backend` defaults to `auto`. In auto mode the node tries
 InsightFace first, then falls back to MediaPipe if InsightFace is not installed

@@ -189,7 +189,9 @@ SCAIL-2 Scheduled Long Video / Internal SAM
 3. 检测高清参考图里的人脸位置和宽度。
 4. 按 crop 视频的比例重新裁切参考图。
 5. 让参考图里的人脸位置和大小尽量对齐 crop 第一帧。
-6. 保持参考图原始像素清晰度；如果边缘不够，会按 `padding_mode` 补边。
+6. 保持参考图原始像素清晰度；默认 `window_fit_mode=shift_inside_reference` 会在裁切窗口放得进参考图时先把窗口平移回图内，只有窗口本身比参考图还大时才按 `padding_mode` 补边。
+
+如果你需要完全保留旧逻辑的严格相对位置，可以把 `window_fit_mode` 改成 `strict_alignment`。这个模式下只要严格计算出的窗口越界，就会按 `padding_mode` 补边。
 
 检测后端：
 

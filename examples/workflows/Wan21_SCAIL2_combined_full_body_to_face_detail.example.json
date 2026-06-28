@@ -3380,7 +3380,8 @@
         640,
         "auto",
         "full_range",
-        0.5
+        0.5,
+        "shift_inside_reference"
       ]
     },
     {
@@ -3705,7 +3706,8 @@
         640,
         "auto",
         "full_range",
-        0.5
+        0.5,
+        "shift_inside_reference"
       ]
     },
     {
@@ -3870,7 +3872,8 @@
         640,
         "auto",
         "full_range",
-        0.5
+        0.5,
+        "shift_inside_reference"
       ]
     },
     {
@@ -4125,7 +4128,8 @@
         640,
         "auto",
         "full_range",
-        0.5
+        0.5,
+        "shift_inside_reference"
       ]
     },
     {
@@ -4290,7 +4294,8 @@
         640,
         "auto",
         "full_range",
-        0.5
+        0.5,
+        "shift_inside_reference"
       ]
     },
     {
