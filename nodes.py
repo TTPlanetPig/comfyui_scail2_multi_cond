@@ -5,6 +5,8 @@ import hashlib
 import inspect
 import json
 import math
+import os
+import time
 from typing import Any, Optional
 
 import torch
@@ -127,6 +129,105 @@ def _prompt_upstream_fingerprint(prompt: Any, unique_id: Any) -> Any:
 
 def _clone_cached_result(result: tuple) -> tuple:
     return tuple(result)
+
+
+def _scail2_cache_root() -> str:
+    try:
+        import folder_paths
+
+        root = folder_paths.get_output_directory()
+    except Exception:
+        root = os.path.join(os.getcwd(), "output")
+    return os.path.join(root, "scail2_cache", "long_video")
+
+
+def _safe_cache_token(value: Any) -> str:
+    text = str(value if value is not None else "global")
+    safe = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in text)
+    return safe[:96] or "global"
+
+
+def _single_slot_cache_paths(node_name: str, unique_id: Any) -> tuple[str, str, str]:
+    cache_dir = os.path.join(_scail2_cache_root(), _safe_cache_token(node_name), _safe_cache_token(unique_id))
+    return cache_dir, os.path.join(cache_dir, "cache.pt"), os.path.join(cache_dir, "meta.json")
+
+
+def _torch_load_cpu(path: str) -> Any:
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
+def _load_single_slot_disk_cache(node_name: str, unique_id: Any, cache_key: str) -> Optional[tuple]:
+    _cache_dir, cache_path, meta_path = _single_slot_cache_paths(node_name, unique_id)
+    if not os.path.exists(cache_path):
+        return None
+    try:
+        payload = _torch_load_cpu(cache_path)
+        if not isinstance(payload, dict) or payload.get("version") != 1 or payload.get("key") != cache_key:
+            return None
+        result = payload.get("result")
+        if not isinstance(result, (list, tuple)) or len(result) != 4:
+            return None
+        frames, pose_mask, reference_mask, summary = result
+        if not all(isinstance(item, torch.Tensor) for item in (frames, pose_mask, reference_mask)):
+            return None
+        if not isinstance(summary, str):
+            return None
+        now = time.time()
+        try:
+            os.utime(cache_path, (now, now))
+            if os.path.exists(meta_path):
+                os.utime(meta_path, (now, now))
+        except Exception:
+            pass
+        return (
+            frames.detach().cpu().contiguous(),
+            pose_mask.detach().cpu().contiguous(),
+            reference_mask.detach().cpu().contiguous(),
+            summary,
+        )
+    except Exception as exc:
+        print(f"[SCAIL2DiskCache] cache read failed; recomputing. reason={exc}")
+        return None
+
+
+def _save_single_slot_disk_cache(node_name: str, unique_id: Any, cache_key: str, result: tuple) -> None:
+    cache_dir, cache_path, meta_path = _single_slot_cache_paths(node_name, unique_id)
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        frames, pose_mask, reference_mask, summary = result
+        payload = {
+            "version": 1,
+            "key": cache_key,
+            "saved_at": time.time(),
+            "node": node_name,
+            "unique_id": str(unique_id),
+            "result": (
+                frames.detach().cpu().contiguous(),
+                pose_mask.detach().cpu().contiguous(),
+                reference_mask.detach().cpu().contiguous(),
+                str(summary),
+            ),
+        }
+        tmp_path = cache_path + ".tmp"
+        torch.save(payload, tmp_path)
+        os.replace(tmp_path, cache_path)
+        meta = {
+            "version": 1,
+            "key": cache_key,
+            "saved_at": payload["saved_at"],
+            "node": node_name,
+            "unique_id": str(unique_id),
+            "frames_shape": _shape(frames),
+            "pose_mask_shape": _shape(pose_mask),
+            "reference_mask_shape": _shape(reference_mask),
+        }
+        with open(meta_path, "w", encoding="utf-8") as handle:
+            json.dump(meta, handle, indent=2, sort_keys=True)
+    except Exception as exc:
+        print(f"[SCAIL2DiskCache] cache write failed; continuing without disk cache. reason={exc}")
 
 
 def _empty_cache(force: bool = False) -> None:
@@ -2333,6 +2434,7 @@ class SCAIL2ScheduledLongVideo:
                 "overlap_frames": ("INT", {"default": 5, "min": 0, "max": 33, "step": 1}),
                 "reference_count": ("INT", {"default": 2, "min": 1, "max": MAX_REFERENCES, "step": 1}),
                 "color_correction": ("BOOLEAN", {"default": True}),
+                "cache_mode": (["disk", "off"], {"default": "disk"}),
             },
             "optional": optional,
             "hidden": {
@@ -2368,6 +2470,7 @@ class SCAIL2ScheduledLongVideo:
         overlap_frames: int,
         reference_count: int,
         color_correction: bool,
+        cache_mode: str = "disk",
         pose_video_mask=None,
         prompt=None,
         unique_id=None,
@@ -2400,11 +2503,20 @@ class SCAIL2ScheduledLongVideo:
                 "dynamic_inputs": _cache_marker(kwargs),
             }
         )
+        cache_mode = str(cache_mode or "disk").strip().lower()
+        use_disk_cache = cache_mode == "disk"
         cached_key = getattr(self, "_last_generate_cache_key", None)
         cached_result = getattr(self, "_last_generate_cache_result", None)
         if cached_key == call_cache_key and cached_result is not None:
             print("[SCAIL2ScheduledLongVideo] semantic cache hit; returning previous result without sampling.")
             return _clone_cached_result(cached_result)
+        if use_disk_cache:
+            disk_result = _load_single_slot_disk_cache("SCAIL2ScheduledLongVideo", unique_id, call_cache_key)
+            if disk_result is not None:
+                print("[SCAIL2ScheduledLongVideo] disk cache hit; returning previous result without sampling.")
+                self._last_generate_cache_key = call_cache_key
+                self._last_generate_cache_result = _clone_cached_result(disk_result)
+                return _clone_cached_result(disk_result)
 
         total_pose_frames = int(pose_video.shape[0])
         segments = _parse_plan(segment_plan, pose_frame_count=total_pose_frames, max_frames=max_frames)
@@ -2712,6 +2824,8 @@ class SCAIL2ScheduledLongVideo:
         result = (frames, used_pose_video_mask, used_reference_mask_timeline, json.dumps(summary, indent=2))
         self._last_generate_cache_key = call_cache_key
         self._last_generate_cache_result = _clone_cached_result(result)
+        if use_disk_cache:
+            _save_single_slot_disk_cache("SCAIL2ScheduledLongVideo", unique_id, call_cache_key, result)
         _empty_cache(force=True)
         return result
 
@@ -2771,6 +2885,7 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
                 ),
                 "sam_max_objects": ("INT", {"default": 2, "min": 1, "max": 16, "step": 1}),
                 "sam_detect_interval": ("INT", {"default": 2, "min": 1, "max": 999, "step": 1}),
+                "cache_mode": (["disk", "off"], {"default": "disk"}),
             },
             "optional": optional,
             "hidden": {
@@ -2808,6 +2923,7 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
         sam_detection_threshold: float = 0.5,
         sam_max_objects: int = 2,
         sam_detect_interval: int = 2,
+        cache_mode: str = "disk",
         sam_model=None,
         sam_conditioning=None,
         prompt=None,
@@ -2865,6 +2981,8 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
                 "dynamic_inputs": _cache_marker(kwargs),
             }
         )
+        cache_mode = str(cache_mode or "disk").strip().lower()
+        use_disk_cache = cache_mode == "disk"
         cached_key = getattr(self, "_last_internal_sam_cache_key", None)
         cached_result = getattr(self, "_last_internal_sam_cache_result", None)
         if cached_key == call_cache_key and cached_result is not None:
@@ -2873,6 +2991,16 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
                 "returning previous result without SAM tracking/sampling."
             )
             return _clone_cached_result(cached_result)
+        if use_disk_cache:
+            disk_result = _load_single_slot_disk_cache("SCAIL2ScheduledLongVideoWithSAM", unique_id, call_cache_key)
+            if disk_result is not None:
+                print(
+                    "[SCAIL2ScheduledLongVideoWithSAM] disk cache hit; "
+                    "returning previous result without SAM tracking/sampling."
+                )
+                self._last_internal_sam_cache_key = call_cache_key
+                self._last_internal_sam_cache_result = _clone_cached_result(disk_result)
+                return _clone_cached_result(disk_result)
 
         if not replacement_mode:
             generate_kwargs: dict[str, Any] = {}
@@ -2895,6 +3023,7 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
                 overlap_frames,
                 reference_count,
                 color_correction,
+                cache_mode="off",
                 prompt=prompt,
                 unique_id=unique_id,
                 **generate_kwargs,
@@ -2910,6 +3039,8 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
             result = (frames, used_pose_video_mask, used_reference_mask_timeline, json.dumps(summary, indent=2))
             self._last_internal_sam_cache_key = call_cache_key
             self._last_internal_sam_cache_result = _clone_cached_result(result)
+            if use_disk_cache:
+                _save_single_slot_disk_cache("SCAIL2ScheduledLongVideoWithSAM", unique_id, call_cache_key, result)
             return result
 
         if sam_model is None or sam_conditioning is None:
@@ -2994,6 +3125,7 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
             overlap_frames,
             reference_count,
             color_correction,
+            cache_mode="off",
             prompt=prompt,
             unique_id=unique_id,
             **generate_kwargs,
@@ -3015,6 +3147,8 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
         result = (frames, used_pose_video_mask, used_reference_mask_timeline, json.dumps(summary, indent=2))
         self._last_internal_sam_cache_key = call_cache_key
         self._last_internal_sam_cache_result = _clone_cached_result(result)
+        if use_disk_cache:
+            _save_single_slot_disk_cache("SCAIL2ScheduledLongVideoWithSAM", unique_id, call_cache_key, result)
         return result
 
 
