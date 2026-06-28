@@ -15,10 +15,10 @@ import torch
 CATEGORY = "SCAIL-2/Scheduled"
 MAX_REFERENCES = 8
 DEFAULT_PLAN = """# frames | reference | prompt | negative | boundary_overlap
-49 | 1 | first segment prompt | |
-121 | 2 | second segment prompt | | 1
-73 | 3 | third segment prompt | | 1
-157 | 4 | fourth segment prompt | | 1
+49 | 1 | first segment prompt | | 5
+121 | 2 | second segment prompt | | 5
+73 | 3 | third segment prompt | | 5
+157 | 4 | fourth segment prompt | | 5
 """
 _INSIGHTFACE_APP_CACHE: dict[tuple[str, str, int], Any] = {}
 _MEDIAPIPE_FACE_DETECTION_CACHE: dict[tuple[int, float], Any] = {}
@@ -2250,7 +2250,7 @@ class SCAIL2SegmentPlanBuilder:
             )
             required[f"segment_{index}_boundary_overlap"] = (
                 "INT",
-                {"default": -1 if index == 1 else 1, "min": -1, "max": 33, "step": 1},
+                {"default": 5, "min": -1, "max": 33, "step": 1},
             )
         return {"required": required}
 

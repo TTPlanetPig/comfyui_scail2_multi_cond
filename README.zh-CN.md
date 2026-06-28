@@ -111,16 +111,10 @@ max_chunk_frames = 81
 overlap_frames = 5
 ```
 
-同一个参考图连续生成：
+Plan Builder 里的参考切换：
 
 ```text
-boundary_overlap = -1
-```
-
-换参考图时：
-
-```text
-boundary_overlap = 0 或 1
+boundary_overlap = 5
 ```
 
 说明：
@@ -130,6 +124,7 @@ boundary_overlap = 0 或 1
 - `-1` 表示使用全局 `overlap_frames`。
 - `0` 表示换参考图时不带上一段锚点。
 - `1` 表示只带最小连续性，通常更利于新参考图快速接管。
+- 当前示例 workflow 和 Plan Builder 默认值统一使用 `5`。
 
 ## 脸部二次优化流程
 

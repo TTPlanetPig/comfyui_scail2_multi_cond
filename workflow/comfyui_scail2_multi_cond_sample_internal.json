@@ -992,27 +992,27 @@
         4,
         "第四段提示词",
         "",
-        1,
+        5,
         73,
         5,
         "segment 5 prompt",
         "",
-        1,
+        5,
         73,
         6,
         "segment 6 prompt",
         "",
-        1,
+        5,
         73,
         7,
         "segment 7 prompt",
         "",
-        1,
+        5,
         73,
         8,
         "segment 8 prompt",
         "",
-        1
+        5
       ]
     },
     {
@@ -1466,7 +1466,7 @@
         "Node name for S&R": "SCAIL2ScheduledLongVideoWithSAM"
       },
       "widgets_values": [
-        "# frames | reference | prompt | negative | boundary_overlap\n49 | 1 | first segment prompt | |\n121 | 2 | second segment prompt | | 1\n73 | 3 | third segment prompt | | 1\n157 | 4 | fourth segment prompt | | 1\n",
+        "# frames | reference | prompt | negative | boundary_overlap\n49 | 1 | first segment prompt |  | 5\n121 | 2 | second segment prompt |  | 5\n73 | 3 | third segment prompt |  | 5\n157 | 4 | fourth segment prompt |  | 5\n",
         1,
         1,
         "replacement",
