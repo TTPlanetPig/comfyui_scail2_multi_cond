@@ -1,5 +1,7 @@
 # ComfyUI SCAIL2 Scheduled Long Video
 
+[中文说明](README.zh-CN.md)
+
 Multi-reference, multi-prompt scheduling for ComfyUI SCAIL2 long-video workflows.
 
 This custom node package wraps the native SCAIL2 long-video pattern into a cleaner scheduler:
