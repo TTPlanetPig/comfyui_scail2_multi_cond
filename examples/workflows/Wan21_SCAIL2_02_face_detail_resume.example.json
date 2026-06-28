@@ -1,6 +1,6 @@
 {
-  "id": "wan21-scail2-example-stage2-face-detail-resume",
-  "revision": 1,
+  "id": "2f6f7250-6dda-4bea-b6ea-a2f55f7cfe2d",
+  "revision": 0,
   "last_node_id": 75,
   "last_link_id": 171,
   "nodes": [
@@ -8,8 +8,8 @@
       "id": 2,
       "type": "LoraLoaderModelOnly",
       "pos": [
-        2180,
-        940
+        1341.5687862467246,
+        -47.02765493796876
       ],
       "size": [
         360,
@@ -53,8 +53,8 @@
       "id": 6,
       "type": "VAELoader",
       "pos": [
-        2180,
-        1100
+        1341.5687862467246,
+        102.97234506203122
       ],
       "size": [
         320,
@@ -91,8 +91,8 @@
       "id": 14,
       "type": "DiffusionModelLoaderKJ",
       "pos": [
-        1740,
-        940
+        921.5687862467247,
+        -47.02765493796876
       ],
       "size": [
         379.2396729487368,
@@ -141,8 +141,8 @@
       "id": 15,
       "type": "CLIPLoader",
       "pos": [
-        1740,
-        1180
+        922.3289740949393,
+        201.0425284120261
       ],
       "size": [
         360,
@@ -181,8 +181,8 @@
       "id": 3,
       "type": "ModelSamplingSD3",
       "pos": [
-        2580,
-        940
+        1741.5687862467248,
+        -47.02765493796876
       ],
       "size": [
         260,
@@ -226,8 +226,8 @@
       "id": 4,
       "type": "BasicScheduler",
       "pos": [
-        2880,
-        920
+        2042.2000417003944,
+        -73.70999862135655
       ],
       "size": [
         260,
@@ -272,8 +272,8 @@
       "id": 49,
       "type": "CheckpointLoaderSimple",
       "pos": [
-        920,
-        80
+        1372.8903912474543,
+        -936.6643678407298
       ],
       "size": [
         360,
@@ -322,8 +322,8 @@
       "id": 51,
       "type": "ImageResizeKJv2",
       "pos": [
-        500,
-        120
+        859.9267378521877,
+        -948.4186540109823
       ],
       "size": [
         360,
@@ -398,8 +398,8 @@
       "id": 61,
       "type": "GetImageSize",
       "pos": [
-        1300,
-        540
+        1810.0556847744658,
+        -1088.5632615136235
       ],
       "size": [
         140,
@@ -452,8 +452,8 @@
       "id": 55,
       "type": "Reroute",
       "pos": [
-        1600,
-        540
+        958.3240914437781,
+        -279.0661750097041
       ],
       "size": [
         75,
@@ -493,8 +493,8 @@
       "id": 7,
       "type": "CLIPVisionLoader",
       "pos": [
-        2180,
-        1240
+        1738.8893766635033,
+        69.79848691378352
       ],
       "size": [
         316.8899507986016,
@@ -531,8 +531,8 @@
       "id": 23,
       "type": "CheckpointLoaderSimple",
       "pos": [
-        2580,
-        1160
+        1726.9369584728345,
+        205.91896450005808
       ],
       "size": [
         360,
@@ -668,8 +668,8 @@
       "id": 5,
       "type": "KSamplerSelect",
       "pos": [
-        2880,
-        1080
+        2126.6298821525925,
+        85.13395750725802
       ],
       "size": [
         260,
@@ -706,8 +706,8 @@
       "id": 57,
       "type": "CLIPTextEncode",
       "pos": [
-        2880,
-        1320
+        2145.1070028409426,
+        340.83432443586867
       ],
       "size": [
         320,
@@ -748,8 +748,8 @@
       "id": 66,
       "type": "ImageConcanate",
       "pos": [
-        2040,
-        120
+        1573.3875140823602,
+        -1665.0890946072543
       ],
       "size": [
         270,
@@ -798,8 +798,8 @@
       "id": 62,
       "type": "VHS_VideoCombine",
       "pos": [
-        4340,
-        840
+        2776.560022298302,
+        -2180.0972744210912
       ],
       "size": [
         360,
@@ -853,7 +853,7 @@
       "widgets_values": {
         "frame_rate": 16,
         "loop_count": 0,
-        "filename_prefix": "SCAIL2_STAGE2_refined_face_crop_preview",
+        "filename_prefix": "Wan21_SCAIL2_scheduled",
         "format": "video/h264-mp4",
         "pix_fmt": "yuv420p",
         "crf": 19,
@@ -865,13 +865,12 @@
           "hidden": false,
           "paused": false,
           "params": {
-            "filename": "SCAIL2_STAGE2_refined_face_crop_preview_example.mp4",
+            "filename": "Wan21_SCAIL2_scheduled_00333.mp4",
             "subfolder": "",
             "type": "output",
             "format": "video/h264-mp4",
             "frame_rate": 16,
-            "workflow": "SCAIL2_STAGE2_refined_face_crop_preview_example.png",
-            "fullpath": "I:\\ComfyUI_windows_portable\\ComfyUI\\output\\Wan21_SCAIL2_scheduled_00333.mp4"
+            "workflow": "Wan21_SCAIL2_scheduled_00333.png"
           }
         }
       }
@@ -880,8 +879,8 @@
       "id": 65,
       "type": "MaskToImage",
       "pos": [
-        1800,
-        120
+        1750.1604973581489,
+        -1472.5873877833578
       ],
       "size": [
         193.2779296875,
@@ -922,8 +921,8 @@
       "id": 58,
       "type": "ImageResizeKJv2",
       "pos": [
-        3920,
-        980
+        2094.4863734433943,
+        -1405.0151473540395
       ],
       "size": [
         360,
@@ -1014,8 +1013,8 @@
       "id": 53,
       "type": "SCAIL2HeadTrackCrop",
       "pos": [
-        1300,
-        140
+        1376.0653629237356,
+        -1387.43407949581
       ],
       "size": [
         304.865234375,
@@ -1111,8 +1110,8 @@
       "id": 69,
       "type": "PreviewImage",
       "pos": [
-        1800,
-        420
+        1854.4057239073309,
+        -557.0692846823547
       ],
       "size": [
         140,
@@ -1145,8 +1144,8 @@
       "id": 54,
       "type": "SCAIL2FaceCompositeBack",
       "pos": [
-        4340,
-        1340
+        2131.7145680659414,
+        -766.5617694672792
       ],
       "size": [
         301.1841796875,
@@ -1223,8 +1222,8 @@
       "id": 50,
       "type": "CLIPTextEncode",
       "pos": [
-        920,
-        240
+        1378.3552897702575,
+        -697.74740400331
       ],
       "size": [
         320,
@@ -1267,8 +1266,8 @@
       "id": 27,
       "type": "CLIPTextEncode",
       "pos": [
-        2580,
-        1320
+        1740.5624759973377,
+        460.81616367884493
       ],
       "size": [
         320,
@@ -1311,8 +1310,8 @@
       "id": 20,
       "type": "ImageResizeKJv2",
       "pos": [
-        420,
-        980
+        1363.9470887416517,
+        1232.3986067976807
       ],
       "size": [
         343.2748929179413,
@@ -1404,8 +1403,8 @@
       "id": 68,
       "type": "SCAIL2AlignReferenceFaceToCrop",
       "pos": [
-        840,
-        980
+        467.34842051310477,
+        334.14668316246485
       ],
       "size": [
         354.5181640625,
@@ -1478,8 +1477,8 @@
       "id": 36,
       "type": "SCAIL2ScheduledLongVideoWithSAM",
       "pos": [
-        3300,
-        960
+        2558.4786650160854,
+        -265.39111830095715
       ],
       "size": [
         406.06796875,
@@ -1638,8 +1637,8 @@
       "id": 21,
       "type": "ImageResizeKJv2",
       "pos": [
-        420,
-        1420
+        1674.6275089215444,
+        1216.531064913107
       ],
       "size": [
         343.2748929179413,
@@ -1731,8 +1730,8 @@
       "id": 70,
       "type": "SCAIL2AlignReferenceFaceToCrop",
       "pos": [
-        840,
-        1420
+        458.7383846380947,
+        766.9943313083196
       ],
       "size": [
         354.5181640625,
@@ -1804,8 +1803,8 @@
       "id": 25,
       "type": "ImageResizeKJv2",
       "pos": [
-        420,
-        1860
+        2098.58925720648,
+        1195.9983646448638
       ],
       "size": [
         343.2748929179413,
@@ -1897,8 +1896,8 @@
       "id": 71,
       "type": "SCAIL2AlignReferenceFaceToCrop",
       "pos": [
-        840,
-        1860
+        461.83281699195686,
+        1163.4946582891482
       ],
       "size": [
         354.5181640625,
@@ -1970,8 +1969,8 @@
       "id": 47,
       "type": "ImageResizeKJv2",
       "pos": [
-        420,
-        2300
+        1382.0020815836283,
+        1710.374463628617
       ],
       "size": [
         343.2748929179413,
@@ -2063,8 +2062,8 @@
       "id": 52,
       "type": "VHS_LoadVideo",
       "pos": [
-        80,
-        120
+        399.7324364256755,
+        -1285.029051580532
       ],
       "size": [
         360,
@@ -2138,7 +2137,7 @@
           "hidden": false,
           "paused": false,
           "params": {
-            "filename": "SELECT_APPROVED_STAGE1_FULL_BODY_OUTPUT.mp4",
+            "filename": "Wan21_SCAIL2_scheduled_00332-audio.mp4",
             "type": "input",
             "format": "video/mp4",
             "force_rate": 16,
@@ -2153,8 +2152,8 @@
       "id": 72,
       "type": "SCAIL2AlignReferenceFaceToCrop",
       "pos": [
-        840,
-        2300
+        445.6429301800933,
+        1566.2196907678547
       ],
       "size": [
         354.5181640625,
@@ -2226,8 +2225,8 @@
       "id": 42,
       "type": "ImageResizeKJv2",
       "pos": [
-        420,
-        2740
+        1724.2618071071963,
+        1723.4569641764149
       ],
       "size": [
         343.2748929179413,
@@ -2319,8 +2318,8 @@
       "id": 73,
       "type": "SCAIL2AlignReferenceFaceToCrop",
       "pos": [
-        840,
-        2740
+        454.658504119509,
+        1947.4154351809054
       ],
       "size": [
         354.5181640625,
@@ -2392,8 +2391,8 @@
       "id": 17,
       "type": "LoadImage",
       "pos": [
-        80,
-        980
+        1299.1984601389559,
+        859.0804001570874
       ],
       "size": [
         260,
@@ -2436,8 +2435,8 @@
       "id": 16,
       "type": "LoadImage",
       "pos": [
-        80,
-        1420
+        1665.1271511330986,
+        846.4752693670815
       ],
       "size": [
         282.798828125,
@@ -2480,8 +2479,8 @@
       "id": 26,
       "type": "LoadImage",
       "pos": [
-        80,
-        1860
+        2070.3504029900732,
+        811.0472957068416
       ],
       "size": [
         282.798828125,
@@ -2524,8 +2523,8 @@
       "id": 48,
       "type": "LoadImage",
       "pos": [
-        80,
-        2300
+        1316.9906543065213,
+        1331.195059921943
       ],
       "size": [
         282.798828125,
@@ -2568,8 +2567,8 @@
       "id": 41,
       "type": "LoadImage",
       "pos": [
-        80,
-        2740
+        1705.5508052307168,
+        1329.3504174552784
       ],
       "size": [
         282.798828125,
@@ -2612,8 +2611,8 @@
       "id": 46,
       "type": "SCAIL2SegmentPlanBuilder",
       "pos": [
-        1740,
-        1540
+        2471.829390340986,
+        610.1320876384083
       ],
       "size": [
         516.2302433922446,
@@ -2697,8 +2696,8 @@
       "id": 74,
       "type": "DownloadAndLoadGIMMVFIModel",
       "pos": [
-        4740,
-        1800
+        3146.6400355915407,
+        -766.2785581994079
       ],
       "size": [
         281.9546813964844,
@@ -2750,8 +2749,8 @@
       "id": 10,
       "type": "VHS_VideoCombine",
       "pos": [
-        5160,
-        1280
+        3574.8026638457136,
+        -1446.602841631286
       ],
       "size": [
         360,
@@ -2805,7 +2804,7 @@
       "widgets_values": {
         "frame_rate": 16,
         "loop_count": 0,
-        "filename_prefix": "SCAIL2_STAGE2_face_detail_final",
+        "filename_prefix": "Wan21_SCAIL2_scheduled",
         "format": "video/h264-mp4",
         "pix_fmt": "yuv420p",
         "crf": 19,
@@ -2817,13 +2816,12 @@
           "hidden": false,
           "paused": false,
           "params": {
-            "filename": "SCAIL2_STAGE2_face_detail_final_example.mp4",
+            "filename": "Wan21_SCAIL2_scheduled_00334-audio.mp4",
             "subfolder": "",
             "type": "output",
             "format": "video/h264-mp4",
             "frame_rate": 16,
-            "workflow": "SCAIL2_STAGE2_face_detail_final_example.png",
-            "fullpath": "I:\\ComfyUI_windows_portable\\ComfyUI\\output\\Wan21_SCAIL2_scheduled_00334-audio.mp4"
+            "workflow": "Wan21_SCAIL2_scheduled_00334.png"
           }
         }
       }
@@ -2832,8 +2830,8 @@
       "id": 75,
       "type": "GIMMVFI_interpolate",
       "pos": [
-        4740,
-        1340
+        3119.7154633611535,
+        -1263.5676049464844
       ],
       "size": [
         270,
@@ -2922,8 +2920,8 @@
       "id": 63,
       "type": "VHS_VideoCombine",
       "pos": [
-        2380,
-        80
+        2018.989538498788,
+        -2253.4603695026044
       ],
       "size": [
         360,
@@ -2977,7 +2975,7 @@
       "widgets_values": {
         "frame_rate": 16,
         "loop_count": 0,
-        "filename_prefix": "SCAIL2_STAGE2_crop_and_mask_debug",
+        "filename_prefix": "Wan21_SCAIL2_scheduled",
         "format": "video/h264-mp4",
         "pix_fmt": "yuv420p",
         "crf": 19,
@@ -2989,13 +2987,12 @@
           "hidden": false,
           "paused": false,
           "params": {
-            "filename": "SCAIL2_STAGE2_crop_and_mask_debug_example.mp4",
+            "filename": "Wan21_SCAIL2_scheduled_00012.mp4",
             "subfolder": "",
             "type": "temp",
             "format": "video/h264-mp4",
             "frame_rate": 16,
-            "workflow": "SCAIL2_STAGE2_crop_and_mask_debug_example.png",
-            "fullpath": "C:\\Users\\cmept\\AppData\\Local\\Temp\\latentsync_47415876\\Wan21_SCAIL2_scheduled_00012.mp4"
+            "workflow": "Wan21_SCAIL2_scheduled_00012.png"
           }
         }
       }
@@ -3563,77 +3560,16 @@
       "IMAGE"
     ]
   ],
-  "groups": [
-    {
-      "title": "01 继续：加载已确认满意的全身视频",
-      "bounding": [
-        40,
-        0,
-        1660,
-        820
-      ],
-      "color": "#9a6b28",
-      "font_size": 24,
-      "locked": false
-    },
-    {
-      "title": "02 高清参考图对齐到脸部画框",
-      "bounding": [
-        40,
-        880,
-        1500,
-        2280
-      ],
-      "color": "#6d4c9a",
-      "font_size": 24,
-      "locked": false
-    },
-    {
-      "title": "03 模型、分段计划与脸部 replacement 生成",
-      "bounding": [
-        1660,
-        820,
-        2120,
-        2340
-      ],
-      "color": "#2f7d46",
-      "font_size": 24,
-      "locked": false
-    },
-    {
-      "title": "04 调试预览：脸部 crop 与 mask",
-      "bounding": [
-        1760,
-        0,
-        1180,
-        720
-      ],
-      "color": "#345995",
-      "font_size": 24,
-      "locked": false
-    },
-    {
-      "title": "05 贴回全身 + 插帧 + 最终视频输出",
-      "bounding": [
-        3860,
-        820,
-        1720,
-        1540
-      ],
-      "color": "#8a3d3d",
-      "font_size": 24,
-      "locked": false
-    }
-  ],
+  "groups": [],
   "config": {},
   "extra": {
     "ue_links": [],
     "links_added_by_ue": [],
     "ds": {
-      "scale": 0.55,
+      "scale": 0.2309211532038229,
       "offset": [
-        -20,
-        110
+        2788.646028072662,
+        3088.1358852472063
       ]
     },
     "frontendVersion": "1.45.15",
