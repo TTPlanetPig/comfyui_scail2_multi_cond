@@ -60,7 +60,69 @@ def _cache_marker(value: Any) -> Any:
         return {str(key): _cache_marker(value[key]) for key in sorted(value, key=str)}
     if isinstance(value, (list, tuple)):
         return [_cache_marker(item) for item in value]
-    return {"type": type(value).__name__, "id": id(value)}
+    return {"type": type(value).__name__}
+
+
+def _prompt_graph(prompt: Any) -> Optional[dict[str, Any]]:
+    if not isinstance(prompt, dict):
+        return None
+    nested = prompt.get("prompt")
+    if isinstance(nested, dict):
+        return nested
+    return prompt
+
+
+def _prompt_get_node(graph: dict[str, Any], node_id: Any) -> Optional[dict[str, Any]]:
+    for key in (node_id, str(node_id), int(node_id) if str(node_id).isdigit() else None):
+        if key is None:
+            continue
+        node = graph.get(key)
+        if isinstance(node, dict):
+            return node
+    return None
+
+
+def _prompt_is_link(value: Any) -> bool:
+    return (
+        isinstance(value, (list, tuple))
+        and len(value) == 2
+        and isinstance(value[0], (str, int))
+        and isinstance(value[1], int)
+    )
+
+
+def _prompt_upstream_fingerprint(prompt: Any, unique_id: Any) -> Any:
+    graph = _prompt_graph(prompt)
+    if graph is None or unique_id is None:
+        return None
+
+    visited: set[str] = set()
+    stack: list[Any] = [unique_id]
+    collected: dict[str, Any] = {}
+    while stack:
+        node_id = stack.pop()
+        node_key = str(node_id)
+        if node_key in visited:
+            continue
+        visited.add(node_key)
+        node = _prompt_get_node(graph, node_id)
+        if node is None:
+            continue
+        inputs = node.get("inputs", {}) if isinstance(node.get("inputs", {}), dict) else {}
+        normalized_inputs: dict[str, Any] = {}
+        for input_name in sorted(inputs):
+            value = inputs[input_name]
+            if _prompt_is_link(value) and _prompt_get_node(graph, value[0]) is not None:
+                source_id, source_output = value
+                normalized_inputs[input_name] = ["LINK", str(source_id), int(source_output)]
+                stack.append(source_id)
+            else:
+                normalized_inputs[input_name] = _cache_marker(value)
+        collected[node_key] = {
+            "class_type": node.get("class_type"),
+            "inputs": normalized_inputs,
+        }
+    return _stable_fingerprint(collected)
 
 
 def _clone_cached_result(result: tuple) -> tuple:
@@ -2273,6 +2335,10 @@ class SCAIL2ScheduledLongVideo:
                 "color_correction": ("BOOLEAN", {"default": True}),
             },
             "optional": optional,
+            "hidden": {
+                "prompt": "PROMPT",
+                "unique_id": "UNIQUE_ID",
+            },
         }
 
     RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE", "STRING")
@@ -2282,14 +2348,7 @@ class SCAIL2ScheduledLongVideo:
 
     @classmethod
     def IS_CHANGED(cls, **kwargs):
-        fingerprint_inputs: dict[str, Any] = {}
-        for key in sorted(kwargs):
-            value = kwargs[key]
-            if isinstance(value, (str, int, float, bool)) or value is None:
-                fingerprint_inputs[key] = value
-            else:
-                fingerprint_inputs[key] = type(value).__name__
-        return _stable_fingerprint(fingerprint_inputs)
+        return False
 
     def generate(
         self,
@@ -2310,6 +2369,8 @@ class SCAIL2ScheduledLongVideo:
         reference_count: int,
         color_correction: bool,
         pose_video_mask=None,
+        prompt=None,
+        unique_id=None,
         **kwargs,
     ):
         if not isinstance(pose_video, torch.Tensor) or pose_video.ndim != 4:
@@ -2324,6 +2385,7 @@ class SCAIL2ScheduledLongVideo:
                 "sampler": _cache_marker(sampler),
                 "sigmas": _cache_marker(sigmas),
                 "clip_vision": _cache_marker(clip_vision),
+                "prompt_graph": _prompt_upstream_fingerprint(prompt, unique_id),
                 "pose_video": _tensor_fingerprint(pose_video),
                 "segment_plan": segment_plan,
                 "seed": int(seed),
@@ -2341,7 +2403,7 @@ class SCAIL2ScheduledLongVideo:
         cached_key = getattr(self, "_last_generate_cache_key", None)
         cached_result = getattr(self, "_last_generate_cache_result", None)
         if cached_key == call_cache_key and cached_result is not None:
-            print("[SCAIL2ScheduledLongVideo] cache hit; returning previous result without sampling.")
+            print("[SCAIL2ScheduledLongVideo] semantic cache hit; returning previous result without sampling.")
             return _clone_cached_result(cached_result)
 
         total_pose_frames = int(pose_video.shape[0])
@@ -2711,6 +2773,10 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
                 "sam_detect_interval": ("INT", {"default": 2, "min": 1, "max": 999, "step": 1}),
             },
             "optional": optional,
+            "hidden": {
+                "prompt": "PROMPT",
+                "unique_id": "UNIQUE_ID",
+            },
         }
 
     RETURN_TYPES = SCAIL2ScheduledLongVideo.RETURN_TYPES
@@ -2744,6 +2810,8 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
         sam_detect_interval: int = 2,
         sam_model=None,
         sam_conditioning=None,
+        prompt=None,
+        unique_id=None,
         **kwargs,
     ):
         if not isinstance(pose_video, torch.Tensor) or pose_video.ndim != 4:
@@ -2775,6 +2843,7 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
                 "sampler": _cache_marker(sampler),
                 "sigmas": _cache_marker(sigmas),
                 "clip_vision": _cache_marker(clip_vision),
+                "prompt_graph": _prompt_upstream_fingerprint(prompt, unique_id),
                 "pose_video": _tensor_fingerprint(pose_video),
                 "sam_model": _cache_marker(sam_model),
                 "sam_conditioning": _cache_marker(sam_conditioning),
@@ -2799,7 +2868,10 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
         cached_key = getattr(self, "_last_internal_sam_cache_key", None)
         cached_result = getattr(self, "_last_internal_sam_cache_result", None)
         if cached_key == call_cache_key and cached_result is not None:
-            print("[SCAIL2ScheduledLongVideoWithSAM] cache hit; returning previous result without SAM tracking.")
+            print(
+                "[SCAIL2ScheduledLongVideoWithSAM] semantic cache hit; "
+                "returning previous result without SAM tracking/sampling."
+            )
             return _clone_cached_result(cached_result)
 
         if not replacement_mode:
@@ -2823,6 +2895,8 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
                 overlap_frames,
                 reference_count,
                 color_correction,
+                prompt=prompt,
+                unique_id=unique_id,
                 **generate_kwargs,
             )
             try:
@@ -2920,6 +2994,8 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
             overlap_frames,
             reference_count,
             color_correction,
+            prompt=prompt,
+            unique_id=unique_id,
             **generate_kwargs,
         )
         try:
