@@ -1,0 +1,405 @@
+{
+  "id": "be07c133-294f-47c8-b758-bb02c37441e9",
+  "revision": 0,
+  "last_node_id": 8,
+  "last_link_id": 7,
+  "nodes": [
+    {
+      "id": 2,
+      "type": "SCAIL2ChunkKeyframeExtractor",
+      "pos": [
+        960,
+        180
+      ],
+      "size": [
+        349.08984375,
+        306
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "video",
+          "type": "IMAGE",
+          "link": 2
+        },
+        {
+          "name": "planner_summary",
+          "shape": 7,
+          "type": "STRING",
+          "link": 3
+        }
+      ],
+      "outputs": [
+        {
+          "name": "boundary_anchor_frames",
+          "type": "IMAGE",
+          "links": []
+        },
+        {
+          "name": "new_chunk_start_frames",
+          "type": "IMAGE",
+          "links": null
+        },
+        {
+          "name": "paired_keyframes",
+          "type": "IMAGE",
+          "links": [
+            6
+          ]
+        },
+        {
+          "name": "contact_sheet",
+          "type": "IMAGE",
+          "links": null
+        },
+        {
+          "name": "summary",
+          "type": "STRING",
+          "links": [
+            7
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui_scail2_multi_cond",
+        "ver": "6496f804ced63b50385d421420c9750945aad682",
+        "Node name for S&R": "SCAIL2ChunkKeyframeExtractor",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "input_ue_unconnectable": {},
+          "version": "7.8"
+        }
+      },
+      "widgets_values": [
+        "planner_summary",
+        81,
+        5,
+        0,
+        false,
+        4,
+        256,
+        "overlap_last_frame"
+      ]
+    },
+    {
+      "id": 4,
+      "type": "VHS_LoadVideo",
+      "pos": [
+        80,
+        180
+      ],
+      "size": [
+        360,
+        928
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "meta_batch",
+          "shape": 7,
+          "type": "VHS_BatchManager",
+          "link": null
+        },
+        {
+          "name": "vae",
+          "shape": 7,
+          "type": "VAE",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            2
+          ]
+        },
+        {
+          "name": "frame_count",
+          "type": "INT",
+          "links": null
+        },
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "links": []
+        },
+        {
+          "name": "video_info",
+          "type": "VHS_VIDEOINFO",
+          "links": []
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui-videohelpersuite",
+        "ver": "c67ff3ef37afb53a54488260cb2b1d2bd84c5326",
+        "Node name for S&R": "VHS_LoadVideo",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.5.2",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": {
+        "video": "6月27日.mp4",
+        "force_rate": 16,
+        "custom_width": 0,
+        "custom_height": 0,
+        "frame_load_cap": 0,
+        "skip_first_frames": 0,
+        "select_every_nth": 1,
+        "format": "AnimateDiff",
+        "videopreview": {
+          "hidden": false,
+          "paused": false,
+          "params": {
+            "filename": "6月27日.mp4",
+            "type": "input",
+            "format": "video/mp4",
+            "force_rate": 16,
+            "frame_load_cap": 0,
+            "skip_first_frames": 0,
+            "select_every_nth": 1
+          }
+        }
+      }
+    },
+    {
+      "id": 5,
+      "type": "SCAIL2SegmentPlanBuilder",
+      "pos": [
+        520,
+        180
+      ],
+      "size": [
+        516.2302433922446,
+        1002
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "segment_plan",
+          "type": "STRING",
+          "links": []
+        },
+        {
+          "name": "summary",
+          "type": "STRING",
+          "links": [
+            3
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui_scail2_multi_cond",
+        "ver": "4b920d68672059ee08ea71ab5b71c475536af2ff",
+        "Node name for S&R": "SCAIL2SegmentPlanBuilder",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.5.2",
+          "input_ue_unconnectable": {}
+        },
+        "aux_id": "TTPlanetPig/comfyui_scail2_multi_cond"
+      },
+      "widgets_values": [
+        5,
+        17,
+        1,
+        "一个年轻女性，穿着灰白衣服正在跳舞",
+        "",
+        5,
+        57,
+        2,
+        "一个年轻女性，穿着灰白衣服正在跳舞",
+        "",
+        5,
+        57,
+        3,
+        "一个年轻女性，穿着灰白衣服正在跳舞",
+        "",
+        5,
+        57,
+        4,
+        "一个年轻女性，穿着灰白衣服正在跳舞",
+        "",
+        5,
+        57,
+        5,
+        "一个年轻女性，穿着灰白衣服正在跳舞",
+        "",
+        1,
+        73,
+        6,
+        "segment 6 prompt",
+        "",
+        1,
+        73,
+        7,
+        "segment 7 prompt",
+        "",
+        1,
+        73,
+        8,
+        "segment 8 prompt",
+        "",
+        1,
+        null
+      ]
+    },
+    {
+      "id": 7,
+      "type": "SCAIL2KeyframeMatrixViewer",
+      "pos": [
+        1420,
+        160
+      ],
+      "size": [
+        758.3574627049301,
+        933
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "paired_keyframes",
+          "type": "IMAGE",
+          "link": 6
+        },
+        {
+          "name": "summary",
+          "type": "STRING",
+          "link": 7
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "cnr_id": "comfyui_scail2_multi_cond",
+        "ver": "95763062b90234fe2071d7171603a7b7cbdc893f",
+        "Node name for S&R": "SCAIL2KeyframeMatrixViewer",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "input_ue_unconnectable": {},
+          "version": "7.8"
+        }
+      },
+      "widgets_values": [
+        "",
+        "",
+        "",
+        ""
+      ]
+    }
+  ],
+  "links": [
+    [
+      2,
+      4,
+      0,
+      2,
+      0,
+      "IMAGE"
+    ],
+    [
+      3,
+      5,
+      1,
+      2,
+      1,
+      "STRING"
+    ],
+    [
+      6,
+      2,
+      2,
+      7,
+      0,
+      "IMAGE"
+    ],
+    [
+      7,
+      2,
+      4,
+      7,
+      1,
+      "STRING"
+    ]
+  ],
+  "groups": [
+    {
+      "title": "00-1 输入视频",
+      "bounding": [
+        40,
+        40,
+        420,
+        780
+      ],
+      "color": "#314f7a",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "title": "00-2 分段计划：与后续 SCAIL 长视频保持一致",
+      "bounding": [
+        480,
+        40,
+        420,
+        780
+      ],
+      "color": "#4f5f2c",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "title": "00-3 自动截关键帧/边界参考帧",
+      "bounding": [
+        920,
+        40,
+        420,
+        780
+      ],
+      "color": "#654b2a",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "title": "00-4 查看矩阵：挑选后续参考图",
+      "bounding": [
+        1380,
+        40,
+        620,
+        780
+      ],
+      "color": "#5b3b6e",
+      "font_size": 24,
+      "flags": {}
+    }
+  ],
+  "config": {},
+  "extra": {
+    "ue_links": [],
+    "ds": {
+      "scale": 0.78,
+      "offset": [
+        80,
+        100
+      ]
+    },
+    "links_added_by_ue": [],
+    "frontendVersion": "1.45.15",
+    "VHS_latentpreview": false,
+    "VHS_latentpreviewrate": 0,
+    "VHS_MetadataImage": true,
+    "VHS_KeepIntermediate": true,
+    "workflow_note": "Optional stage 0: load a source video, reuse the same segment plan logic, extract paired keyframes, then use the matrix viewer to choose reference frames for the two-stage SCAIL workflow."
+  },
+  "version": 0.4
+}

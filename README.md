@@ -144,6 +144,13 @@ SCAIL-2 Head Track Crop.face_crop_video + high-res face reference
   -> face crop pass reference_N
 ```
 
+Thanks to Aiwu (爱屋) for pointing out that the second-pass face-detail video is
+more stable when the high-resolution reference face is aligned to the crop
+video before generation. The `SCAIL-2 Align Reference Face To Crop` node was
+added for that step: it matches the reference face position and face size to the
+first selected crop frame while preserving as much original reference resolution
+as possible.
+
 `SCAIL-2 Align Reference Face To Crop` uses a face detector to compare the first
 selected crop frame with the high-resolution reference image. It then builds a
 new reference image whose aspect ratio matches the crop frame and whose face
@@ -399,6 +406,11 @@ workflow/SCAIL2_scheduled_long_video_template.json
 workflow/SCAIL2_long_video_sample.json
 workflow/comfyui_scail2_multi_cond_sample_external.json
 workflow/comfyui_scail2_multi_cond_sample_internal.json
+examples/workflows/Wan21_SCAIL2_00_key_frame_capture.example.json
+examples/workflows/Wan21_SCAIL2_01_full_body_pause.example.json
+examples/workflows/Wan21_SCAIL2_02_face_detail_resume.example.json
+examples/workflows/Wan21_SCAIL2_combined_full_body_to_face_detail.example.json
+examples/workflows/Wan21_SCAIL2_two_stage_guide.md
 ```
 
 The sample workflow uses placeholder media names such as:
@@ -411,6 +423,20 @@ reference_3.png
 ```
 
 Replace them with your own ComfyUI input files.
+
+The Wan21 examples are split into a practical two-stage face-detail workflow:
+
+- `Wan21_SCAIL2_00_key_frame_capture.example.json` extracts chunk keyframes for
+  reference preparation;
+- `Wan21_SCAIL2_01_full_body_pause.example.json` runs the full-body pass first,
+  so you can inspect and approve the action transfer result;
+- `Wan21_SCAIL2_02_face_detail_resume.example.json` resumes from that approved
+  full-body video, crops the stable face region, aligns the high-resolution face
+  reference with `SCAIL-2 Align Reference Face To Crop`, runs the face-detail
+  pass, and composites the refined face back;
+- `Wan21_SCAIL2_combined_full_body_to_face_detail.example.json` keeps the same
+  idea in one combined reference workflow, but the two-stage files are safer for
+  expensive runs because you can stop after the full-body pass.
 
 ## Recommended Settings
 
