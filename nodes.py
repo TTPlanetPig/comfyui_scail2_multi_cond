@@ -2274,6 +2274,155 @@ def _format_tile_resolution_report(manifest: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _tile_repaint_report(manifest: dict[str, Any]) -> str:
+    lines = [
+        "# tile | actual_resolution | pixels | planned_resolution | target_crop | actual_repaint_scale | actual_to_target_scale | status",
+    ]
+    for tile in manifest.get("tiles", []):
+        tile_number = int(tile.get("tile_number", int(tile.get("index", 0)) + 1))
+        actual_w, actual_h = [int(value) for value in tile.get("actual_tile_output_size", [0, 0])]
+        planned_w, planned_h = [int(value) for value in tile.get("tile_generate_size", [0, 0])]
+        target_w, target_h = [int(value) for value in tile.get("target_crop_size", [0, 0])]
+        repaint_scale = tile.get("actual_repaint_scale", [0, 0])
+        target_scale = tile.get("actual_tile_to_target_scale", [0, 0])
+        notes = tile.get("actual_repaint_notes", [])
+        status = "ok" if not notes else ",".join(str(item) for item in notes)
+        lines.append(
+            " | ".join(
+                [
+                    str(tile_number),
+                    f"{actual_w}x{actual_h}",
+                    str(int(tile.get("actual_tile_output_pixels", actual_w * actual_h))),
+                    f"{planned_w}x{planned_h}",
+                    f"{target_w}x{target_h}",
+                    f"{float(repaint_scale[0]):.4f}x,{float(repaint_scale[1]):.4f}y",
+                    f"{float(target_scale[0]):.4f}x,{float(target_scale[1]):.4f}y",
+                    status,
+                ]
+            )
+        )
+    constraints = manifest.get("actual_tile_output_constraints", manifest.get("tile_output_constraints", {}))
+    lines.append("")
+    lines.append(
+        "max_tile_pixels="
+        f"{int(constraints.get('max_tile_pixels', 0))} "
+        f"enforce={bool(constraints.get('enforce_tile_pixel_limit', False))}"
+    )
+    lines.append("Use actual_tile_manifest as Tile Composite Video.tile_manifest.")
+    return "\n".join(lines)
+
+
+def _augment_manifest_with_actual_tile_outputs(
+    manifest: dict[str, Any],
+    tile_videos: list[torch.Tensor],
+    max_tile_pixels: int,
+    enforce_tile_pixel_limit: bool,
+    expected_size_mismatch_mode: str,
+    aspect_mismatch_mode: str,
+    aspect_tolerance: float,
+) -> dict[str, Any]:
+    tiles = manifest.get("tiles")
+    if not isinstance(tiles, list) or len(tiles) != len(tile_videos):
+        raise ValueError(f"tile_manifest must contain {len(tile_videos)} tile entries.")
+
+    normalized_expected_mode = str(expected_size_mismatch_mode or "warn").strip()
+    if normalized_expected_mode not in {"ignore", "warn", "error"}:
+        normalized_expected_mode = "warn"
+    normalized_aspect_mode = str(aspect_mismatch_mode or "warn").strip()
+    if normalized_aspect_mode not in {"ignore", "warn", "error"}:
+        normalized_aspect_mode = "warn"
+    tolerance = max(0.0, min(0.25, float(aspect_tolerance)))
+    max_pixels = max(0, int(max_tile_pixels))
+
+    updated = dict(manifest)
+    updated_tiles: list[dict[str, Any]] = []
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    for index, (tile, video) in enumerate(zip(tiles, tile_videos), start=1):
+        if not isinstance(video, torch.Tensor) or video.ndim != 4:
+            raise ValueError(f"tile_{index}_video must be a ComfyUI IMAGE tensor.")
+        item = dict(tile)
+        actual_h = int(video.shape[1])
+        actual_w = int(video.shape[2])
+        actual_pixels = int(actual_w * actual_h)
+        source_w, source_h = [int(value) for value in item.get("source_crop_size", [0, 0])]
+        target_w, target_h = [int(value) for value in item.get("target_crop_size", [0, 0])]
+        planned_w, planned_h = [int(value) for value in item.get("tile_generate_size", [0, 0])]
+        notes: list[str] = []
+
+        if max_pixels > 0 and actual_pixels > max_pixels:
+            message = (
+                f"tile {index} actual output {actual_w}x{actual_h} has {actual_pixels} pixels, "
+                f"over max_tile_pixels={max_pixels}"
+            )
+            notes.append("over_pixel_budget")
+            if bool(enforce_tile_pixel_limit):
+                errors.append(message)
+            else:
+                warnings.append(message)
+
+        if planned_w > 0 and planned_h > 0 and [actual_w, actual_h] != [planned_w, planned_h]:
+            message = f"tile {index} actual output {actual_w}x{actual_h} differs from planned {planned_w}x{planned_h}"
+            notes.append("size_differs_from_plan")
+            if normalized_expected_mode == "error":
+                errors.append(message)
+            elif normalized_expected_mode == "warn":
+                warnings.append(message)
+
+        actual_aspect = float(actual_w / max(1, actual_h))
+        target_aspect = float(target_w / max(1, target_h)) if target_w > 0 and target_h > 0 else actual_aspect
+        aspect_delta = abs(actual_aspect - target_aspect) / max(1e-6, target_aspect)
+        if normalized_aspect_mode != "ignore" and aspect_delta > tolerance:
+            message = (
+                f"tile {index} actual aspect {actual_aspect:.6f} differs from target crop aspect "
+                f"{target_aspect:.6f} by {aspect_delta:.4f}"
+            )
+            notes.append("aspect_differs_from_target")
+            if normalized_aspect_mode == "error":
+                errors.append(message)
+            else:
+                warnings.append(message)
+
+        item.update(
+            {
+                "actual_tile_output_size": [int(actual_w), int(actual_h)],
+                "actual_tile_output_pixels": int(actual_pixels),
+                "actual_tile_output_frames": int(video.shape[0]),
+                "actual_repaint_scale": [
+                    float(actual_w / max(1, source_w)),
+                    float(actual_h / max(1, source_h)),
+                ],
+                "actual_tile_to_target_scale": [
+                    float(target_w / max(1, actual_w)),
+                    float(target_h / max(1, actual_h)),
+                ],
+                "actual_aspect_ratio": float(actual_aspect),
+                "target_crop_aspect_ratio": float(target_aspect),
+                "actual_aspect_delta_ratio": float(aspect_delta),
+                "actual_resolution_matches_plan": bool([actual_w, actual_h] == [planned_w, planned_h]),
+                "actual_within_tile_pixel_limit": bool(max_pixels <= 0 or actual_pixels <= max_pixels),
+                "actual_repaint_notes": notes,
+            }
+        )
+        updated_tiles.append(item)
+
+    if errors:
+        raise ValueError("Tile repaint collector rejected actual tile outputs: " + "; ".join(errors))
+
+    updated["tiles"] = updated_tiles
+    updated["actual_tile_output_constraints"] = {
+        "max_tile_pixels": int(max_pixels),
+        "enforce_tile_pixel_limit": bool(enforce_tile_pixel_limit),
+        "expected_size_mismatch_mode": normalized_expected_mode,
+        "aspect_mismatch_mode": normalized_aspect_mode,
+        "aspect_tolerance": float(tolerance),
+    }
+    updated["actual_tile_output_warnings"] = warnings
+    updated["actual_tile_outputs_collected"] = True
+    return updated
+
+
 def _build_2x2_tile_manifest(
     source_video: torch.Tensor,
     target_w: int,
@@ -4857,6 +5006,77 @@ class SCAIL2TileExtractor:
         )
 
 
+class SCAIL2TileRepaintCollector:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "tile_manifest": ("STRING", {"default": "", "multiline": True, "forceInput": True}),
+                "tile_1_video": ("IMAGE",),
+                "tile_2_video": ("IMAGE",),
+                "tile_3_video": ("IMAGE",),
+                "tile_4_video": ("IMAGE",),
+                "max_tile_pixels": ("INT", {"default": DEFAULT_MAX_TILE_PIXELS, "min": 0, "max": 4096 * 4096, "step": 1024}),
+                "enforce_tile_pixel_limit": ("BOOLEAN", {"default": True}),
+                "expected_size_mismatch_mode": (["warn", "error", "ignore"], {"default": "warn"}),
+                "aspect_mismatch_mode": (["warn", "error", "ignore"], {"default": "warn"}),
+                "aspect_tolerance": ("FLOAT", {"default": 0.03, "min": 0.0, "max": 0.25, "step": 0.005}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING", "IMAGE", "IMAGE", "IMAGE", "IMAGE", "STRING")
+    RETURN_NAMES = (
+        "actual_tile_manifest",
+        "tile_1_video",
+        "tile_2_video",
+        "tile_3_video",
+        "tile_4_video",
+        "tile_repaint_report",
+    )
+    FUNCTION = "collect"
+    CATEGORY = f"{CATEGORY}/Tile Upscale"
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        fingerprint_inputs: dict[str, Any] = {}
+        for key in sorted(kwargs):
+            value = kwargs[key]
+            fingerprint_inputs[key] = value if isinstance(value, (str, int, float, bool)) or value is None else type(value).__name__
+        return _stable_fingerprint(fingerprint_inputs)
+
+    def collect(
+        self,
+        tile_manifest: str,
+        tile_1_video: torch.Tensor,
+        tile_2_video: torch.Tensor,
+        tile_3_video: torch.Tensor,
+        tile_4_video: torch.Tensor,
+        max_tile_pixels: int = DEFAULT_MAX_TILE_PIXELS,
+        enforce_tile_pixel_limit: bool = True,
+        expected_size_mismatch_mode: str = "warn",
+        aspect_mismatch_mode: str = "warn",
+        aspect_tolerance: float = 0.03,
+    ):
+        manifest = _parse_tile_manifest(tile_manifest)
+        actual_manifest = _augment_manifest_with_actual_tile_outputs(
+            manifest,
+            [tile_1_video, tile_2_video, tile_3_video, tile_4_video],
+            int(max_tile_pixels),
+            bool(enforce_tile_pixel_limit),
+            str(expected_size_mismatch_mode),
+            str(aspect_mismatch_mode),
+            float(aspect_tolerance),
+        )
+        return (
+            json.dumps(actual_manifest, indent=2),
+            tile_1_video,
+            tile_2_video,
+            tile_3_video,
+            tile_4_video,
+            _tile_repaint_report(actual_manifest),
+        )
+
+
 class SCAIL2TileCompositeVideo:
     @classmethod
     def INPUT_TYPES(cls):
@@ -4965,9 +5185,12 @@ class SCAIL2TileCompositeVideo:
                     "target_crop_bbox": [int(x0), int(y0), int(x1), int(y1)],
                     "target_core_bbox": core_bbox,
                     "tile_generate_size": tile.get("tile_generate_size"),
+                    "actual_tile_output_size": tile.get("actual_tile_output_size", [int(video.shape[2]), int(video.shape[1])]),
                     "tile_repaint_scale": tile.get("tile_repaint_scale"),
+                    "actual_repaint_scale": tile.get("actual_repaint_scale"),
                     "target_composite_scale": tile.get("target_composite_scale"),
                     "tile_to_target_scale": tile.get("tile_to_target_scale"),
+                    "actual_tile_to_target_scale": tile.get("actual_tile_to_target_scale"),
                     "input_shape": _shape(video),
                     "fitted_shape": _shape(fitted),
                 }
@@ -5074,6 +5297,7 @@ NODE_CLASS_MAPPINGS = {
     "SCAIL2TilePlanBuilder": SCAIL2TilePlanBuilder,
     "SCAIL2ManualTilePlanBuilder": SCAIL2ManualTilePlanBuilder,
     "SCAIL2TileExtractor": SCAIL2TileExtractor,
+    "SCAIL2TileRepaintCollector": SCAIL2TileRepaintCollector,
     "SCAIL2TileCompositeVideo": SCAIL2TileCompositeVideo,
 }
 
@@ -5091,5 +5315,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SCAIL2TilePlanBuilder": "SCAIL-2 Tile Plan Builder",
     "SCAIL2ManualTilePlanBuilder": "SCAIL-2 Manual Tile Plan Builder",
     "SCAIL2TileExtractor": "SCAIL-2 Tile Extractor",
+    "SCAIL2TileRepaintCollector": "SCAIL-2 Tile Repaint Collector",
     "SCAIL2TileCompositeVideo": "SCAIL-2 Tile Composite Video",
 }

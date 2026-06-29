@@ -228,6 +228,7 @@ first-pass SCAIL-2 frames
   -> SCAIL-2 Manual Tile Plan Builder
   -> four SCAIL-2 Tile Extractor nodes, tile_index 1..4
   -> four SCAIL-2 Scheduled Long Video / Internal SAM nodes
+  -> SCAIL-2 Tile Repaint Collector
   -> SCAIL-2 Tile Composite Video
   -> SCAIL-2 Head Track Crop
   -> SCAIL-2 Scheduled Long Video / Internal SAM    # face crop pass
@@ -273,6 +274,14 @@ budget. With `enforce_tile_pixel_limit` enabled, the planner refuses to produce
 a manifest if any tile's repaint resolution exceeds that budget. Move the
 manual split lines, lower `overlap_ratio`, lower `scale_factor`, or raise
 `max_tile_pixels` before running the expensive repaint pass.
+
+After the four tile repaint passes finish, use `SCAIL-2 Tile Repaint Collector`
+before compositing. It reads the actual generated video dimensions, recomputes
+the real source-crop -> repaint and repaint -> final-canvas scale for each tile,
+and outputs `actual_tile_manifest`. Connect that manifest to
+`SCAIL-2 Tile Composite Video.tile_manifest`. This handles cases where each tile
+comes back at a different valid resolution, as long as the collector's pixel and
+aspect checks pass.
 
 For people videos, connect a face/head/person mask to
 `Tile Plan Builder.protected_masks`. The planner treats that mask as a protected
