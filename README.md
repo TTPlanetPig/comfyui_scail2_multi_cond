@@ -257,6 +257,23 @@ context across tile boundaries. Because the overlap belongs to the generated
 tile context, each tile's generation size can be larger than the core quadrant
 and is aligned with `tile_align` for SCAIL/Wan-friendly dimensions.
 
+Both tile planners output `tile_resolution_report` in addition to
+`tile_manifest`. Use that report to configure each tile repaint pass. For every
+tile it lists:
+
+- `repaint_resolution`: the exact `width x height` to generate for that tile;
+- `pixels`: total repaint pixels;
+- `source_crop`: the first-pass crop size before upscaling;
+- `target_crop`: the final-canvas paste size;
+- `repaint_scale`: source crop -> tile repaint scale;
+- `composite_scale`: tile repaint -> final-canvas paste scale.
+
+`max_tile_pixels` defaults to `921600`, equivalent to a `1280x720` pixel
+budget. With `enforce_tile_pixel_limit` enabled, the planner refuses to produce
+a manifest if any tile's repaint resolution exceeds that budget. Move the
+manual split lines, lower `overlap_ratio`, lower `scale_factor`, or raise
+`max_tile_pixels` before running the expensive repaint pass.
+
 For people videos, connect a face/head/person mask to
 `Tile Plan Builder.protected_masks`. The planner treats that mask as a protected
 region, pads it with `protected_padding_ratio` and `protected_padding_px`, then
