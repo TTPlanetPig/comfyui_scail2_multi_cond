@@ -5220,11 +5220,11 @@ class SCAIL2ManualTilePlanBuilder:
                 "resolution_snap_mode": (["nearest", "ceil", "floor"], {"default": "nearest"}),
                 "feather_px": ("INT", {"default": 48, "min": 0, "max": 512, "step": 1}),
                 "min_tile_ratio": ("FLOAT", {"default": 0.20, "min": 0.05, "max": 0.45, "step": 0.01}),
-                "coverage_policy": (["auto_fill", "error", "ignore"], {"default": "auto_fill"}),
                 "max_tile_pixels": ("INT", {"default": DEFAULT_MAX_TILE_PIXELS, "min": 0, "max": 4096 * 4096, "step": 1024}),
                 "enforce_tile_pixel_limit": ("BOOLEAN", {"default": True}),
                 "preview_frame_count": ("INT", {"default": 8, "min": 1, "max": 24, "step": 1}),
                 "preview_filename_prefix": ("STRING", {"default": "scail_manual_tile"}),
+                "coverage_policy": (["auto_fill", "error", "ignore"], {"default": "auto_fill"}),
             }
         }
 
@@ -5253,11 +5253,11 @@ class SCAIL2ManualTilePlanBuilder:
         resolution_snap_mode: str = "nearest",
         feather_px: int = 48,
         min_tile_ratio: float = 0.20,
-        coverage_policy: str = "auto_fill",
         max_tile_pixels: int = DEFAULT_MAX_TILE_PIXELS,
         enforce_tile_pixel_limit: bool = True,
         preview_frame_count: int = 8,
         preview_filename_prefix: str = "scail_manual_tile",
+        coverage_policy: str = "auto_fill",
     ):
         if not isinstance(source_video, torch.Tensor) or source_video.ndim != 4:
             raise ValueError("source_video must be a ComfyUI IMAGE tensor.")

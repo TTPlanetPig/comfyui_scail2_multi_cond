@@ -69,6 +69,16 @@ def main() -> None:
     assert_true(nodes._tile_seed(123, 7, "same_seed") == 123, "same_seed changed tile 7")
     assert_true(nodes._tile_seed(123, 7, "offset_by_tile") != 123, "offset_by_tile did not offset")
 
+    manual_required_keys = list(nodes.SCAIL2ManualTilePlanBuilder.INPUT_TYPES()["required"])
+    assert_true(
+        manual_required_keys[-1] == "coverage_policy",
+        "coverage_policy must stay last so older saved workflows do not shift max_tile_pixels into the combo widget",
+    )
+    assert_true(
+        manual_required_keys.index("max_tile_pixels") < manual_required_keys.index("coverage_policy"),
+        "manual tile widget order should keep max_tile_pixels before coverage_policy",
+    )
+
     x_edges = [0, 78, 156, 234, 312, 390, 469, 548]
     core_bboxes = [[x_edges[index], 0, x_edges[index + 1], 960] for index in range(7)]
     manifest = nodes._build_rect_tile_manifest(
