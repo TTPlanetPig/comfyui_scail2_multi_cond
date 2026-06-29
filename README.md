@@ -268,6 +268,11 @@ the Python node so downstream stitching remains deterministic.
 `SCAIL-2 Tile Plan Builder` remains available for automatic planning. By
 default both tile planners target a 2x final canvas, so a `548x960` first pass
 composites back to `1096x1920`.
+If `output_width`/`output_height` are set to a near-match such as `1080x1920`,
+the planners preserve the source-video aspect ratio and adjust the actual
+manifest target size automatically. For example, a `548x960` source with a
+requested `1080x1920` target resolves to `1096x1920`; the manifest records this
+under `target_size_adjustment`.
 `overlap_ratio` expands each tile crop before the second pass, giving the model
 context across tile boundaries. Because the overlap belongs to the generated
 tile context, each tile's generation size can be larger than the core quadrant
@@ -294,7 +299,8 @@ manual tile rectangles, lower `overlap_ratio`, lower `scale_factor`, or raise
 first-pass `pose_video`, `tile_manifest`, the original `segment_plan`, model
 inputs, and the same references/reference masks used by `SCAIL-2 Scheduled Long
 Video`. The node crops every tile internally, runs the scheduled long-video pass
-once per tile, collects the actual output sizes, recomputes each tile's real
+once per tile, crops each `reference_N` and mask to the matching tile region,
+collects the actual output sizes, recomputes each tile's real
 scale, and composites the tiles back to `tile_manifest.target_size`.
 
 `SCAIL-2 Tiled Long Video (Internal SAM)` follows the same contract, but only

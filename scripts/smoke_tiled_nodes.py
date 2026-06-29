@@ -78,6 +78,15 @@ def main() -> None:
         manual_required_keys.index("max_tile_pixels") < manual_required_keys.index("coverage_policy"),
         "manual tile widget order should keep max_tile_pixels before coverage_policy",
     )
+    target_w, target_h, target_info = nodes._resolve_tile_target_size(548, 960, 1080, 1920, 2.0)
+    assert_true([target_w, target_h] == [1096, 1920], "target resolution should preserve source aspect from requested height")
+    assert_true(target_info["adjusted_output_size"], "target resolution adjustment should report changed user request")
+    target_w, target_h, target_info = nodes._resolve_tile_target_size(548, 960, 1080, 0, 2.0)
+    assert_true([target_w, target_h] == [1080, 1892], "target resolution should derive missing height from source aspect")
+    assert_true(
+        target_info["resolution_basis"] == "output_width_preserve_aspect",
+        "single-width target should use width as aspect-preserving basis",
+    )
 
     x_edges = [0, 78, 156, 234, 312, 390, 469, 548]
     core_bboxes = [[x_edges[index], 0, x_edges[index + 1], 960] for index in range(7)]

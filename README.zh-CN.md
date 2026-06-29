@@ -261,6 +261,21 @@ mask_contract_px 增大
 stitch_mask_expand_px 减小
 ```
 
+## Tile 超分流程
+
+`SCAIL-2 Manual Tile Plan Builder` 会生成 `tile_manifest`。如果你填写了
+`output_width` / `output_height`，节点不会拉伸原始视频比例，而是按源视频比例
+自动修正最终目标尺寸。例如源视频是 `548x960`，目标填 `1080x1920` 时，
+manifest 会解析为 `1096x1920`，并在 `target_size_adjustment` 里记录请求值和实际值。
+
+`SCAIL-2 Tiled Long Video` 是自动生产节点。连接第一阶段的 `pose_video`、
+`tile_manifest`、原始 `segment_plan`、模型输入，以及和普通长视频节点相同的
+`reference_N` / mask 即可。节点内部会按 tile 自动裁切 `pose_video`、对应的
+`reference_N` 和 mask，再逐块调用长视频生成，最后自动拼合。
+
+如果你想单独调试每一块，再使用 `SCAIL-2 Tile Extractor` 手动导出每块视频，
+分别生成后接 `SCAIL-2 Tile Repaint Collector` 和 `SCAIL-2 Tile Composite Video`。
+
 ## 长视频缓存
 
 长视频节点提供 `cache_mode`：

@@ -2559,6 +2559,62 @@ def _validate_uniform_tile_scale(source_w: int, source_h: int, target_w: int, ta
     return scale_x, scale_y
 
 
+def _resolve_tile_target_size(
+    source_w: int,
+    source_h: int,
+    output_width: int,
+    output_height: int,
+    scale_factor: float,
+) -> tuple[int, int, dict[str, Any]]:
+    source_w = max(1, int(source_w))
+    source_h = max(1, int(source_h))
+    requested_w = max(0, int(output_width))
+    requested_h = max(0, int(output_height))
+    requested_scale = max(1.0, float(scale_factor))
+    source_aspect = float(source_w / max(1, source_h))
+
+    basis = "scale_factor"
+    if requested_w > 0 and requested_h > 0:
+        width_scale = float(requested_w / source_w)
+        height_scale = float(requested_h / source_h)
+        if abs(width_scale - height_scale) <= 1e-6:
+            resolved_scale = max(1.0, (width_scale + height_scale) / 2.0)
+            basis = "exact_output_size"
+        else:
+            width_delta = abs(width_scale - requested_scale)
+            height_delta = abs(height_scale - requested_scale)
+            if height_delta <= width_delta:
+                resolved_scale = max(1.0, height_scale)
+                basis = "output_height_preserve_aspect"
+            else:
+                resolved_scale = max(1.0, width_scale)
+                basis = "output_width_preserve_aspect"
+    elif requested_w > 0:
+        resolved_scale = max(1.0, float(requested_w / source_w))
+        basis = "output_width_preserve_aspect"
+    elif requested_h > 0:
+        resolved_scale = max(1.0, float(requested_h / source_h))
+        basis = "output_height_preserve_aspect"
+    else:
+        resolved_scale = requested_scale
+
+    target_w = max(1, int(round(source_w * resolved_scale)))
+    target_h = max(1, int(round(source_h * resolved_scale)))
+    resolved_scale_x, resolved_scale_y = _validate_uniform_tile_scale(source_w, source_h, target_w, target_h)
+    requested_aspect = float(requested_w / requested_h) if requested_w > 0 and requested_h > 0 else None
+    return target_w, target_h, {
+        "requested_output_size": [int(requested_w), int(requested_h)],
+        "resolved_target_size": [int(target_w), int(target_h)],
+        "requested_scale_factor": float(requested_scale),
+        "resolved_scale": [float(resolved_scale_x), float(resolved_scale_y)],
+        "source_aspect_ratio": float(source_aspect),
+        "requested_aspect_ratio": requested_aspect,
+        "preserve_source_aspect": True,
+        "resolution_basis": basis,
+        "adjusted_output_size": bool(requested_w > 0 and requested_h > 0 and [requested_w, requested_h] != [target_w, target_h]),
+    }
+
+
 def _format_tile_resolution_report(manifest: dict[str, Any]) -> str:
     constraints = manifest.get("tile_output_constraints", {})
     lines = [
@@ -5106,9 +5162,13 @@ class SCAIL2TilePlanBuilder:
         _frames, source_h, source_w, channels = source_video.shape
         rows = 2
         cols = 2
-        scale = max(1.0, float(scale_factor))
-        target_w = int(output_width) if int(output_width) > 0 else int(round(int(source_w) * scale))
-        target_h = int(output_height) if int(output_height) > 0 else int(round(int(source_h) * scale))
+        target_w, target_h, target_size_adjustment = _resolve_tile_target_size(
+            int(source_w),
+            int(source_h),
+            int(output_width),
+            int(output_height),
+            float(scale_factor),
+        )
         target_w = max(cols, int(target_w))
         target_h = max(rows, int(target_h))
         overlap_ratio = max(0.0, min(0.45, float(overlap_ratio)))
@@ -5175,7 +5235,8 @@ class SCAIL2TilePlanBuilder:
 
         manifest.update(
             {
-                "scale_factor": float(scale),
+                "scale_factor": float(scale_x),
+                "target_size_adjustment": target_size_adjustment,
                 "min_tile_ratio": float(min_tile_ratio),
                 "protected_region": protected_region,
                 "protected_owner_tile": protected_owner_tile,
@@ -5262,9 +5323,13 @@ class SCAIL2ManualTilePlanBuilder:
         if not isinstance(source_video, torch.Tensor) or source_video.ndim != 4:
             raise ValueError("source_video must be a ComfyUI IMAGE tensor.")
         _frames, source_h, source_w, _channels = source_video.shape
-        scale = max(1.0, float(scale_factor))
-        target_w = int(output_width) if int(output_width) > 0 else int(round(int(source_w) * scale))
-        target_h = int(output_height) if int(output_height) > 0 else int(round(int(source_h) * scale))
+        target_w, target_h, target_size_adjustment = _resolve_tile_target_size(
+            int(source_w),
+            int(source_h),
+            int(output_width),
+            int(output_height),
+            float(scale_factor),
+        )
         layout = _parse_manual_tile_layout(layout_json)
         core_bboxes, normalized_layout = _manual_core_bboxes_from_layout(
             layout,
@@ -5298,6 +5363,7 @@ class SCAIL2ManualTilePlanBuilder:
             enforce_tile_pixel_limit=bool(enforce_tile_pixel_limit),
             resolution_snap_mode=str(resolution_snap_mode),
             extra={
+                "target_size_adjustment": target_size_adjustment,
                 "manual_layout": {
                     **normalized_layout,
                     "min_tile_ratio": float(max(0.01, min(0.45, float(min_tile_ratio)))),
