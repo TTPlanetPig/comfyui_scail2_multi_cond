@@ -538,6 +538,18 @@ and `SCAIL-2 Multi Reference Colored Mask` to prepare `pose_video_mask` and
 
 The package itself does not depend on KJNodes. A workflow may still require KJNodes if it uses unrelated KJNodes nodes such as resize helpers.
 
+## Developer Smoke Test
+
+Run this after changing tile or tiled long-video node wiring:
+
+```bash
+python3 -B scripts/smoke_tiled_nodes.py
+```
+
+This test does not run model inference. It verifies node registration, 7-tile
+manifest planning, 32-pixel tile alignment, pixel-budget rejection, external
+mask vs. internal SAM inputs, and the global-SAM-then-tile-crop strategy.
+
 ## Included Workflows
 
 ```text

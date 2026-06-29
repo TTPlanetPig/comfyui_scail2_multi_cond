@@ -36,6 +36,16 @@ web/js/scail_multi_cond_dynamic.js
 [SCAIL Multi Cond] dynamic UI extension loaded
 ```
 
+## 开发 Smoke Test
+
+修改 tile 或 tiled long-video 节点后，可以先跑：
+
+```bash
+python3 -B scripts/smoke_tiled_nodes.py
+```
+
+这个测试不跑真实模型推理，只验证节点注册、7 块 tile manifest、32 像素对齐、像素预算拒绝、外置 mask / 内置 SAM 输入差异，以及“全局 SAM 一次后按 tile 裁切”的策略没有被改坏。
+
 ## 基础长视频节点
 
 ### SCAIL-2 Segment Plan Builder
