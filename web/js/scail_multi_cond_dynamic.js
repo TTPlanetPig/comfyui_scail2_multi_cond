@@ -5,6 +5,7 @@ console.log("[SCAIL Multi Cond] dynamic UI extension loaded");
 
 const MAX_SEGMENTS = 8;
 const MAX_REFERENCES = 8;
+const MAX_TILES = 8;
 
 function widgetByName(node, name) {
     return node.widgets?.find((widget) => widget.name === name);
@@ -462,17 +463,16 @@ function renderMatrix(node, matrix) {
     resizeNode(node);
 }
 
-function parseManualTileLayout(node) {
-    const layoutWidget = widgetByName(node, "layout_json");
-    try {
-        const value = JSON.parse(layoutWidget?.value || "{}");
-        return {
-            split_x: Math.max(0.01, Math.min(0.99, Number(value.split_x ?? 0.5))),
-            split_y: Math.max(0.01, Math.min(0.99, Number(value.split_y ?? 0.5))),
-        };
-    } catch {
-        return { split_x: 0.5, split_y: 0.5 };
+function clampNumber(value, min, max) {
+    const number = Number(value);
+    if (!Number.isFinite(number)) {
+        return min;
     }
+    return Math.max(min, Math.min(max, number));
+}
+
+function roundRatio(value) {
+    return Number(clampNumber(value, 0, 1).toFixed(6));
 }
 
 function manualTileMinRatio(node) {
@@ -480,10 +480,23 @@ function manualTileMinRatio(node) {
     return Math.max(0.05, Math.min(0.45, Number(widget?.value ?? 0.2)));
 }
 
-function manualTileAspect(node) {
+function manualTileAlign(node) {
+    const widget = widgetByName(node, "tile_align");
+    return Math.max(1, Math.min(256, Math.round(Number(widget?.value ?? 32))));
+}
+
+function manualTileSourceSize(node) {
     const previewSize = node.scailManualTilePreview?.source_size;
     if (Array.isArray(previewSize) && Number(previewSize[0]) > 0 && Number(previewSize[1]) > 0) {
-        return Math.max(0.25, Math.min(4, Number(previewSize[1]) / Number(previewSize[0])));
+        return { width: Number(previewSize[0]), height: Number(previewSize[1]) };
+    }
+    return null;
+}
+
+function manualTileAspect(node) {
+    const sourceSize = manualTileSourceSize(node);
+    if (sourceSize) {
+        return Math.max(0.25, Math.min(4, sourceSize.height / sourceSize.width));
     }
     const outputWidth = Number(widgetByName(node, "output_width")?.value ?? 0);
     const outputHeight = Number(widgetByName(node, "output_height")?.value ?? 0);
@@ -491,6 +504,106 @@ function manualTileAspect(node) {
         return Math.max(0.25, Math.min(4, outputHeight / outputWidth));
     }
     return 960 / 548;
+}
+
+function normalizeManualTileAxis(start, end, dimension, minRatio, align) {
+    const usePixels = Number(dimension) > 1;
+    let first = clampNumber(start, 0, 1);
+    let second = clampNumber(end, 0, 1);
+    if (second < first) {
+        [first, second] = [second, first];
+    }
+    if (!usePixels) {
+        const minSpan = Math.max(0.01, Math.min(0.95, Number(minRatio)));
+        if (second - first < minSpan) {
+            const center = (first + second) / 2;
+            first = center - minSpan / 2;
+            second = center + minSpan / 2;
+            if (first < 0) {
+                second -= first;
+                first = 0;
+            }
+            if (second > 1) {
+                first -= second - 1;
+                second = 1;
+            }
+        }
+        return [roundRatio(first), roundRatio(second)];
+    }
+
+    const size = Math.max(1, Math.round(Number(dimension)));
+    const step = Math.max(1, Math.round(Number(align)));
+    let a = Math.round((first * size) / step) * step;
+    let b = Math.round((second * size) / step) * step;
+    a = Math.max(0, Math.min(size - 1, a));
+    b = Math.max(1, Math.min(size, b));
+    if (b <= a) {
+        b = Math.min(size, a + 1);
+        a = Math.max(0, b - 1);
+    }
+
+    const minPixels = Math.max(1, Math.round(size * Math.max(0.01, Math.min(0.95, Number(minRatio)))));
+    if (b - a < minPixels) {
+        const center = (a + b) / 2;
+        a = Math.round(center - minPixels / 2);
+        b = a + minPixels;
+        if (a < 0) {
+            b -= a;
+            a = 0;
+        }
+        if (b > size) {
+            a -= b - size;
+            b = size;
+        }
+    }
+    return [roundRatio(a / size), roundRatio(b / size)];
+}
+
+function normalizeManualTileRect(node, raw) {
+    const sourceSize = manualTileSourceSize(node);
+    const minRatio = manualTileMinRatio(node);
+    const align = manualTileAlign(node);
+    let x0 = Number(raw?.x0 ?? raw?.x ?? 0);
+    let y0 = Number(raw?.y0 ?? raw?.y ?? 0);
+    let x1 = Number(raw?.x1 ?? (Number(raw?.x ?? 0) + Number(raw?.w ?? raw?.width ?? 0.5)));
+    let y1 = Number(raw?.y1 ?? (Number(raw?.y ?? 0) + Number(raw?.h ?? raw?.height ?? 0.5)));
+    [x0, x1] = normalizeManualTileAxis(x0, x1, sourceSize?.width, minRatio, align);
+    [y0, y1] = normalizeManualTileAxis(y0, y1, sourceSize?.height, minRatio, align);
+    return { x0, y0, x1, y1 };
+}
+
+function manualTilesFromSplit(node, splitX = 0.5, splitY = 0.5) {
+    const minRatio = manualTileMinRatio(node);
+    const x = Math.max(minRatio, Math.min(1 - minRatio, Number(splitX)));
+    const y = Math.max(minRatio, Math.min(1 - minRatio, Number(splitY)));
+    return [
+        normalizeManualTileRect(node, { x0: 0, y0: 0, x1: x, y1: y }),
+        normalizeManualTileRect(node, { x0: x, y0: 0, x1: 1, y1: y }),
+        normalizeManualTileRect(node, { x0: 0, y0: y, x1: x, y1: 1 }),
+        normalizeManualTileRect(node, { x0: x, y0: y, x1: 1, y1: 1 }),
+    ];
+}
+
+function parseManualTileLayout(node) {
+    const layoutWidget = widgetByName(node, "layout_json");
+    let value = {};
+    try {
+        value = JSON.parse(layoutWidget?.value || "{}");
+    } catch {
+        value = {};
+    }
+    if (Array.isArray(value?.tiles) && value.tiles.length) {
+        return {
+            tiles: value.tiles.slice(0, MAX_TILES).map((tile) => normalizeManualTileRect(node, tile)),
+        };
+    }
+    const splitX = Math.max(0.01, Math.min(0.99, Number(value.split_x ?? 0.5)));
+    const splitY = Math.max(0.01, Math.min(0.99, Number(value.split_y ?? 0.5)));
+    return {
+        split_x: splitX,
+        split_y: splitY,
+        tiles: manualTilesFromSplit(node, splitX, splitY),
+    };
 }
 
 function normalizeManualTilePreview(payload) {
@@ -532,18 +645,70 @@ function extractManualTilePreview(message) {
     return null;
 }
 
-function setManualTileLayout(node, splitX, splitY) {
-    const minRatio = manualTileMinRatio(node);
+function writeManualTileLayout(node, tiles, selectedIndex = 0) {
+    const normalizedTiles = (Array.isArray(tiles) ? tiles : [])
+        .slice(0, MAX_TILES)
+        .map((tile) => normalizeManualTileRect(node, tile));
     const layout = {
-        split_x: Math.max(minRatio, Math.min(1 - minRatio, Number(splitX))),
-        split_y: Math.max(minRatio, Math.min(1 - minRatio, Number(splitY))),
+        tiles: normalizedTiles.length ? normalizedTiles : manualTilesFromSplit(node, 0.5, 0.5),
     };
     const layoutWidget = widgetByName(node, "layout_json");
     if (layoutWidget) {
         layoutWidget.value = JSON.stringify(layout);
     }
     node.scailManualTileLayout = layout;
+    node.scailManualTileSelectedIndex = Math.max(
+        0,
+        Math.min(layout.tiles.length - 1, Number(selectedIndex ?? 0))
+    );
+}
+
+function setManualTileTiles(node, tiles, selectedIndex = 0) {
+    writeManualTileLayout(node, tiles, selectedIndex);
     renderManualTileEditor(node);
+}
+
+function setManualTileLayout(node, splitX, splitY) {
+    setManualTileTiles(node, manualTilesFromSplit(node, splitX, splitY), 0);
+}
+
+function manualTilePixelRect(node, tile) {
+    const sourceSize = manualTileSourceSize(node);
+    if (!sourceSize) {
+        return null;
+    }
+    const x0 = Math.round(tile.x0 * sourceSize.width);
+    const y0 = Math.round(tile.y0 * sourceSize.height);
+    const x1 = Math.round(tile.x1 * sourceSize.width);
+    const y1 = Math.round(tile.y1 * sourceSize.height);
+    return {
+        x0,
+        y0,
+        x1,
+        y1,
+        width: Math.max(1, x1 - x0),
+        height: Math.max(1, y1 - y0),
+    };
+}
+
+function createManualTileButton(label, onClick, disabled = false) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = label;
+    button.disabled = disabled;
+    button.style.cssText = [
+        "font:inherit",
+        "color:" + (disabled ? "rgba(15,23,42,.45)" : "#0f172a"),
+        "background:#e2e8f0",
+        "border:1px solid #cbd5e1",
+        "border-radius:4px",
+        "padding:4px 7px",
+        "cursor:" + (disabled ? "default" : "pointer"),
+    ].join(";");
+    if (!disabled) {
+        button.onclick = onClick;
+    }
+    return button;
 }
 
 function ensureManualTileEditor(node) {
@@ -573,7 +738,7 @@ function ensureManualTileEditor(node) {
         });
         widget.computeSize = () => [
             Math.max(460, node.size?.[0] ?? 460),
-            Math.max(270, container.scrollHeight + 18),
+            Math.max(320, container.scrollHeight + 18),
         ];
     } else {
         node.addWidget("text", "manual_tile_editor", "Manual Tile Editor", () => {}, { serialize: false });
@@ -589,9 +754,16 @@ function renderManualTileEditor(node) {
         return;
     }
     const current = node.scailManualTileLayout ?? parseManualTileLayout(node);
-    const minRatio = manualTileMinRatio(node);
-    const splitX = Math.max(minRatio, Math.min(1 - minRatio, current.split_x));
-    const splitY = Math.max(minRatio, Math.min(1 - minRatio, current.split_y));
+    const tiles = Array.isArray(current.tiles) && current.tiles.length
+        ? current.tiles.map((tile) => normalizeManualTileRect(node, tile))
+        : manualTilesFromSplit(node, current.split_x ?? 0.5, current.split_y ?? 0.5);
+    const selectedIndex = Math.max(
+        0,
+        Math.min(tiles.length - 1, Number(node.scailManualTileSelectedIndex ?? 0))
+    );
+    writeManualTileLayout(node, tiles, selectedIndex);
+    node.scailManualTileSelectedIndex = selectedIndex;
+
     const aspect = manualTileAspect(node);
     const preview = node.scailManualTilePreview ?? { items: [] };
     const previewItems = Array.isArray(preview.items) ? preview.items : [];
@@ -601,16 +773,21 @@ function renderManualTileEditor(node) {
     );
     node.scailManualTilePreviewIndex = previewIndex;
     const previewItem = previewItems[previewIndex];
+    const sourceSize = manualTileSourceSize(node);
+    const selectedPixelRect = manualTilePixelRect(node, tiles[selectedIndex]);
+    const align = manualTileAlign(node);
 
     container.replaceChildren();
 
     const header = document.createElement("div");
     header.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px;";
     const title = document.createElement("div");
-    title.textContent = "Manual Tile Core Layout";
+    title.textContent = "Manual Tile Rectangles";
     title.style.cssText = "font-weight:700;font-size:13px;";
     const value = document.createElement("div");
-    value.textContent = `x ${(splitX * 100).toFixed(1)}% / y ${(splitY * 100).toFixed(1)}%`;
+    value.textContent = selectedPixelRect
+        ? `${tiles.length} tiles / T${selectedIndex + 1} ${selectedPixelRect.width}x${selectedPixelRect.height}px / snap ${align}px`
+        : `${tiles.length} tiles / snap ${align}px`;
     value.style.cssText = "opacity:.78;text-align:right;";
     header.append(title, value);
 
@@ -622,7 +799,7 @@ function renderManualTileEditor(node) {
         "border:1px solid rgba(226,232,240,.45)",
         "border-radius:6px",
         "overflow:hidden",
-        "background:linear-gradient(135deg,#172033,#0f172a)",
+        "background:#172033",
         "touch-action:none",
         "cursor:crosshair",
     ].join(";");
@@ -659,84 +836,119 @@ function renderManualTileEditor(node) {
         stage.append(empty);
     }
 
-    const makeRegion = (label, style) => {
-        const item = document.createElement("div");
-        item.textContent = label;
-        item.style.cssText = [
+    const pointFromEvent = (event) => {
+        const rect = stage.getBoundingClientRect();
+        return {
+            x: clampNumber((event.clientX - rect.left) / Math.max(1, rect.width), 0, 1),
+            y: clampNumber((event.clientY - rect.top) / Math.max(1, rect.height), 0, 1),
+        };
+    };
+    const beginTileDrag = (event, tileIndex, mode) => {
+        event.preventDefault();
+        event.stopPropagation();
+        node.scailManualTileSelectedIndex = tileIndex;
+        const startPoint = pointFromEvent(event);
+        const startTiles = tiles.map((tile) => ({ ...tile }));
+        const startTile = startTiles[tileIndex];
+        const apply = (moveEvent) => {
+            const point = pointFromEvent(moveEvent);
+            const dx = point.x - startPoint.x;
+            const dy = point.y - startPoint.y;
+            const nextTiles = startTiles.map((tile) => ({ ...tile }));
+            let nextTile;
+            if (mode === "resize") {
+                nextTile = {
+                    ...startTile,
+                    x1: startTile.x1 + dx,
+                    y1: startTile.y1 + dy,
+                };
+            } else {
+                const width = startTile.x1 - startTile.x0;
+                const height = startTile.y1 - startTile.y0;
+                let x0 = startTile.x0 + dx;
+                let y0 = startTile.y0 + dy;
+                x0 = Math.max(0, Math.min(1 - width, x0));
+                y0 = Math.max(0, Math.min(1 - height, y0));
+                nextTile = {
+                    x0,
+                    y0,
+                    x1: x0 + width,
+                    y1: y0 + height,
+                };
+            }
+            nextTiles[tileIndex] = normalizeManualTileRect(node, nextTile);
+            writeManualTileLayout(node, nextTiles, tileIndex);
+            renderManualTileEditor(node);
+        };
+        const end = () => {
+            window.removeEventListener("pointermove", apply);
+            window.removeEventListener("pointerup", end);
+        };
+        window.addEventListener("pointermove", apply);
+        window.addEventListener("pointerup", end);
+    };
+
+    for (const [index, tile] of tiles.entries()) {
+        const selected = index === selectedIndex;
+        const region = document.createElement("div");
+        region.textContent = String(index + 1);
+        region.title = "Tile " + (index + 1);
+        region.style.cssText = [
             "position:absolute",
             "box-sizing:border-box",
             "display:flex",
             "align-items:center",
             "justify-content:center",
-            "border:1px solid rgba(226,232,240,.2)",
-            "background:rgba(15,23,42,.16)",
-            "color:rgba(226,232,240,.76)",
-            "font-weight:700",
+            "left:" + tile.x0 * 100 + "%",
+            "top:" + tile.y0 * 100 + "%",
+            "width:" + Math.max(0.1, (tile.x1 - tile.x0) * 100) + "%",
+            "height:" + Math.max(0.1, (tile.y1 - tile.y0) * 100) + "%",
+            "border:" + (selected ? "2px solid #f8fafc" : "1px solid rgba(226,232,240,.55)"),
+            "background:" + (selected ? "rgba(14,165,233,.28)" : "rgba(15,23,42,.20)"),
+            "color:#f8fafc",
+            "font-weight:800",
             "letter-spacing:0",
-            style,
+            "box-shadow:" + (selected ? "0 0 0 1px rgba(15,23,42,.85),0 0 16px rgba(14,165,233,.55)" : "none"),
+            "cursor:move",
+            "user-select:none",
         ].join(";");
-        return item;
-    };
-    stage.append(
-        makeRegion("1", `left:0;top:0;width:${splitX * 100}%;height:${splitY * 100}%;`),
-        makeRegion("2", `left:${splitX * 100}%;top:0;width:${(1 - splitX) * 100}%;height:${splitY * 100}%;`),
-        makeRegion("3", `left:0;top:${splitY * 100}%;width:${splitX * 100}%;height:${(1 - splitY) * 100}%;`),
-        makeRegion("4", `left:${splitX * 100}%;top:${splitY * 100}%;width:${(1 - splitX) * 100}%;height:${(1 - splitY) * 100}%;`)
-    );
+        region.addEventListener("pointerdown", (event) => beginTileDrag(event, index, "move"));
+        const handle = document.createElement("div");
+        handle.title = "Resize tile " + (index + 1);
+        handle.style.cssText = [
+            "position:absolute",
+            "right:0",
+            "bottom:0",
+            "width:14px",
+            "height:14px",
+            "background:#f8fafc",
+            "border-left:1px solid rgba(15,23,42,.8)",
+            "border-top:1px solid rgba(15,23,42,.8)",
+            "cursor:nwse-resize",
+        ].join(";");
+        handle.addEventListener("pointerdown", (event) => beginTileDrag(event, index, "resize"));
+        region.append(handle);
+        stage.append(region);
+    }
 
-    const vLine = document.createElement("div");
-    vLine.style.cssText = [
-        "position:absolute",
-        `left:calc(${splitX * 100}% - 2px)`,
-        "top:0",
-        "width:4px",
-        "height:100%",
-        "background:#f8fafc",
-        "box-shadow:0 0 0 1px rgba(15,23,42,.8),0 0 14px rgba(248,250,252,.45)",
-        "cursor:ew-resize",
-    ].join(";");
-    const hLine = document.createElement("div");
-    hLine.style.cssText = [
-        "position:absolute",
-        "left:0",
-        `top:calc(${splitY * 100}% - 2px)`,
-        "width:100%",
-        "height:4px",
-        "background:#f8fafc",
-        "box-shadow:0 0 0 1px rgba(15,23,42,.8),0 0 14px rgba(248,250,252,.45)",
-        "cursor:ns-resize",
-    ].join(";");
-    stage.append(vLine, hLine);
-
-    const updateFromPointer = (event, axis) => {
-        const rect = stage.getBoundingClientRect();
-        const nextX = (event.clientX - rect.left) / Math.max(1, rect.width);
-        const nextY = (event.clientY - rect.top) / Math.max(1, rect.height);
-        setManualTileLayout(node, axis === "y" ? splitX : nextX, axis === "x" ? splitY : nextY);
-    };
-    const beginDrag = (event, axis) => {
-        event.preventDefault();
-        event.stopPropagation();
-        const target = event.currentTarget;
-        target.setPointerCapture?.(event.pointerId);
-        const move = (moveEvent) => updateFromPointer(moveEvent, axis);
-        const end = (endEvent) => {
-            target.releasePointerCapture?.(endEvent.pointerId);
-            window.removeEventListener("pointermove", move);
-            window.removeEventListener("pointerup", end);
-        };
-        window.addEventListener("pointermove", move);
-        window.addEventListener("pointerup", end);
-        updateFromPointer(event, axis);
-    };
-    vLine.addEventListener("pointerdown", (event) => beginDrag(event, "x"));
-    hLine.addEventListener("pointerdown", (event) => beginDrag(event, "y"));
     stage.addEventListener("pointerdown", (event) => {
-        const rect = stage.getBoundingClientRect();
-        const x = (event.clientX - rect.left) / Math.max(1, rect.width);
-        const y = (event.clientY - rect.top) / Math.max(1, rect.height);
-        const axis = Math.abs(x - splitX) < Math.abs(y - splitY) ? "x" : "y";
-        beginDrag(event, axis);
+        if (event.target !== stage) {
+            return;
+        }
+        const point = pointFromEvent(event);
+        let bestIndex = 0;
+        let bestDistance = Number.POSITIVE_INFINITY;
+        for (const [index, tile] of tiles.entries()) {
+            const centerX = (tile.x0 + tile.x1) / 2;
+            const centerY = (tile.y0 + tile.y1) / 2;
+            const distance = Math.hypot(point.x - centerX, point.y - centerY);
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                bestIndex = index;
+            }
+        }
+        node.scailManualTileSelectedIndex = bestIndex;
+        renderManualTileEditor(node);
     });
 
     const controls = document.createElement("div");
@@ -744,22 +956,34 @@ function renderManualTileEditor(node) {
     const note = document.createElement("div");
     note.textContent = previewItem
         ? `Preview ${previewIndex + 1}/${previewItems.length}: ${previewItem.label ?? `frame ${previewItem.frame_1_based ?? ""}`}`
-        : "Drag the white split lines. Overlap is added by the node.";
-    note.style.cssText = "opacity:.72;";
-    const reset = document.createElement("button");
-    reset.type = "button";
-    reset.textContent = "Reset center";
-    reset.style.cssText = [
-        "font:inherit",
-        "color:#0f172a",
-        "background:#e2e8f0",
-        "border:1px solid #cbd5e1",
-        "border-radius:4px",
-        "padding:4px 7px",
-        "cursor:pointer",
-    ].join(";");
-    reset.onclick = () => setManualTileLayout(node, 0.5, 0.5);
-    controls.append(note, reset);
+        : "Drag rectangles. The Python node adds overlap and final aligned repaint sizes.";
+    note.style.cssText = "opacity:.72;min-width:180px;";
+    const actions = document.createElement("div");
+    actions.style.cssText = "display:flex;gap:6px;align-items:center;flex-wrap:wrap;";
+    const add = createManualTileButton("Add tile", () => {
+        const base = tiles[selectedIndex] ?? { x0: 0.25, y0: 0.25, x1: 0.75, y1: 0.75 };
+        const offset = Math.min(0.12, 0.03 * tiles.length);
+        const width = Math.max(0.2, Math.min(0.5, base.x1 - base.x0));
+        const height = Math.max(0.2, Math.min(0.5, base.y1 - base.y0));
+        const x0 = Math.min(1 - width, Math.max(0, base.x0 + offset));
+        const y0 = Math.min(1 - height, Math.max(0, base.y0 + offset));
+        setManualTileTiles(node, [...tiles, { x0, y0, x1: x0 + width, y1: y0 + height }], tiles.length);
+    }, tiles.length >= MAX_TILES);
+    const remove = createManualTileButton("Delete", () => {
+        const nextTiles = tiles.filter((_tile, index) => index !== selectedIndex);
+        setManualTileTiles(node, nextTiles, Math.max(0, selectedIndex - 1));
+    }, tiles.length <= 1);
+    const reset = createManualTileButton("Reset 2x2", () => setManualTileLayout(node, 0.5, 0.5));
+    actions.append(add, remove, reset);
+    controls.append(note, actions);
+
+    const status = document.createElement("div");
+    status.style.cssText = "display:flex;gap:10px;flex-wrap:wrap;margin-top:6px;opacity:.76;";
+    const sourceLabel = sourceSize ? `${sourceSize.width}x${sourceSize.height} source` : "source size after first run";
+    const selectedLabel = selectedPixelRect
+        ? `T${selectedIndex + 1}: x${selectedPixelRect.x0}, y${selectedPixelRect.y0}, ${selectedPixelRect.width}x${selectedPixelRect.height}`
+        : `T${selectedIndex + 1}`;
+    status.textContent = `${sourceLabel} / ${selectedLabel} / max ${MAX_TILES} tiles`;
 
     if (previewItems.length > 1) {
         const frameControl = document.createElement("div");
@@ -779,9 +1003,9 @@ function renderManualTileEditor(node) {
             renderManualTileEditor(node);
         };
         frameControl.append(label, slider);
-        container.append(header, stage, controls, frameControl);
+        container.append(header, stage, controls, status, frameControl);
     } else {
-        container.append(header, stage, controls);
+        container.append(header, stage, controls, status);
     }
     resizeNode(node);
 }
@@ -854,7 +1078,9 @@ app.registerExtension({
             nodeType.prototype.onNodeCreated = function () {
                 originalOnNodeCreated?.apply(this, arguments);
                 ensureManualTileEditor(this);
-                setManualTileLayout(this, parseManualTileLayout(this).split_x, parseManualTileLayout(this).split_y);
+                const layout = parseManualTileLayout(this);
+                writeManualTileLayout(this, layout.tiles, this.scailManualTileSelectedIndex ?? 0);
+                renderManualTileEditor(this);
             };
 
             const originalOnConfigure = nodeType.prototype.onConfigure;

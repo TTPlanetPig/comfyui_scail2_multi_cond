@@ -14,6 +14,7 @@ import torch
 
 CATEGORY = "SCAIL-2/Scheduled"
 MAX_REFERENCES = 8
+MAX_TILES = 8
 DEFAULT_MAX_TILE_PIXELS = 1280 * 720
 DEFAULT_PLAN = """# frames | reference | prompt | negative | boundary_overlap
 49 | 1 | first segment prompt | | 5
@@ -2053,6 +2054,19 @@ def _align_up(value: int, align: int) -> int:
     return int(math.ceil(value / align) * align)
 
 
+def _align_to_step(value: int, align: int, mode: str = "nearest") -> int:
+    value = max(1, int(value))
+    align = max(1, int(align))
+    normalized = str(mode or "nearest").strip()
+    if normalized == "floor":
+        return max(align, int(math.floor(value / align) * align))
+    if normalized == "ceil":
+        return int(math.ceil(value / align) * align)
+    lower = max(align, int(math.floor(value / align) * align))
+    upper = int(math.ceil(value / align) * align)
+    return lower if abs(value - lower) <= abs(upper - value) else upper
+
+
 def _resize_image_batch(image: torch.Tensor, height: int, width: int, mode: str = "bilinear") -> torch.Tensor:
     return _resize_image_tensor_like(
         image,
@@ -2219,6 +2233,85 @@ def _parse_manual_tile_layout(layout_json: str) -> dict[str, Any]:
         **value,
         "split_x": max(0.01, min(0.99, split_x)),
         "split_y": max(0.01, min(0.99, split_y)),
+    }
+
+
+def _manual_core_bboxes_from_layout(
+    layout: dict[str, Any],
+    source_w: int,
+    source_h: int,
+    min_tile_ratio: float,
+) -> tuple[list[list[int]], dict[str, Any]]:
+    source_w = max(1, int(source_w))
+    source_h = max(1, int(source_h))
+    min_ratio = max(0.01, min(0.45, float(min_tile_ratio)))
+    min_w = max(1, int(round(source_w * min_ratio)))
+    min_h = max(1, int(round(source_h * min_ratio)))
+    raw_tiles = layout.get("tiles")
+    core_bboxes: list[list[int]] = []
+    normalized_tiles: list[dict[str, Any]] = []
+    if isinstance(raw_tiles, list) and raw_tiles:
+        if len(raw_tiles) > MAX_TILES:
+            raise ValueError(f"manual tile layout supports at most {MAX_TILES} tiles.")
+        for index, raw in enumerate(raw_tiles):
+            if not isinstance(raw, dict):
+                raise ValueError(f"manual tile {index + 1} must be a JSON object.")
+            if all(key in raw for key in ("x0", "y0", "x1", "y1")):
+                x0 = float(raw.get("x0", 0.0))
+                y0 = float(raw.get("y0", 0.0))
+                x1 = float(raw.get("x1", 1.0))
+                y1 = float(raw.get("y1", 1.0))
+            else:
+                x0 = float(raw.get("x", raw.get("left", 0.0)))
+                y0 = float(raw.get("y", raw.get("top", 0.0)))
+                width = float(raw.get("w", raw.get("width", 0.5)))
+                height = float(raw.get("h", raw.get("height", 0.5)))
+                x1 = x0 + width
+                y1 = y0 + height
+            x0, x1 = sorted((max(0.0, min(1.0, x0)), max(0.0, min(1.0, x1))))
+            y0, y1 = sorted((max(0.0, min(1.0, y0)), max(0.0, min(1.0, y1))))
+            px0 = max(0, min(source_w - 1, int(round(x0 * source_w))))
+            py0 = max(0, min(source_h - 1, int(round(y0 * source_h))))
+            px1 = max(px0 + 1, min(source_w, int(round(x1 * source_w))))
+            py1 = max(py0 + 1, min(source_h, int(round(y1 * source_h))))
+            if px1 - px0 < min_w or py1 - py0 < min_h:
+                raise ValueError(
+                    f"manual tile {index + 1} is smaller than min_tile_ratio={min_ratio}: "
+                    f"{px1 - px0}x{py1 - py0}, minimum {min_w}x{min_h}."
+                )
+            core_bboxes.append([int(px0), int(py0), int(px1), int(py1)])
+            normalized_tiles.append(
+                {
+                    "tile_number": len(core_bboxes),
+                    "x0": float(px0 / source_w),
+                    "y0": float(py0 / source_h),
+                    "x1": float(px1 / source_w),
+                    "y1": float(py1 / source_h),
+                    "source_core_bbox": [int(px0), int(py0), int(px1), int(py1)],
+                }
+            )
+    if core_bboxes:
+        return core_bboxes, {"tiles": normalized_tiles, "tile_count": len(core_bboxes), "layout_mode": "rectangles"}
+
+    split_x = max(min_ratio, min(1.0 - min_ratio, float(layout.get("split_x", 0.5))))
+    split_y = max(min_ratio, min(1.0 - min_ratio, float(layout.get("split_y", 0.5))))
+    split_x_px = max(1, min(source_w - 1, int(round(float(source_w) * split_x))))
+    split_y_px = max(1, min(source_h - 1, int(round(float(source_h) * split_y))))
+    core_bboxes = [
+        [0, 0, int(split_x_px), int(split_y_px)],
+        [int(split_x_px), 0, int(source_w), int(split_y_px)],
+        [0, int(split_y_px), int(split_x_px), int(source_h)],
+        [int(split_x_px), int(split_y_px), int(source_w), int(source_h)],
+    ]
+    return core_bboxes, {
+        **layout,
+        "split_x": float(split_x),
+        "split_y": float(split_y),
+        "split_x_px": int(split_x_px),
+        "split_y_px": int(split_y_px),
+        "min_tile_ratio": float(min_ratio),
+        "tile_count": 4,
+        "layout_mode": "split_2x2",
     }
 
 
@@ -2436,6 +2529,7 @@ def _build_2x2_tile_manifest(
     mode: str,
     max_tile_pixels: int = DEFAULT_MAX_TILE_PIXELS,
     enforce_tile_pixel_limit: bool = True,
+    resolution_snap_mode: str = "nearest",
     extra: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     _frames, source_h, source_w, channels = source_video.shape
@@ -2445,6 +2539,9 @@ def _build_2x2_tile_manifest(
     target_h = max(rows, int(target_h))
     overlap_ratio = max(0.0, min(0.45, float(overlap_ratio)))
     tile_align = max(1, int(tile_align))
+    normalized_snap_mode = str(resolution_snap_mode or "nearest").strip()
+    if normalized_snap_mode not in {"nearest", "ceil", "floor"}:
+        normalized_snap_mode = "nearest"
     scale_x, scale_y = _validate_uniform_tile_scale(int(source_w), int(source_h), int(target_w), int(target_h))
     max_tile_pixels = max(0, int(max_tile_pixels))
     if len(x_edges) != 3 or len(y_edges) != 3:
@@ -2488,8 +2585,8 @@ def _build_2x2_tile_manifest(
             target_crop_h = max(1, target_crop_bbox[3] - target_crop_bbox[1])
             source_crop_w = max(1, crop_x1 - crop_x0)
             source_crop_h = max(1, crop_y1 - crop_y0)
-            tile_generate_w = int(_align_up(target_crop_w, tile_align))
-            tile_generate_h = int(_align_up(target_crop_h, tile_align))
+            tile_generate_w = int(_align_to_step(target_crop_w, tile_align, normalized_snap_mode))
+            tile_generate_h = int(_align_to_step(target_crop_h, tile_align, normalized_snap_mode))
             tile_generate_pixels = int(tile_generate_w * tile_generate_h)
             if bool(enforce_tile_pixel_limit) and max_tile_pixels > 0 and tile_generate_pixels > max_tile_pixels:
                 oversized_tiles.append(
@@ -2556,6 +2653,7 @@ def _build_2x2_tile_manifest(
         "scale": [float(scale_x), float(scale_y)],
         "overlap_ratio": float(overlap_ratio),
         "tile_align": int(tile_align),
+        "resolution_snap_mode": normalized_snap_mode,
         "default_feather_px": int(feather_px),
         "tile_output_constraints": {
             "max_tile_pixels": int(max_tile_pixels),
@@ -2567,6 +2665,152 @@ def _build_2x2_tile_manifest(
         "split_plan": {
             "x_edges": [int(value) for value in x_edges],
             "y_edges": [int(value) for value in y_edges],
+        },
+        "tiles": tiles,
+    }
+    if extra:
+        manifest.update(extra)
+    return manifest
+
+
+def _build_rect_tile_manifest(
+    source_video: torch.Tensor,
+    target_w: int,
+    target_h: int,
+    overlap_ratio: float,
+    tile_align: int,
+    feather_px: int,
+    core_bboxes: list[list[int]],
+    *,
+    mode: str,
+    max_tile_pixels: int = DEFAULT_MAX_TILE_PIXELS,
+    enforce_tile_pixel_limit: bool = True,
+    resolution_snap_mode: str = "nearest",
+    extra: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    _frames, source_h, source_w, channels = source_video.shape
+    target_w = max(1, int(target_w))
+    target_h = max(1, int(target_h))
+    overlap_ratio = max(0.0, min(0.45, float(overlap_ratio)))
+    tile_align = max(1, int(tile_align))
+    normalized_snap_mode = str(resolution_snap_mode or "nearest").strip()
+    if normalized_snap_mode not in {"nearest", "ceil", "floor"}:
+        normalized_snap_mode = "nearest"
+    scale_x, scale_y = _validate_uniform_tile_scale(int(source_w), int(source_h), int(target_w), int(target_h))
+    max_tile_pixels = max(0, int(max_tile_pixels))
+    if not core_bboxes:
+        raise ValueError("manual tile layout produced no tiles.")
+    if len(core_bboxes) > MAX_TILES:
+        raise ValueError(f"manual tile layout supports at most {MAX_TILES} tiles.")
+
+    tiles: list[dict[str, Any]] = []
+    oversized_tiles: list[dict[str, Any]] = []
+    for tile_index, bbox in enumerate(core_bboxes):
+        core_x0, core_y0, core_x1, core_y1 = _clamp_bbox(tuple(int(value) for value in bbox), int(source_w), int(source_h))
+        core_w = max(1, core_x1 - core_x0)
+        core_h = max(1, core_y1 - core_y0)
+        overlap_x = int(math.ceil(core_w * overlap_ratio))
+        overlap_y = int(math.ceil(core_h * overlap_ratio))
+        crop_x0 = max(0, core_x0 - overlap_x)
+        crop_y0 = max(0, core_y0 - overlap_y)
+        crop_x1 = min(int(source_w), core_x1 + overlap_x)
+        crop_y1 = min(int(source_h), core_y1 + overlap_y)
+        target_crop_bbox = [
+            int(round(crop_x0 * scale_x)),
+            int(round(crop_y0 * scale_y)),
+            int(round(crop_x1 * scale_x)),
+            int(round(crop_y1 * scale_y)),
+        ]
+        target_core_bbox = [
+            int(round(core_x0 * scale_x)),
+            int(round(core_y0 * scale_y)),
+            int(round(core_x1 * scale_x)),
+            int(round(core_y1 * scale_y)),
+        ]
+        target_crop_w = max(1, target_crop_bbox[2] - target_crop_bbox[0])
+        target_crop_h = max(1, target_crop_bbox[3] - target_crop_bbox[1])
+        source_crop_w = max(1, crop_x1 - crop_x0)
+        source_crop_h = max(1, crop_y1 - crop_y0)
+        tile_generate_w = int(_align_to_step(target_crop_w, tile_align, normalized_snap_mode))
+        tile_generate_h = int(_align_to_step(target_crop_h, tile_align, normalized_snap_mode))
+        tile_generate_pixels = int(tile_generate_w * tile_generate_h)
+        if bool(enforce_tile_pixel_limit) and max_tile_pixels > 0 and tile_generate_pixels > max_tile_pixels:
+            oversized_tiles.append(
+                {
+                    "tile_number": tile_index + 1,
+                    "tile_generate_size": [int(tile_generate_w), int(tile_generate_h)],
+                    "tile_generate_pixels": int(tile_generate_pixels),
+                }
+            )
+        tiles.append(
+            {
+                "index": int(tile_index),
+                "tile_number": int(tile_index + 1),
+                "row": None,
+                "col": None,
+                "source_core_bbox": [int(core_x0), int(core_y0), int(core_x1), int(core_y1)],
+                "source_crop_bbox": [int(crop_x0), int(crop_y0), int(crop_x1), int(crop_y1)],
+                "source_core_size": [int(core_w), int(core_h)],
+                "source_crop_size": [int(source_crop_w), int(source_crop_h)],
+                "target_core_bbox": target_core_bbox,
+                "target_crop_bbox": target_crop_bbox,
+                "target_crop_size": [int(target_crop_w), int(target_crop_h)],
+                "tile_generate_size": [int(tile_generate_w), int(tile_generate_h)],
+                "tile_generate_pixels": int(tile_generate_pixels),
+                "tile_repaint_scale": [
+                    float(tile_generate_w / max(1, source_crop_w)),
+                    float(tile_generate_h / max(1, source_crop_h)),
+                ],
+                "target_composite_scale": [
+                    float(target_crop_w / max(1, source_crop_w)),
+                    float(target_crop_h / max(1, source_crop_h)),
+                ],
+                "tile_to_target_scale": [
+                    float(target_crop_w / max(1, tile_generate_w)),
+                    float(target_crop_h / max(1, tile_generate_h)),
+                ],
+                "aspect_ratio": float(tile_generate_w / max(1, tile_generate_h)),
+                "within_tile_pixel_limit": bool(max_tile_pixels <= 0 or tile_generate_pixels <= max_tile_pixels),
+                "overlap_px_source": [int(overlap_x), int(overlap_y)],
+            }
+        )
+
+    if oversized_tiles:
+        details = ", ".join(
+            f"tile {item['tile_number']}={item['tile_generate_size'][0]}x{item['tile_generate_size'][1]}"
+            f" ({item['tile_generate_pixels']} px)"
+            for item in oversized_tiles
+        )
+        raise ValueError(
+            f"Tile repaint resolution exceeds max_tile_pixels={max_tile_pixels}: {details}. "
+            "Resize the tile, reduce overlap_ratio, reduce scale_factor/output size, or raise max_tile_pixels."
+        )
+
+    manifest = {
+        "version": 1,
+        "mode": str(mode),
+        "source_shape": _shape(source_video),
+        "source_size": [int(source_w), int(source_h)],
+        "target_size": [int(target_w), int(target_h)],
+        "rows": None,
+        "cols": None,
+        "tile_count": len(tiles),
+        "scale_factor": float(target_w / max(1, int(source_w))),
+        "scale": [float(scale_x), float(scale_y)],
+        "overlap_ratio": float(overlap_ratio),
+        "tile_align": int(tile_align),
+        "resolution_snap_mode": normalized_snap_mode,
+        "default_feather_px": int(feather_px),
+        "tile_output_constraints": {
+            "max_tile_pixels": int(max_tile_pixels),
+            "max_tile_reference_resolution": "1280x720 pixels by default as total pixel budget",
+            "enforce_tile_pixel_limit": bool(enforce_tile_pixel_limit),
+            "uniform_final_scale_required": True,
+            "max_tiles": int(MAX_TILES),
+        },
+        "channels": int(channels),
+        "split_plan": {
+            "manual_rectangles": [tile["source_core_bbox"] for tile in tiles],
         },
         "tiles": tiles,
     }
@@ -4583,6 +4827,7 @@ class SCAIL2TilePlanBuilder:
                 "scale_factor": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 8.0, "step": 0.05}),
                 "overlap_ratio": ("FLOAT", {"default": 0.10, "min": 0.0, "max": 0.45, "step": 0.01}),
                 "tile_align": ("INT", {"default": 32, "min": 1, "max": 256, "step": 1}),
+                "resolution_snap_mode": (["nearest", "ceil", "floor"], {"default": "nearest"}),
                 "feather_px": ("INT", {"default": 48, "min": 0, "max": 512, "step": 1}),
                 "min_tile_ratio": ("FLOAT", {"default": 0.30, "min": 0.05, "max": 0.45, "step": 0.01}),
                 "protected_padding_ratio": ("FLOAT", {"default": 0.45, "min": 0.0, "max": 2.0, "step": 0.05}),
@@ -4616,6 +4861,7 @@ class SCAIL2TilePlanBuilder:
         scale_factor: float = 2.0,
         overlap_ratio: float = 0.10,
         tile_align: int = 32,
+        resolution_snap_mode: str = "nearest",
         feather_px: int = 48,
         min_tile_ratio: float = 0.30,
         protected_padding_ratio: float = 0.45,
@@ -4674,6 +4920,7 @@ class SCAIL2TilePlanBuilder:
             mode="2x2_face_safe_spatial_tile_upscale" if protected_region is not None else "2x2_spatial_tile_upscale",
             max_tile_pixels=int(max_tile_pixels),
             enforce_tile_pixel_limit=bool(enforce_tile_pixel_limit),
+            resolution_snap_mode=str(resolution_snap_mode),
         )
         tiles = manifest["tiles"]
 
@@ -4731,7 +4978,7 @@ class SCAIL2ManualTilePlanBuilder:
                     {
                         "default": '{"split_x":0.5,"split_y":0.5}',
                         "multiline": False,
-                        "tooltip": "Written by the visual tile editor. Normalized split_x/split_y define the four core tiles.",
+                        "tooltip": "Written by the visual tile editor. Supports normalized tiles or split_x/split_y fallback.",
                     },
                 ),
                 "output_width": ("INT", {"default": 0, "min": 0, "max": 8192, "step": 1}),
@@ -4739,6 +4986,7 @@ class SCAIL2ManualTilePlanBuilder:
                 "scale_factor": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 8.0, "step": 0.05}),
                 "overlap_ratio": ("FLOAT", {"default": 0.10, "min": 0.0, "max": 0.45, "step": 0.01}),
                 "tile_align": ("INT", {"default": 32, "min": 1, "max": 256, "step": 1}),
+                "resolution_snap_mode": (["nearest", "ceil", "floor"], {"default": "nearest"}),
                 "feather_px": ("INT", {"default": 48, "min": 0, "max": 512, "step": 1}),
                 "min_tile_ratio": ("FLOAT", {"default": 0.20, "min": 0.05, "max": 0.45, "step": 0.01}),
                 "max_tile_pixels": ("INT", {"default": DEFAULT_MAX_TILE_PIXELS, "min": 0, "max": 4096 * 4096, "step": 1024}),
@@ -4770,6 +5018,7 @@ class SCAIL2ManualTilePlanBuilder:
         scale_factor: float = 2.0,
         overlap_ratio: float = 0.10,
         tile_align: int = 32,
+        resolution_snap_mode: str = "nearest",
         feather_px: int = 48,
         min_tile_ratio: float = 0.20,
         max_tile_pixels: int = DEFAULT_MAX_TILE_PIXELS,
@@ -4784,36 +5033,31 @@ class SCAIL2ManualTilePlanBuilder:
         target_w = int(output_width) if int(output_width) > 0 else int(round(int(source_w) * scale))
         target_h = int(output_height) if int(output_height) > 0 else int(round(int(source_h) * scale))
         layout = _parse_manual_tile_layout(layout_json)
-        min_ratio = max(0.05, min(0.45, float(min_tile_ratio)))
-        split_x = max(min_ratio, min(1.0 - min_ratio, float(layout.get("split_x", 0.5))))
-        split_y = max(min_ratio, min(1.0 - min_ratio, float(layout.get("split_y", 0.5))))
-        split_x_px = max(1, min(int(source_w) - 1, int(round(float(source_w) * split_x))))
-        split_y_px = max(1, min(int(source_h) - 1, int(round(float(source_h) * split_y))))
-        x_edges = [0, int(split_x_px), int(source_w)]
-        y_edges = [0, int(split_y_px), int(source_h)]
-        manifest = _build_2x2_tile_manifest(
+        core_bboxes, normalized_layout = _manual_core_bboxes_from_layout(
+            layout,
+            int(source_w),
+            int(source_h),
+            float(min_tile_ratio),
+        )
+        manifest = _build_rect_tile_manifest(
             source_video,
             int(target_w),
             int(target_h),
             float(overlap_ratio),
             int(tile_align),
             int(feather_px),
-            x_edges,
-            y_edges,
-            mode="2x2_manual_spatial_tile_upscale",
+            core_bboxes,
+            mode="manual_rect_spatial_tile_upscale",
             max_tile_pixels=int(max_tile_pixels),
             enforce_tile_pixel_limit=bool(enforce_tile_pixel_limit),
+            resolution_snap_mode=str(resolution_snap_mode),
             extra={
                 "manual_layout": {
-                    **layout,
-                    "split_x": float(split_x),
-                    "split_y": float(split_y),
-                    "split_x_px": int(split_x_px),
-                    "split_y_px": int(split_y_px),
-                    "min_tile_ratio": float(min_ratio),
+                    **normalized_layout,
+                    "min_tile_ratio": float(max(0.01, min(0.45, float(min_tile_ratio)))),
                 },
                 "note": (
-                    "Manual tile layout: user chooses the core split lines in the front-end editor; "
+                    "Manual tile layout: user chooses core rectangles in the front-end editor; "
                     "the node adds overlap and aligned generation sizes automatically."
                 ),
             },
@@ -4848,7 +5092,7 @@ class SCAIL2TileExtractor:
             "required": {
                 "source_video": ("IMAGE",),
                 "tile_manifest": ("STRING", {"default": "", "multiline": True, "forceInput": True}),
-                "tile_index": ("INT", {"default": 1, "min": 1, "max": 4, "step": 1}),
+                "tile_index": ("INT", {"default": 1, "min": 1, "max": MAX_TILES, "step": 1}),
                 "reference_count": ("INT", {"default": 1, "min": 1, "max": MAX_REFERENCES, "step": 1}),
                 "image_resize_mode": (["bilinear", "bicubic", "nearest"], {"default": "bilinear"}),
                 "mask_resize_mode": (["nearest", "bilinear"], {"default": "nearest"}),
@@ -5009,28 +5253,31 @@ class SCAIL2TileExtractor:
 class SCAIL2TileRepaintCollector:
     @classmethod
     def INPUT_TYPES(cls):
+        optional = {f"tile_{index}_video": ("IMAGE",) for index in range(2, MAX_TILES + 1)}
         return {
             "required": {
                 "tile_manifest": ("STRING", {"default": "", "multiline": True, "forceInput": True}),
                 "tile_1_video": ("IMAGE",),
-                "tile_2_video": ("IMAGE",),
-                "tile_3_video": ("IMAGE",),
-                "tile_4_video": ("IMAGE",),
                 "max_tile_pixels": ("INT", {"default": DEFAULT_MAX_TILE_PIXELS, "min": 0, "max": 4096 * 4096, "step": 1024}),
                 "enforce_tile_pixel_limit": ("BOOLEAN", {"default": True}),
                 "expected_size_mismatch_mode": (["warn", "error", "ignore"], {"default": "warn"}),
                 "aspect_mismatch_mode": (["warn", "error", "ignore"], {"default": "warn"}),
                 "aspect_tolerance": ("FLOAT", {"default": 0.03, "min": 0.0, "max": 0.25, "step": 0.005}),
-            }
+            },
+            "optional": optional,
         }
 
-    RETURN_TYPES = ("STRING", "IMAGE", "IMAGE", "IMAGE", "IMAGE", "STRING")
+    RETURN_TYPES = ("STRING",) + ("IMAGE",) * MAX_TILES + ("STRING",)
     RETURN_NAMES = (
         "actual_tile_manifest",
         "tile_1_video",
         "tile_2_video",
         "tile_3_video",
         "tile_4_video",
+        "tile_5_video",
+        "tile_6_video",
+        "tile_7_video",
+        "tile_8_video",
         "tile_repaint_report",
     )
     FUNCTION = "collect"
@@ -5048,31 +5295,38 @@ class SCAIL2TileRepaintCollector:
         self,
         tile_manifest: str,
         tile_1_video: torch.Tensor,
-        tile_2_video: torch.Tensor,
-        tile_3_video: torch.Tensor,
-        tile_4_video: torch.Tensor,
         max_tile_pixels: int = DEFAULT_MAX_TILE_PIXELS,
         enforce_tile_pixel_limit: bool = True,
         expected_size_mismatch_mode: str = "warn",
         aspect_mismatch_mode: str = "warn",
         aspect_tolerance: float = 0.03,
+        **kwargs,
     ):
         manifest = _parse_tile_manifest(tile_manifest)
+        tile_count = int(manifest.get("tile_count", len(manifest.get("tiles", []))))
+        if tile_count < 1 or tile_count > MAX_TILES:
+            raise ValueError(f"tile_manifest tile_count must be between 1 and {MAX_TILES}.")
+        tile_videos = [tile_1_video]
+        for index in range(2, tile_count + 1):
+            video = kwargs.get(f"tile_{index}_video")
+            if video is None:
+                raise ValueError(f"tile_manifest requires tile_{index}_video, but it is not connected.")
+            tile_videos.append(video)
         actual_manifest = _augment_manifest_with_actual_tile_outputs(
             manifest,
-            [tile_1_video, tile_2_video, tile_3_video, tile_4_video],
+            tile_videos,
             int(max_tile_pixels),
             bool(enforce_tile_pixel_limit),
             str(expected_size_mismatch_mode),
             str(aspect_mismatch_mode),
             float(aspect_tolerance),
         )
+        passthrough = list(tile_videos)
+        while len(passthrough) < MAX_TILES:
+            passthrough.append(tile_videos[-1])
         return (
             json.dumps(actual_manifest, indent=2),
-            tile_1_video,
-            tile_2_video,
-            tile_3_video,
-            tile_4_video,
+            *passthrough,
             _tile_repaint_report(actual_manifest),
         )
 
@@ -5080,21 +5334,21 @@ class SCAIL2TileRepaintCollector:
 class SCAIL2TileCompositeVideo:
     @classmethod
     def INPUT_TYPES(cls):
+        optional = {
+            "base_video": ("IMAGE",),
+        }
+        for index in range(2, MAX_TILES + 1):
+            optional[f"tile_{index}_video"] = ("IMAGE",)
         return {
             "required": {
                 "tile_manifest": ("STRING", {"default": "", "multiline": True, "forceInput": True}),
                 "tile_1_video": ("IMAGE",),
-                "tile_2_video": ("IMAGE",),
-                "tile_3_video": ("IMAGE",),
-                "tile_4_video": ("IMAGE",),
                 "feather_px": ("INT", {"default": 48, "min": 0, "max": 512, "step": 1}),
                 "tile_fit_mode": (["stretch", "center_crop", "pad"], {"default": "stretch"}),
                 "frame_mismatch_mode": (["trim_to_shortest", "error"], {"default": "trim_to_shortest"}),
                 "color_correction": ("BOOLEAN", {"default": False}),
             },
-            "optional": {
-                "base_video": ("IMAGE",),
-            },
+            "optional": optional,
         }
 
     RETURN_TYPES = ("IMAGE", "STRING", "IMAGE")
@@ -5114,20 +5368,24 @@ class SCAIL2TileCompositeVideo:
         self,
         tile_manifest: str,
         tile_1_video: torch.Tensor,
-        tile_2_video: torch.Tensor,
-        tile_3_video: torch.Tensor,
-        tile_4_video: torch.Tensor,
         feather_px: int = 48,
         tile_fit_mode: str = "stretch",
         frame_mismatch_mode: str = "trim_to_shortest",
         color_correction: bool = False,
         base_video: Optional[torch.Tensor] = None,
+        **kwargs,
     ):
         manifest = _parse_tile_manifest(tile_manifest)
         tiles = manifest.get("tiles", [])
-        if len(tiles) != 4:
-            raise ValueError("SCAIL-2 Tile Composite Video currently requires a 2x2 manifest with 4 tiles.")
-        tile_videos = [tile_1_video, tile_2_video, tile_3_video, tile_4_video]
+        tile_count = int(manifest.get("tile_count", len(tiles)))
+        if tile_count < 1 or tile_count > MAX_TILES or len(tiles) != tile_count:
+            raise ValueError(f"SCAIL-2 Tile Composite Video requires a manifest with 1-{MAX_TILES} tiles.")
+        tile_videos = [tile_1_video]
+        for index in range(2, tile_count + 1):
+            video = kwargs.get(f"tile_{index}_video")
+            if video is None:
+                raise ValueError(f"tile_manifest requires tile_{index}_video, but it is not connected.")
+            tile_videos.append(video)
         for index, video in enumerate(tile_videos, start=1):
             if not isinstance(video, torch.Tensor) or video.ndim != 4:
                 raise ValueError(f"tile_{index}_video must be a ComfyUI IMAGE tensor.")
@@ -5205,10 +5463,8 @@ class SCAIL2TileCompositeVideo:
             "target_size": [int(target_w), int(target_h)],
             "output_shape": _shape(output),
             "input_frame_counts": {
-                "tile_1_video": int(frame_counts[0]),
-                "tile_2_video": int(frame_counts[1]),
-                "tile_3_video": int(frame_counts[2]),
-                "tile_4_video": int(frame_counts[3]),
+                f"tile_{index + 1}_video": int(count)
+                for index, count in enumerate(frame_counts)
             },
             "used_frame_count": int(frame_count),
             "frame_mismatch_mode": normalized_frame_mismatch_mode,

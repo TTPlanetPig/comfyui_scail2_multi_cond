@@ -226,8 +226,8 @@ intended workflow is:
 ```text
 first-pass SCAIL-2 frames
   -> SCAIL-2 Manual Tile Plan Builder
-  -> four SCAIL-2 Tile Extractor nodes, tile_index 1..4
-  -> four SCAIL-2 Scheduled Long Video / Internal SAM nodes
+  -> one SCAIL-2 Tile Extractor node per tile
+  -> one SCAIL-2 Scheduled Long Video / Internal SAM node per tile
   -> SCAIL-2 Tile Repaint Collector
   -> SCAIL-2 Tile Composite Video
   -> SCAIL-2 Head Track Crop
@@ -237,18 +237,32 @@ first-pass SCAIL-2 frames
 ```
 
 `SCAIL-2 Manual Tile Plan Builder` is the recommended creative workflow. It
-adds a front-end editor with draggable vertical and horizontal split lines. The
-split lines define the four core tiles; the node then adds `overlap_ratio`
-around each selected core region and writes the same `tile_manifest` consumed by
-`SCAIL-2 Tile Extractor`. The editor stores normalized `split_x` and `split_y`
-in `layout_json`, so the layout survives workflow save/load.
+adds a front-end editor with draggable tile rectangles. Move a rectangle to
+reposition a tile, drag its lower-right handle to resize it, and use the editor
+buttons to add/delete tiles or reset to a 2x2 layout. The node then adds
+`overlap_ratio` around each selected core region and writes the same
+`tile_manifest` consumed by `SCAIL-2 Tile Extractor`. The editor stores
+normalized `layout_json.tiles`, so the layout survives workflow save/load.
+
+The manual planner also accepts a `layout_json.tiles` array for non-2x2 layouts,
+up to eight tiles. Each item can use normalized `{x0,y0,x1,y1}` or `{x,y,w,h}`.
+This is the backend contract for a richer rectangle editor:
+
+```json
+{"tiles":[{"x0":0.0,"y0":0.0,"x1":0.62,"y1":0.55},{"x":0.45,"y":0.50,"w":0.55,"h":0.50}]}
+```
+
+Every tile is independently expanded by `overlap_ratio`; `tile_generate_size`
+is snapped to `tile_align` using `resolution_snap_mode` (`nearest`, `ceil`, or
+`floor`). This lets hand-drawn tiles have different aspect ratios while keeping
+the repaint sizes on model-friendly 32-pixel steps.
 
 Run the manual planner once to load preview frames into the editor. After it
 executes, the front-end panel shows a video frame preview plus a frame slider;
-drag the white split lines on a representative frame, then rerun the node to
-produce the updated `tile_manifest`. The preview is only for choosing the core
-split lines. Overlap, target crop boxes, and aligned generation sizes are still
-computed by the Python node so downstream stitching remains deterministic.
+adjust rectangles on a representative frame, then rerun the node to produce the
+updated `tile_manifest`. The preview is only for choosing core tile rectangles.
+Overlap, target crop boxes, and aligned generation sizes are still computed by
+the Python node so downstream stitching remains deterministic.
 
 `SCAIL-2 Tile Plan Builder` remains available for automatic planning. By
 default both tile planners target a 2x final canvas, so a `548x960` first pass
@@ -271,17 +285,20 @@ tile it lists:
 
 `max_tile_pixels` defaults to `921600`, equivalent to a `1280x720` pixel
 budget. With `enforce_tile_pixel_limit` enabled, the planner refuses to produce
-a manifest if any tile's repaint resolution exceeds that budget. Move the
-manual split lines, lower `overlap_ratio`, lower `scale_factor`, or raise
+a manifest if any tile's repaint resolution exceeds that budget. Resize or move
+manual tile rectangles, lower `overlap_ratio`, lower `scale_factor`, or raise
 `max_tile_pixels` before running the expensive repaint pass.
 
-After the four tile repaint passes finish, use `SCAIL-2 Tile Repaint Collector`
+After the tile repaint passes finish, use `SCAIL-2 Tile Repaint Collector`
 before compositing. It reads the actual generated video dimensions, recomputes
 the real source-crop -> repaint and repaint -> final-canvas scale for each tile,
 and outputs `actual_tile_manifest`. Connect that manifest to
 `SCAIL-2 Tile Composite Video.tile_manifest`. This handles cases where each tile
 comes back at a different valid resolution, as long as the collector's pixel and
 aspect checks pass.
+
+`SCAIL-2 Tile Repaint Collector` and `SCAIL-2 Tile Composite Video` support up
+to eight tile video inputs. Connect only the tile slots present in the manifest.
 
 For people videos, connect a face/head/person mask to
 `Tile Plan Builder.protected_masks`. The planner treats that mask as a protected
@@ -294,17 +311,17 @@ increase overlap, lower `min_tile_ratio`, or rely on the post-tile face-detail
 branch to make one final face pass.
 
 Use one `SCAIL-2 Tile Extractor` per tile. Connect the first-pass video, the
-shared `tile_manifest`, and set `tile_index` from 1 to 4. The extractor crops
-the motion video, optional pose mask, and up to eight references/reference masks
-with the same spatial region. Connect `tile_pose_video`, `tile_pose_video_mask`,
-and the `tile_reference_N` outputs to a normal scheduled SCAIL-2 node. Repeat
-for all four tiles.
+shared `tile_manifest`, and set `tile_index` from `1..tile_count`. The extractor
+crops the motion video, optional pose mask, and up to eight references/reference
+masks with the same spatial region. Connect `tile_pose_video`,
+`tile_pose_video_mask`, and the `tile_reference_N` outputs to a normal scheduled
+SCAIL-2 node. Repeat for every tile in the manifest.
 
-`SCAIL-2 Tile Composite Video` stitches the four generated tile videos back into
-the final canvas using feathered overlap weights. Keep `tile_fit_mode` at
-`stretch` for the default extractor output. If the four tile videos differ in
-length, `trim_to_shortest` drops only trailing mismatched frames; use `error`
-when debugging workflow alignment.
+`SCAIL-2 Tile Composite Video` stitches the generated tile videos back into the
+final canvas using feathered overlap weights. Keep `tile_fit_mode` at `stretch`
+for the default extractor output. If tile videos differ in length,
+`trim_to_shortest` drops only trailing mismatched frames; use `error` when
+debugging workflow alignment.
 
 For face quality, run the face-detail branch after tile compositing rather than
 before it:
