@@ -342,8 +342,9 @@ masks with the same spatial region. Connect `tile_pose_video`,
 SCAIL-2 node. Repeat for every tile in the manifest.
 
 `SCAIL-2 Tile Composite Video` stitches the generated tile videos back into the
-final canvas using feathered overlap weights. Keep `tile_fit_mode` at `stretch`
-for the default extractor output. If tile videos differ in length,
+final canvas with core-first feathering: overlap is primarily generation
+context, while only the core edge is softly blended into neighboring tiles.
+Keep `tile_fit_mode` at `stretch` for the default extractor output. If tile videos differ in length,
 `trim_to_shortest` drops only trailing mismatched frames; use `error` when
 debugging workflow alignment.
 

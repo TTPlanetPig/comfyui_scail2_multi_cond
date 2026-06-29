@@ -214,6 +214,10 @@ def main() -> None:
         "global_once_then_tile_crop" in inspect.getsource(nodes._build_tiled_global_sam_masks),
         "global SAM crop strategy marker missing",
     )
+    tile_weight_source = inspect.getsource(nodes._tile_weight_mask)
+    assert_true("outer * 0.5" not in tile_weight_source, "tile composite should not give the whole overlap crop fallback weight")
+    assert_true("expand_px=feather_px" not in tile_weight_source, "tile composite should not expand core across the whole overlap")
+    assert_true("blur_px=feather_px" in tile_weight_source, "tile composite should feather the core edge")
 
     print("smoke_tiled_nodes: ok")
 

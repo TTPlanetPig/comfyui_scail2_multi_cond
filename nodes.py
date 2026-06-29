@@ -3225,8 +3225,6 @@ def _tile_weight_mask(height: int, width: int, crop_bbox: list[int], core_bbox: 
     height = max(1, int(height))
     width = max(1, int(width))
     feather_px = max(0, int(feather_px))
-    if feather_px <= 0:
-        return torch.ones((height, width), dtype=torch.float32)
     x0, y0, _x1, _y1 = [int(value) for value in crop_bbox]
     cx0, cy0, cx1, cy1 = [int(value) for value in core_bbox]
     local_core = [
@@ -3235,19 +3233,12 @@ def _tile_weight_mask(height: int, width: int, crop_bbox: list[int], core_bbox: 
         max(0, min(width, cx1 - x0)),
         max(0, min(height, cy1 - y0)),
     ]
-    y = torch.arange(height, dtype=torch.float32).view(height, 1)
-    x = torch.arange(width, dtype=torch.float32).view(1, width)
     lx0, ly0, lx1, ly1 = local_core
-    left = ((x + 1.0) / max(1, feather_px)).clamp(0, 1)
-    top = ((y + 1.0) / max(1, feather_px)).clamp(0, 1)
-    right = ((width - x) / max(1, feather_px)).clamp(0, 1)
-    bottom = ((height - y) / max(1, feather_px)).clamp(0, 1)
-    outer = torch.minimum(torch.minimum(left, right), torch.minimum(top, bottom))
     core = torch.zeros((height, width), dtype=torch.float32)
     core[ly0:ly1, lx0:lx1] = 1.0
-    if feather_px > 0:
-        core = _binary_mask_morph(core.unsqueeze(0), expand_px=feather_px, blur_px=feather_px)[0]
-    return torch.maximum(core, outer * 0.5).clamp(0, 1)
+    if feather_px <= 0:
+        return core.clamp(0, 1)
+    return _binary_mask_morph(core.unsqueeze(0), blur_px=feather_px)[0].clamp(0, 1)
 
 
 class SCAIL2SegmentPlanner:
@@ -5755,6 +5746,12 @@ class SCAIL2TileCompositeVideo:
                     "tile_number": int(tile.get("tile_number", len(paste_events) + 1)),
                     "target_crop_bbox": [int(x0), int(y0), int(x1), int(y1)],
                     "target_core_bbox": core_bbox,
+                    "local_core_bbox_in_crop": [
+                        int(core_bbox[0] - x0),
+                        int(core_bbox[1] - y0),
+                        int(core_bbox[2] - x0),
+                        int(core_bbox[3] - y0),
+                    ],
                     "tile_generate_size": tile.get("tile_generate_size"),
                     "actual_tile_output_size": tile.get("actual_tile_output_size", [int(video.shape[2]), int(video.shape[1])]),
                     "tile_repaint_scale": tile.get("tile_repaint_scale"),
@@ -5782,6 +5779,7 @@ class SCAIL2TileCompositeVideo:
             "used_frame_count": int(frame_count),
             "frame_mismatch_mode": normalized_frame_mismatch_mode,
             "feather_px": int(feather_px),
+            "tile_weight_mode": "core_feather_overlap_context",
             "tile_fit_mode": normalized_tile_fit_mode,
             "color_correction": bool(color_correction and base_target is not None),
             "paste_events": paste_events,

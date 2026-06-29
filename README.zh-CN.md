@@ -272,6 +272,8 @@ manifest 会解析为 `1096x1920`，并在 `target_size_adjustment` 里记录请
 `tile_manifest`、原始 `segment_plan`、模型输入，以及和普通长视频节点相同的
 `reference_N` / mask 即可。节点内部会按 tile 自动裁切 `pose_video`、对应的
 `reference_N` 和 mask，再逐块调用长视频生成，最后自动拼合。
+拼合时使用 core 优先的 feather：overlap 主要作为生成上下文，不会整段大面积参与最终平均，
+只有 core 边缘会柔和过渡到相邻 tile。
 
 如果你想单独调试每一块，再使用 `SCAIL-2 Tile Extractor` 手动导出每块视频，
 分别生成后接 `SCAIL-2 Tile Repaint Collector` 和 `SCAIL-2 Tile Composite Video`。
