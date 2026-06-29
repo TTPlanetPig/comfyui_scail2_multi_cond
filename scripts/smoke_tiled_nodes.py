@@ -88,6 +88,35 @@ def main() -> None:
         assert_true(width % 32 == 0 and height % 32 == 0, f"tile size not aligned: {width}x{height}")
         assert_true(width * height <= nodes.DEFAULT_MAX_TILE_PIXELS, f"tile over default budget: {width}x{height}")
 
+    gappy_manual_layout = [[0, 0, 250, 960], [320, 0, 548, 960]]
+    gappy_coverage = nodes._manual_tile_coverage_gaps(gappy_manual_layout, 548, 960)
+    assert_true(gappy_coverage["gaps"] == [[250, 0, 320, 960]], "manual coverage gap detection changed")
+    filled_layout, fill_info, auto_filled_from = nodes._apply_manual_tile_coverage_policy(
+        gappy_manual_layout,
+        548,
+        960,
+        0.20,
+        "auto_fill",
+    )
+    filled_coverage = nodes._manual_tile_coverage_gaps(filled_layout, 548, 960)
+    assert_true(auto_filled_from == 2, "auto_fill should append filler tiles after user tiles")
+    assert_true(fill_info["auto_filled_tile_count"] == 1, "auto_fill did not report one filler tile")
+    assert_true(filled_coverage["gaps"] == [], "auto_fill did not cover manual tile gap")
+    assert_raises(
+        "leaves uncovered source areas",
+        lambda: nodes._apply_manual_tile_coverage_policy(gappy_manual_layout, 548, 960, 0.20, "error"),
+    )
+    ignored_layout, ignore_info, ignored_from = nodes._apply_manual_tile_coverage_policy(
+        gappy_manual_layout,
+        548,
+        960,
+        0.20,
+        "ignore",
+    )
+    assert_true(ignored_layout == gappy_manual_layout, "ignore policy should preserve gappy manual layout")
+    assert_true(ignored_from is None, "ignore policy should not mark auto-filled tiles")
+    assert_true(ignore_info["uncovered_after"]["uncovered_gap_count"] == 1, "ignore policy should report remaining gap")
+
     warnings = nodes._validate_tiled_long_video_manifest(
         manifest,
         FakeVideo(),

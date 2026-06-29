@@ -485,6 +485,15 @@ function manualTileAlign(node) {
     return Math.max(1, Math.min(256, Math.round(Number(widget?.value ?? 32))));
 }
 
+function manualTileSnapThreshold(node, axis) {
+    const sourceSize = manualTileSourceSize(node);
+    const dimension = axis === "x" ? sourceSize?.width : sourceSize?.height;
+    if (Number(dimension) > 1) {
+        return Math.max(0.002, Math.min(0.04, 12 / Number(dimension)));
+    }
+    return 0.015;
+}
+
 function manualTileSourceSize(node) {
     const previewSize = node.scailManualTilePreview?.source_size;
     if (Array.isArray(previewSize) && Number(previewSize[0]) > 0 && Number(previewSize[1]) > 0) {
@@ -582,6 +591,163 @@ function manualTilesFromSplit(node, splitX = 0.5, splitY = 0.5) {
         normalizeManualTileRect(node, { x0: 0, y0: y, x1: x, y1: 1 }),
         normalizeManualTileRect(node, { x0: x, y0: y, x1: 1, y1: 1 }),
     ];
+}
+
+function manualTileEdgeValues(tiles, skipIndex, axis) {
+    const keys = axis === "x" ? ["x0", "x1"] : ["y0", "y1"];
+    const values = [0, 1];
+    for (const [index, tile] of tiles.entries()) {
+        if (index === skipIndex) {
+            continue;
+        }
+        values.push(Number(tile[keys[0]]), Number(tile[keys[1]]));
+    }
+    return values.filter((value) => Number.isFinite(value)).sort((a, b) => a - b);
+}
+
+function snapManualTileEdge(value, edges, threshold) {
+    let best = Number(value);
+    let bestDelta = Number.POSITIVE_INFINITY;
+    for (const edge of edges) {
+        const delta = Math.abs(Number(value) - Number(edge));
+        if (delta <= threshold && delta < bestDelta) {
+            best = Number(edge);
+            bestDelta = delta;
+        }
+    }
+    return best;
+}
+
+function snapManualTileMove(node, tile, tiles, tileIndex) {
+    const next = { ...tile };
+    for (const axis of ["x", "y"]) {
+        const minKey = axis === "x" ? "x0" : "y0";
+        const maxKey = axis === "x" ? "x1" : "y1";
+        const edges = manualTileEdgeValues(tiles, tileIndex, axis);
+        const threshold = manualTileSnapThreshold(node, axis);
+        const candidates = [
+            snapManualTileEdge(next[minKey], edges, threshold) - next[minKey],
+            snapManualTileEdge(next[maxKey], edges, threshold) - next[maxKey],
+        ];
+        const delta = candidates.reduce(
+            (best, item) => (Math.abs(item) < Math.abs(best) ? item : best),
+            candidates[0]
+        );
+        if (Math.abs(delta) > 0 && Math.abs(delta) <= threshold) {
+            const span = next[maxKey] - next[minKey];
+            let start = next[minKey] + delta;
+            start = Math.max(0, Math.min(1 - span, start));
+            next[minKey] = start;
+            next[maxKey] = start + span;
+        }
+    }
+    return next;
+}
+
+function snapManualTileResize(node, tile, tiles, tileIndex) {
+    const next = { ...tile };
+    next.x1 = snapManualTileEdge(next.x1, manualTileEdgeValues(tiles, tileIndex, "x"), manualTileSnapThreshold(node, "x"));
+    next.y1 = snapManualTileEdge(next.y1, manualTileEdgeValues(tiles, tileIndex, "y"), manualTileSnapThreshold(node, "y"));
+    return next;
+}
+
+function uniqueSortedManualEdges(values) {
+    const sorted = values
+        .map((value) => roundRatio(value))
+        .filter((value) => Number.isFinite(value))
+        .sort((a, b) => a - b);
+    const result = [];
+    for (const value of sorted) {
+        if (!result.length || Math.abs(value - result[result.length - 1]) > 1e-6) {
+            result.push(value);
+        }
+    }
+    return result;
+}
+
+function analyzeManualTileCoverage(tiles) {
+    const normalizedTiles = (Array.isArray(tiles) ? tiles : []).map((tile) => ({
+        x0: clampNumber(tile.x0, 0, 1),
+        y0: clampNumber(tile.y0, 0, 1),
+        x1: clampNumber(tile.x1, 0, 1),
+        y1: clampNumber(tile.y1, 0, 1),
+    }));
+    const xEdges = uniqueSortedManualEdges([0, 1, ...normalizedTiles.flatMap((tile) => [tile.x0, tile.x1])]);
+    const yEdges = uniqueSortedManualEdges([0, 1, ...normalizedTiles.flatMap((tile) => [tile.y0, tile.y1])]);
+    const rowRuns = [];
+    let uncoveredArea = 0;
+    for (let yIndex = 0; yIndex < yEdges.length - 1; yIndex += 1) {
+        const y0 = yEdges[yIndex];
+        const y1 = yEdges[yIndex + 1];
+        if (y1 - y0 <= 1e-6) {
+            continue;
+        }
+        let run = null;
+        for (let xIndex = 0; xIndex < xEdges.length - 1; xIndex += 1) {
+            const x0 = xEdges[xIndex];
+            const x1 = xEdges[xIndex + 1];
+            if (x1 - x0 <= 1e-6) {
+                continue;
+            }
+            const cx = (x0 + x1) / 2;
+            const cy = (y0 + y1) / 2;
+            const covered = normalizedTiles.some(
+                (tile) => cx >= tile.x0 - 1e-6 && cx <= tile.x1 + 1e-6 && cy >= tile.y0 - 1e-6 && cy <= tile.y1 + 1e-6
+            );
+            if (covered) {
+                if (run) {
+                    rowRuns.push(run);
+                    run = null;
+                }
+                continue;
+            }
+            uncoveredArea += (x1 - x0) * (y1 - y0);
+            if (run && Math.abs(run.x1 - x0) <= 1e-6) {
+                run.x1 = x1;
+            } else {
+                if (run) {
+                    rowRuns.push(run);
+                }
+                run = { x0, y0, x1, y1 };
+            }
+        }
+        if (run) {
+            rowRuns.push(run);
+        }
+    }
+
+    const gaps = [];
+    const activeBySpan = new Map();
+    const sortedRuns = rowRuns
+        .slice()
+        .sort((a, b) => a.x0 - b.x0 || a.x1 - b.x1 || a.y0 - b.y0 || a.y1 - b.y1);
+    for (const run of sortedRuns) {
+        const key = `${run.x0}:${run.x1}`;
+        const previous = activeBySpan.get(key);
+        if (
+            previous &&
+            Math.abs(previous.x0 - run.x0) <= 1e-6 &&
+            Math.abs(previous.x1 - run.x1) <= 1e-6 &&
+            Math.abs(previous.y1 - run.y0) <= 1e-6
+        ) {
+            previous.y1 = run.y1;
+        } else {
+            const gap = { ...run };
+            gaps.push(gap);
+            activeBySpan.set(key, gap);
+        }
+    }
+    gaps.sort((a, b) => (b.x1 - b.x0) * (b.y1 - b.y0) - (a.x1 - a.x0) * (a.y1 - a.y0));
+    return {
+        gaps: gaps.map((gap) => ({
+            x0: roundRatio(gap.x0),
+            y0: roundRatio(gap.y0),
+            x1: roundRatio(gap.x1),
+            y1: roundRatio(gap.y1),
+        })),
+        uncoveredArea,
+        uncoveredRatio: uncoveredArea,
+    };
 }
 
 function parseManualTileLayout(node) {
@@ -779,6 +945,7 @@ function renderManualTileEditor(node) {
     const sourceSize = manualTileSourceSize(node);
     const selectedPixelRect = manualTilePixelRect(node, tiles[selectedIndex]);
     const align = manualTileAlign(node);
+    const coverage = analyzeManualTileCoverage(tiles);
     const stageHeight = Math.max(180, Math.min(420, Math.round(260 * aspect)));
     const editorHeight = stageHeight + (previewItems.length > 1 ? 150 : 118);
     node.scailManualTileEditorHeight = editorHeight;
@@ -841,6 +1008,23 @@ function renderManualTileEditor(node) {
         stage.append(empty);
     }
 
+    for (const gap of coverage.gaps) {
+        const overlay = document.createElement("div");
+        overlay.title = "Uncovered area";
+        overlay.style.cssText = [
+            "position:absolute",
+            "box-sizing:border-box",
+            "left:" + gap.x0 * 100 + "%",
+            "top:" + gap.y0 * 100 + "%",
+            "width:" + Math.max(0.1, (gap.x1 - gap.x0) * 100) + "%",
+            "height:" + Math.max(0.1, (gap.y1 - gap.y0) * 100) + "%",
+            "background:rgba(239,68,68,.30)",
+            "border:1px dashed rgba(254,202,202,.85)",
+            "pointer-events:none",
+        ].join(";");
+        stage.append(overlay);
+    }
+
     const pointFromEvent = (event) => {
         const rect = stage.getBoundingClientRect();
         return {
@@ -881,6 +1065,7 @@ function renderManualTileEditor(node) {
                     x1: startTile.x1 + dx,
                     y1: startTile.y1 + dy,
                 };
+                nextTile = snapManualTileResize(node, nextTile, startTiles, tileIndex);
             } else {
                 const width = startTile.x1 - startTile.x0;
                 const height = startTile.y1 - startTile.y0;
@@ -894,8 +1079,10 @@ function renderManualTileEditor(node) {
                     x1: x0 + width,
                     y1: y0 + height,
                 };
+                nextTile = snapManualTileMove(node, nextTile, startTiles, tileIndex);
             }
             nextTiles[tileIndex] = normalizeManualTileRect(node, nextTile);
+            node.scailManualTileFillMessage = "";
             writeManualTileLayout(node, nextTiles, tileIndex);
             setRegionTileStyle(regionElement, nextTiles[tileIndex]);
             scheduleCanvas(node);
@@ -992,14 +1179,48 @@ function renderManualTileEditor(node) {
         const height = Math.max(0.2, Math.min(0.5, base.y1 - base.y0));
         const x0 = Math.min(1 - width, Math.max(0, base.x0 + offset));
         const y0 = Math.min(1 - height, Math.max(0, base.y0 + offset));
+        node.scailManualTileFillMessage = "";
         setManualTileTiles(node, [...tiles, { x0, y0, x1: x0 + width, y1: y0 + height }], tiles.length);
     }, tiles.length >= MAX_TILES);
     const remove = createManualTileButton("Delete", () => {
         const nextTiles = tiles.filter((_tile, index) => index !== selectedIndex);
+        node.scailManualTileFillMessage = "";
         setManualTileTiles(node, nextTiles, Math.max(0, selectedIndex - 1));
     }, tiles.length <= 1);
-    const reset = createManualTileButton("Reset 2x2", () => setManualTileLayout(node, 0.5, 0.5));
-    actions.append(add, remove, reset);
+    const fillGaps = createManualTileButton("Fill gaps", () => {
+        const nextTiles = tiles.map((tile) => ({ ...tile }));
+        const additions = [];
+        let latest = analyzeManualTileCoverage(nextTiles);
+        while (latest.gaps.length && nextTiles.length < MAX_TILES) {
+            const previousArea = latest.uncoveredArea;
+            const addition = normalizeManualTileRect(node, latest.gaps[0]);
+            nextTiles.push(addition);
+            const nextCoverage = analyzeManualTileCoverage(nextTiles);
+            if (nextCoverage.uncoveredArea >= previousArea - 1e-8) {
+                nextTiles.pop();
+                break;
+            }
+            additions.push(addition);
+            latest = nextCoverage;
+        }
+        if (!additions.length) {
+            node.scailManualTileFillMessage = latest.gaps.length
+                ? `Need ${latest.gaps.length} more tile(s), but max is ${MAX_TILES}.`
+                : "No uncovered areas.";
+            renderManualTileEditor(node);
+            return;
+        }
+        const remaining = latest.gaps.length;
+        node.scailManualTileFillMessage = remaining
+            ? `Filled ${additions.length}; ${remaining} uncovered gap(s) remain because max is ${MAX_TILES}.`
+            : `Filled ${additions.length} uncovered gap(s).`;
+        setManualTileTiles(node, nextTiles, tiles.length);
+    }, !coverage.gaps.length || tiles.length >= MAX_TILES);
+    const reset = createManualTileButton("Reset 2x2", () => {
+        node.scailManualTileFillMessage = "";
+        setManualTileLayout(node, 0.5, 0.5);
+    });
+    actions.append(add, remove, fillGaps, reset);
     controls.append(note, actions);
 
     const status = document.createElement("div");
@@ -1008,7 +1229,11 @@ function renderManualTileEditor(node) {
     const selectedLabel = selectedPixelRect
         ? `T${selectedIndex + 1}: x${selectedPixelRect.x0}, y${selectedPixelRect.y0}, ${selectedPixelRect.width}x${selectedPixelRect.height}`
         : `T${selectedIndex + 1}`;
-    status.textContent = `${sourceLabel} / ${selectedLabel} / max ${MAX_TILES} tiles`;
+    const coverageLabel = coverage.gaps.length
+        ? `${coverage.gaps.length} uncovered gap(s), ${(coverage.uncoveredRatio * 100).toFixed(2)}%`
+        : "covered";
+    const fillMessage = node.scailManualTileFillMessage ? ` / ${node.scailManualTileFillMessage}` : "";
+    status.textContent = `${sourceLabel} / ${selectedLabel} / ${coverageLabel} / max ${MAX_TILES} tiles${fillMessage}`;
 
     if (previewItems.length > 1) {
         const frameControl = document.createElement("div");

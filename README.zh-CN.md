@@ -45,7 +45,7 @@ python3 -B scripts/smoke_tiled_nodes.py
 node scripts/smoke_manual_tile_editor.mjs
 ```
 
-这些测试不跑真实模型推理，只验证节点注册、7 块 tile manifest、32 像素对齐、像素预算拒绝、外置 mask / 内置 SAM 输入差异、“全局 SAM 一次后按 tile 裁切”的策略，以及手动 tile 编辑器的拖拽和高度保护没有被改坏。
+这些测试不跑真实模型推理，只验证节点注册、7 块 tile manifest、32 像素对齐、像素预算拒绝、外置 mask / 内置 SAM 输入差异、“全局 SAM 一次后按 tile 裁切”的策略，以及手动 tile 编辑器的拖拽、高度保护、漏区补块和边缘吸附没有被改坏。
 
 ## 基础长视频节点
 

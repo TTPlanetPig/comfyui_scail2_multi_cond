@@ -2315,6 +2315,237 @@ def _manual_core_bboxes_from_layout(
     }
 
 
+def _manual_tile_entries_from_bboxes(
+    core_bboxes: list[list[int]],
+    source_w: int,
+    source_h: int,
+    auto_filled_from: Optional[int] = None,
+) -> list[dict[str, Any]]:
+    source_w = max(1, int(source_w))
+    source_h = max(1, int(source_h))
+    entries: list[dict[str, Any]] = []
+    for index, bbox in enumerate(core_bboxes):
+        x0, y0, x1, y1 = _clamp_bbox(tuple(int(value) for value in bbox), source_w, source_h)
+        item = {
+            "tile_number": int(index + 1),
+            "x0": float(x0 / source_w),
+            "y0": float(y0 / source_h),
+            "x1": float(x1 / source_w),
+            "y1": float(y1 / source_h),
+            "source_core_bbox": [int(x0), int(y0), int(x1), int(y1)],
+        }
+        if auto_filled_from is not None and index >= int(auto_filled_from):
+            item["auto_filled"] = True
+        entries.append(item)
+    return entries
+
+
+def _manual_tile_coverage_gaps(
+    core_bboxes: list[list[int]],
+    source_w: int,
+    source_h: int,
+) -> dict[str, Any]:
+    source_w = max(1, int(source_w))
+    source_h = max(1, int(source_h))
+    clamped_bboxes = [
+        list(_clamp_bbox(tuple(int(value) for value in bbox), source_w, source_h))
+        for bbox in core_bboxes
+    ]
+    x_edges = sorted({0, source_w, *(edge for bbox in clamped_bboxes for edge in (bbox[0], bbox[2]))})
+    y_edges = sorted({0, source_h, *(edge for bbox in clamped_bboxes for edge in (bbox[1], bbox[3]))})
+    row_runs: list[list[int]] = []
+    uncovered_pixels = 0
+
+    for y_index in range(len(y_edges) - 1):
+        y0 = int(y_edges[y_index])
+        y1 = int(y_edges[y_index + 1])
+        if y1 <= y0:
+            continue
+        run: Optional[list[int]] = None
+        for x_index in range(len(x_edges) - 1):
+            x0 = int(x_edges[x_index])
+            x1 = int(x_edges[x_index + 1])
+            if x1 <= x0:
+                continue
+            cx = (x0 + x1) / 2.0
+            cy = (y0 + y1) / 2.0
+            covered = any(
+                cx >= bbox[0] and cx <= bbox[2] and cy >= bbox[1] and cy <= bbox[3]
+                for bbox in clamped_bboxes
+            )
+            if covered:
+                if run is not None:
+                    row_runs.append(run)
+                    run = None
+                continue
+            uncovered_pixels += int((x1 - x0) * (y1 - y0))
+            if run is not None and run[2] == x0:
+                run[2] = x1
+            else:
+                if run is not None:
+                    row_runs.append(run)
+                run = [x0, y0, x1, y1]
+        if run is not None:
+            row_runs.append(run)
+
+    gaps: list[list[int]] = []
+    active_by_span: dict[tuple[int, int], list[int]] = {}
+    for run in sorted(row_runs, key=lambda item: (item[0], item[2], item[1], item[3])):
+        key = (int(run[0]), int(run[2]))
+        previous = active_by_span.get(key)
+        if previous is not None and previous[3] == run[1]:
+            previous[3] = int(run[3])
+        else:
+            gap = [int(value) for value in run]
+            gaps.append(gap)
+            active_by_span[key] = gap
+
+    gaps.sort(key=lambda bbox: (bbox[2] - bbox[0]) * (bbox[3] - bbox[1]), reverse=True)
+    total_pixels = max(1, int(source_w * source_h))
+    return {
+        "gaps": gaps,
+        "uncovered_pixels": int(uncovered_pixels),
+        "uncovered_ratio": float(uncovered_pixels / total_pixels),
+    }
+
+
+def _manual_tile_coverage_summary(coverage: dict[str, Any]) -> dict[str, Any]:
+    gaps = coverage.get("gaps", [])
+    normalized_gaps = [[int(value) for value in gap] for gap in gaps if isinstance(gap, list) and len(gap) == 4]
+    return {
+        "uncovered_gap_count": int(len(normalized_gaps)),
+        "uncovered_pixels": int(coverage.get("uncovered_pixels", 0)),
+        "uncovered_ratio": float(coverage.get("uncovered_ratio", 0.0)),
+        "uncovered_source_bboxes": normalized_gaps,
+    }
+
+
+def _expand_manual_gap_to_min_tile(
+    bbox: list[int],
+    source_w: int,
+    source_h: int,
+    min_w: int,
+    min_h: int,
+) -> list[int]:
+    source_w = max(1, int(source_w))
+    source_h = max(1, int(source_h))
+    x0, y0, x1, y1 = _clamp_bbox(tuple(int(value) for value in bbox), source_w, source_h)
+
+    def expand_axis(start: int, end: int, size: int, minimum: int) -> tuple[int, int]:
+        size = max(1, int(size))
+        minimum = max(1, min(size, int(minimum)))
+        if end - start >= minimum:
+            return int(start), int(end)
+        center = (start + end) / 2.0
+        new_start = int(round(center - minimum / 2.0))
+        new_end = int(new_start + minimum)
+        if new_start < 0:
+            new_end -= new_start
+            new_start = 0
+        if new_end > size:
+            new_start -= new_end - size
+            new_end = size
+        return int(max(0, new_start)), int(min(size, new_end))
+
+    x0, x1 = expand_axis(int(x0), int(x1), source_w, min_w)
+    y0, y1 = expand_axis(int(y0), int(y1), source_h, min_h)
+    return [int(x0), int(y0), int(x1), int(y1)]
+
+
+def _fill_manual_tile_gaps(
+    core_bboxes: list[list[int]],
+    source_w: int,
+    source_h: int,
+    min_tile_ratio: float,
+) -> tuple[list[list[int]], dict[str, Any]]:
+    source_w = max(1, int(source_w))
+    source_h = max(1, int(source_h))
+    min_ratio = max(0.01, min(0.45, float(min_tile_ratio)))
+    min_w = max(1, int(round(source_w * min_ratio)))
+    min_h = max(1, int(round(source_h * min_ratio)))
+    filled = [
+        list(_clamp_bbox(tuple(int(value) for value in bbox), source_w, source_h))
+        for bbox in core_bboxes
+    ]
+    before = _manual_tile_coverage_gaps(filled, source_w, source_h)
+    added: list[list[int]] = []
+    current = before
+
+    while current["gaps"] and len(filled) < MAX_TILES:
+        gap = current["gaps"][0]
+        addition = _expand_manual_gap_to_min_tile(gap, source_w, source_h, min_w, min_h)
+        if addition in filled:
+            break
+        filled.append(addition)
+        added.append(addition)
+        current = _manual_tile_coverage_gaps(filled, source_w, source_h)
+
+    after = _manual_tile_coverage_gaps(filled, source_w, source_h)
+    return filled, {
+        "coverage_policy": "auto_fill",
+        "uncovered_before": _manual_tile_coverage_summary(before),
+        "uncovered_after": _manual_tile_coverage_summary(after),
+        "auto_filled_tile_count": int(len(added)),
+        "auto_filled_source_core_bboxes": added,
+    }
+
+
+def _apply_manual_tile_coverage_policy(
+    core_bboxes: list[list[int]],
+    source_w: int,
+    source_h: int,
+    min_tile_ratio: float,
+    coverage_policy: str,
+) -> tuple[list[list[int]], dict[str, Any], Optional[int]]:
+    policy = str(coverage_policy or "auto_fill").strip().lower()
+    if policy not in {"auto_fill", "error", "ignore"}:
+        policy = "auto_fill"
+
+    original = [
+        list(_clamp_bbox(tuple(int(value) for value in bbox), int(source_w), int(source_h)))
+        for bbox in core_bboxes
+    ]
+    before = _manual_tile_coverage_gaps(original, int(source_w), int(source_h))
+    if not before["gaps"]:
+        summary = _manual_tile_coverage_summary(before)
+        return original, {
+            "coverage_policy": policy,
+            "uncovered_before": summary,
+            "uncovered_after": summary,
+            "auto_filled_tile_count": 0,
+            "auto_filled_source_core_bboxes": [],
+        }, None
+
+    if policy == "error":
+        summary = _manual_tile_coverage_summary(before)
+        raise ValueError(
+            "Manual tile layout leaves uncovered source areas: "
+            f"{summary['uncovered_gap_count']} gap(s), {summary['uncovered_pixels']} px. "
+            "Move/resize tiles, click Fill gaps in the editor, or set coverage_policy to auto_fill/ignore."
+        )
+
+    if policy == "ignore":
+        summary = _manual_tile_coverage_summary(before)
+        return original, {
+            "coverage_policy": policy,
+            "uncovered_before": summary,
+            "uncovered_after": summary,
+            "auto_filled_tile_count": 0,
+            "auto_filled_source_core_bboxes": [],
+        }, None
+
+    filled, fill_info = _fill_manual_tile_gaps(original, int(source_w), int(source_h), float(min_tile_ratio))
+    after = fill_info["uncovered_after"]
+    if int(after["uncovered_gap_count"]) > 0:
+        raise ValueError(
+            "Manual tile layout still leaves uncovered source areas after auto_fill: "
+            f"{after['uncovered_gap_count']} gap(s), {after['uncovered_pixels']} px. "
+            f"The planner supports at most {MAX_TILES} tiles; cover larger regions or delete extra small tiles."
+        )
+    auto_filled_from = len(original) if int(fill_info["auto_filled_tile_count"]) > 0 else None
+    return filled, fill_info, auto_filled_from
+
+
 def _validate_uniform_tile_scale(source_w: int, source_h: int, target_w: int, target_h: int) -> tuple[float, float]:
     scale_x = float(target_w) / max(1.0, float(source_w))
     scale_y = float(target_h) / max(1.0, float(source_h))
@@ -4989,6 +5220,7 @@ class SCAIL2ManualTilePlanBuilder:
                 "resolution_snap_mode": (["nearest", "ceil", "floor"], {"default": "nearest"}),
                 "feather_px": ("INT", {"default": 48, "min": 0, "max": 512, "step": 1}),
                 "min_tile_ratio": ("FLOAT", {"default": 0.20, "min": 0.05, "max": 0.45, "step": 0.01}),
+                "coverage_policy": (["auto_fill", "error", "ignore"], {"default": "auto_fill"}),
                 "max_tile_pixels": ("INT", {"default": DEFAULT_MAX_TILE_PIXELS, "min": 0, "max": 4096 * 4096, "step": 1024}),
                 "enforce_tile_pixel_limit": ("BOOLEAN", {"default": True}),
                 "preview_frame_count": ("INT", {"default": 8, "min": 1, "max": 24, "step": 1}),
@@ -5021,6 +5253,7 @@ class SCAIL2ManualTilePlanBuilder:
         resolution_snap_mode: str = "nearest",
         feather_px: int = 48,
         min_tile_ratio: float = 0.20,
+        coverage_policy: str = "auto_fill",
         max_tile_pixels: int = DEFAULT_MAX_TILE_PIXELS,
         enforce_tile_pixel_limit: bool = True,
         preview_frame_count: int = 8,
@@ -5039,6 +5272,19 @@ class SCAIL2ManualTilePlanBuilder:
             int(source_h),
             float(min_tile_ratio),
         )
+        core_bboxes, coverage_info, auto_filled_from = _apply_manual_tile_coverage_policy(
+            core_bboxes,
+            int(source_w),
+            int(source_h),
+            float(min_tile_ratio),
+            str(coverage_policy),
+        )
+        normalized_layout = {
+            **normalized_layout,
+            "tiles": _manual_tile_entries_from_bboxes(core_bboxes, int(source_w), int(source_h), auto_filled_from),
+            "tile_count": int(len(core_bboxes)),
+            "coverage": coverage_info,
+        }
         manifest = _build_rect_tile_manifest(
             source_video,
             int(target_w),
@@ -5055,6 +5301,7 @@ class SCAIL2ManualTilePlanBuilder:
                 "manual_layout": {
                     **normalized_layout,
                     "min_tile_ratio": float(max(0.01, min(0.45, float(min_tile_ratio)))),
+                    "coverage_policy": str(coverage_policy or "auto_fill"),
                 },
                 "note": (
                     "Manual tile layout: user chooses core rectangles in the front-end editor; "

@@ -48,5 +48,10 @@ assert(
     /window\.addEventListener\("pointermove", apply, true\)/.test(manualEditorSource),
     "manual tile drag should listen during capture phase"
 );
+assert(/function analyzeManualTileCoverage/.test(source), "manual tile editor should analyze uncovered areas");
+assert(/Uncovered area/.test(manualEditorSource), "manual tile editor should show uncovered area overlays");
+assert(/Fill gaps/.test(manualEditorSource), "manual tile editor should expose Fill gaps action");
+assert(/snapManualTileMove/.test(source), "manual tile editor should snap moved tiles");
+assert(/snapManualTileResize/.test(source), "manual tile editor should snap resized tiles");
 
 console.log("smoke_manual_tile_editor: ok");

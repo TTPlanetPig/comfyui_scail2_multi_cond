@@ -236,8 +236,12 @@ first-pass SCAIL-2 frames
 `SCAIL-2 Manual Tile Plan Builder` is the recommended creative workflow. It
 adds a front-end editor with draggable tile rectangles. Move a rectangle to
 reposition a tile, drag its lower-right handle to resize it, and use the editor
-buttons to add/delete tiles or reset to a 2x2 layout. The node then adds
-`overlap_ratio` around each selected core region and writes the same
+buttons to add/delete tiles, fill uncovered gaps, or reset to a 2x2 layout.
+The editor highlights uncovered source areas and snaps tile edges to the canvas
+or neighboring tile edges while moving/resizing. The Python node defaults to
+`coverage_policy=auto_fill`, so gappy hand-written layouts are completed before
+manifest generation unless you switch the policy to `error` or `ignore`.
+The node then adds `overlap_ratio` around each selected core region and writes the same
 `tile_manifest` consumed by `SCAIL-2 Tile Extractor`. The editor stores
 normalized `layout_json.tiles`, so the layout survives workflow save/load.
 
@@ -550,7 +554,7 @@ node scripts/smoke_manual_tile_editor.mjs
 These tests do not run model inference. They verify node registration, 7-tile
 manifest planning, 32-pixel tile alignment, pixel-budget rejection, external
 mask vs. internal SAM inputs, the global-SAM-then-tile-crop strategy, and the
-manual tile editor drag/height safeguards.
+manual tile editor drag/height, gap-fill, and edge-snapping safeguards.
 
 ## Included Workflows
 
