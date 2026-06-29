@@ -5480,6 +5480,815 @@ class SCAIL2TileCompositeVideo:
         return (output.contiguous().clamp(0, 1), json.dumps(summary, indent=2), debug_preview)
 
 
+def _parse_summary_text(summary_text: Any) -> Any:
+    if isinstance(summary_text, str):
+        try:
+            return json.loads(summary_text)
+        except Exception:
+            return {"raw_summary": summary_text}
+    return summary_text
+
+
+def _tile_child_unique_id(unique_id: Any, tile_number: int, suffix: str) -> str:
+    base = "anonymous" if unique_id is None else str(unique_id)
+    return f"{base}:tile:{int(tile_number)}:{suffix}"
+
+
+def _tile_seed(seed: int, tile_number: int, tile_seed_mode: str) -> int:
+    base = int(seed)
+    if str(tile_seed_mode or "offset_by_tile").strip() == "same_seed":
+        return base
+    return int((base + (int(tile_number) - 1) * 1000003) % (0xFFFFFFFFFFFFFFFF + 1))
+
+
+def _validate_tiled_long_video_manifest(
+    manifest: dict[str, Any],
+    pose_video: torch.Tensor,
+    max_tile_pixels: int,
+    enforce_tile_pixel_limit: bool,
+) -> list[str]:
+    if not isinstance(pose_video, torch.Tensor) or pose_video.ndim != 4:
+        raise ValueError("pose_video must be a ComfyUI IMAGE tensor.")
+    tiles = manifest.get("tiles")
+    tile_count = int(manifest.get("tile_count", len(tiles) if isinstance(tiles, list) else 0))
+    if not isinstance(tiles, list) or tile_count < 1 or tile_count > MAX_TILES or len(tiles) != tile_count:
+        raise ValueError(f"tile_manifest must contain 1-{MAX_TILES} tiles and matching tile_count.")
+
+    source_size = manifest.get("source_size")
+    if isinstance(source_size, list) and len(source_size) == 2:
+        source_w, source_h = [int(value) for value in source_size]
+        if [source_w, source_h] != [int(pose_video.shape[2]), int(pose_video.shape[1])]:
+            raise ValueError(
+                "tile_manifest source_size must match pose_video size. "
+                f"manifest={source_w}x{source_h}, pose_video={int(pose_video.shape[2])}x{int(pose_video.shape[1])}."
+            )
+
+    max_pixels = max(0, int(max_tile_pixels))
+    warnings: list[str] = []
+    oversized: list[str] = []
+    for tile in tiles:
+        tile_number = int(tile.get("tile_number", int(tile.get("index", 0)) + 1))
+        generate_size = tile.get("tile_generate_size")
+        if not isinstance(generate_size, list) or len(generate_size) != 2:
+            raise ValueError(f"tile {tile_number} is missing tile_generate_size.")
+        generate_w, generate_h = [max(1, int(value)) for value in generate_size]
+        pixels = int(generate_w * generate_h)
+        if max_pixels > 0 and pixels > max_pixels:
+            message = f"tile {tile_number} planned {generate_w}x{generate_h} has {pixels} pixels"
+            if bool(enforce_tile_pixel_limit):
+                oversized.append(message)
+            else:
+                warnings.append(message)
+    if oversized:
+        raise ValueError(
+            f"Tiled long video rejected tile(s) over max_tile_pixels={max_pixels}: "
+            + "; ".join(oversized)
+            + ". Resize or split the tile, reduce overlap/target size, or raise max_tile_pixels."
+        )
+    return warnings
+
+
+def _collect_reference_inputs(
+    kwargs: dict[str, Any],
+    reference_count: int,
+    *,
+    include_masks: bool,
+) -> tuple[dict[int, torch.Tensor], dict[int, torch.Tensor]]:
+    active_reference_count = max(1, min(MAX_REFERENCES, int(reference_count)))
+    references: dict[int, torch.Tensor] = {}
+    reference_masks: dict[int, torch.Tensor] = {}
+    for index in range(1, active_reference_count + 1):
+        reference = kwargs.get(f"reference_{index}")
+        if reference is not None:
+            references[index] = _first_image(reference, f"reference_{index}")
+        if include_masks:
+            reference_mask = kwargs.get(f"reference_{index}_mask")
+            if reference_mask is not None:
+                if not isinstance(reference_mask, torch.Tensor) or reference_mask.ndim != 4:
+                    raise ValueError(f"reference_{index}_mask must be a ComfyUI IMAGE tensor.")
+                reference_masks[index] = reference_mask[:1].detach().contiguous()
+    return references, reference_masks
+
+
+def _validate_tiled_reference_inputs(
+    segments: list[dict[str, Any]],
+    references: dict[int, torch.Tensor],
+    reference_masks: dict[int, torch.Tensor],
+    reference_count: int,
+    mode: str,
+    *,
+    pose_video_mask: Optional[torch.Tensor],
+    use_internal_sam: bool,
+    sam_model: Any = None,
+    sam_conditioning: Any = None,
+) -> list[int]:
+    active_reference_count = max(1, min(MAX_REFERENCES, int(reference_count)))
+    used_refs = sorted({int(segment["reference"]) for segment in segments})
+    outside_active = [index for index in used_refs if index > active_reference_count]
+    if outside_active:
+        raise ValueError(f"segment_plan references {outside_active}, but reference_count is {active_reference_count}.")
+    missing = [index for index in used_refs if index not in references]
+    if missing:
+        raise ValueError(f"segment_plan references missing image input(s): {missing}")
+    if str(mode or "replacement") == "replacement":
+        if use_internal_sam:
+            if sam_model is None or sam_conditioning is None:
+                raise ValueError("Tiled Long Video (Internal SAM) replacement mode requires sam_model and sam_conditioning.")
+        else:
+            if pose_video_mask is None:
+                raise ValueError("Tiled Long Video replacement mode requires pose_video_mask.")
+            missing_masks = [index for index in used_refs if index not in reference_masks]
+            if missing_masks:
+                raise ValueError(f"Tiled Long Video replacement mode requires reference_N_mask for used refs: {missing_masks}.")
+    return used_refs
+
+
+def _build_tiled_global_sam_masks(
+    pose_video: torch.Tensor,
+    references: dict[int, torch.Tensor],
+    used_refs: list[int],
+    sam_options: dict[str, Any],
+) -> tuple[torch.Tensor, dict[int, torch.Tensor], dict[str, Any]]:
+    sam_model = sam_options.get("sam_model")
+    sam_conditioning = sam_options.get("sam_conditioning")
+    if sam_model is None or sam_conditioning is None:
+        raise ValueError("Tiled Long Video (Internal SAM) replacement mode requires sam_model and sam_conditioning.")
+
+    object_indices = str(sam_options.get("object_indices", ""))
+    reference_object_indices = str(sam_options.get("reference_object_indices", ""))
+    sort_by = str(sam_options.get("sort_by", "left_to_right"))
+    if sort_by not in {"none", "left_to_right", "area"}:
+        sort_by = "left_to_right"
+    detection_threshold = float(sam_options.get("sam_detection_threshold", 0.5))
+    max_objects = int(sam_options.get("sam_max_objects", 2))
+    detect_interval = int(sam_options.get("sam_detect_interval", 2))
+
+    print(
+        "[SCAIL2TiledLongVideoWithSAM] global SAM tracking "
+        f"pose_frames={int(pose_video.shape[0])} refs={used_refs} "
+        f"object_indices='{object_indices}' reference_object_indices='{reference_object_indices}' sort_by={sort_by}"
+    )
+    driving_track_data = _run_sam3_track(
+        pose_video,
+        sam_model,
+        sam_conditioning,
+        detection_threshold=detection_threshold,
+        max_objects=max_objects,
+        detect_interval=detect_interval,
+    )
+
+    pose_video_mask = None
+    reference_masks: dict[int, torch.Tensor] = {}
+    track_summary: list[dict[str, Any]] = []
+    for index in used_refs:
+        reference_track_data = _run_sam3_track(
+            references[index],
+            sam_model,
+            sam_conditioning,
+            detection_threshold=detection_threshold,
+            max_objects=max_objects,
+            detect_interval=1,
+        )
+        current_pose_mask, _ = _create_scail_masks(
+            driving_track_data,
+            reference_track_data,
+            object_indices,
+            sort_by,
+            True,
+        )
+        _, reference_mask = _create_scail_masks(
+            driving_track_data,
+            reference_track_data,
+            reference_object_indices,
+            sort_by,
+            True,
+        )
+        if pose_video_mask is None:
+            pose_video_mask = current_pose_mask.detach().contiguous()
+        reference_masks[index] = reference_mask.detach().contiguous()
+        track_summary.append(
+            {
+                "reference": int(index),
+                "reference_shape": _shape(references[index]),
+                "reference_mask_shape": _shape(reference_mask),
+            }
+        )
+
+    if pose_video_mask is None:
+        raise RuntimeError("Global internal SAM tracking produced no pose_video_mask.")
+
+    return (
+        pose_video_mask.detach().contiguous(),
+        reference_masks,
+        {
+            "enabled": True,
+            "mask_strategy": "global_once_then_tile_crop",
+            "object_indices": object_indices,
+            "reference_object_indices": reference_object_indices,
+            "sort_by": sort_by,
+            "sam_detection_threshold": float(detection_threshold),
+            "sam_max_objects": int(max_objects),
+            "sam_detect_interval": int(detect_interval),
+            "pose_video_mask_shape": _shape(pose_video_mask),
+            "references_tracked": track_summary,
+        },
+    )
+
+
+def _extract_tiled_long_video_inputs(
+    pose_video: torch.Tensor,
+    pose_video_mask: Optional[torch.Tensor],
+    references: dict[int, torch.Tensor],
+    reference_masks: dict[int, torch.Tensor],
+    manifest: dict[str, Any],
+    tile: dict[str, Any],
+    reference_count: int,
+    image_resize_mode: str,
+    mask_resize_mode: str,
+    *,
+    include_masks: bool,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, Any]]:
+    source_bbox = [int(value) for value in tile["source_crop_bbox"]]
+    target_w, target_h = [int(value) for value in tile["tile_generate_size"]]
+    tile_pose_video = _crop_resize_image_tensor(
+        pose_video,
+        source_bbox,
+        int(target_h),
+        int(target_w),
+        mode=str(image_resize_mode),
+    )
+    tile_kwargs: dict[str, torch.Tensor] = {}
+    extraction_summary: dict[str, Any] = {
+        "tile_number": int(tile.get("tile_number", int(tile.get("index", 0)) + 1)),
+        "source_crop_bbox": source_bbox,
+        "tile_pose_video_shape": _shape(tile_pose_video),
+        "references": [],
+    }
+
+    if include_masks and pose_video_mask is not None:
+        tile_pose_video_mask = _crop_resize_image_tensor(
+            pose_video_mask,
+            source_bbox,
+            int(target_h),
+            int(target_w),
+            mode=str(mask_resize_mode),
+        )
+        tile_kwargs["pose_video_mask"] = tile_pose_video_mask
+        extraction_summary["tile_pose_video_mask_shape"] = _shape(tile_pose_video_mask)
+
+    source_size = manifest.get("source_size", [int(pose_video.shape[2]), int(pose_video.shape[1])])
+    active_reference_count = max(1, min(MAX_REFERENCES, int(reference_count)))
+    for index in range(1, active_reference_count + 1):
+        reference = references.get(index)
+        if reference is not None:
+            ref_bbox = _scaled_bbox_for_image(source_bbox, source_size, reference)
+            tile_reference = _crop_resize_image_tensor(
+                reference,
+                ref_bbox,
+                int(target_h),
+                int(target_w),
+                mode=str(image_resize_mode),
+            )
+            tile_kwargs[f"reference_{index}"] = tile_reference
+            ref_summary = {
+                "reference": int(index),
+                "source_shape": _shape(reference),
+                "source_crop_bbox": ref_bbox,
+                "tile_shape": _shape(tile_reference),
+            }
+        else:
+            ref_summary = {"reference": int(index), "status": "missing_or_inactive"}
+
+        if include_masks and index in reference_masks:
+            reference_mask = reference_masks[index]
+            mask_bbox = _scaled_bbox_for_image(source_bbox, source_size, reference_mask)
+            tile_reference_mask = _crop_resize_image_tensor(
+                reference_mask,
+                mask_bbox,
+                int(target_h),
+                int(target_w),
+                mode=str(mask_resize_mode),
+            )
+            tile_kwargs[f"reference_{index}_mask"] = tile_reference_mask
+            ref_summary["mask_source_crop_bbox"] = mask_bbox
+            ref_summary["tile_mask_shape"] = _shape(tile_reference_mask)
+        extraction_summary["references"].append(ref_summary)
+
+    return tile_pose_video, tile_kwargs, extraction_summary
+
+
+def _run_tiled_long_video(
+    *,
+    use_internal_sam: bool,
+    model,
+    clip,
+    vae,
+    sampler,
+    sigmas,
+    clip_vision,
+    pose_video: torch.Tensor,
+    tile_manifest: str,
+    segment_plan: str,
+    seed: int,
+    cfg: float,
+    mode: str,
+    max_frames: int,
+    max_chunk_frames: int,
+    overlap_frames: int,
+    reference_count: int,
+    color_correction: bool,
+    cache_mode: str,
+    max_tile_pixels: int,
+    enforce_tile_pixel_limit: bool,
+    expected_size_mismatch_mode: str,
+    aspect_mismatch_mode: str,
+    aspect_tolerance: float,
+    image_resize_mode: str,
+    mask_resize_mode: str,
+    composite_feather_px: int,
+    tile_fit_mode: str,
+    frame_mismatch_mode: str,
+    composite_color_correction: bool,
+    tile_seed_mode: str,
+    pose_video_mask: Optional[torch.Tensor],
+    sam_options: Optional[dict[str, Any]],
+    prompt=None,
+    unique_id=None,
+    **kwargs,
+):
+    if not isinstance(pose_video, torch.Tensor) or pose_video.ndim != 4:
+        raise ValueError("pose_video must be a ComfyUI IMAGE tensor.")
+
+    manifest = _parse_tile_manifest(tile_manifest)
+    preflight_warnings = _validate_tiled_long_video_manifest(
+        manifest,
+        pose_video,
+        int(max_tile_pixels),
+        bool(enforce_tile_pixel_limit),
+    )
+    segments = _parse_plan(segment_plan, pose_frame_count=int(pose_video.shape[0]), max_frames=max_frames)
+    references, reference_masks = _collect_reference_inputs(
+        kwargs,
+        int(reference_count),
+        include_masks=not bool(use_internal_sam),
+    )
+    sam_options = dict(sam_options or {})
+    used_refs = _validate_tiled_reference_inputs(
+        segments,
+        references,
+        reference_masks,
+        int(reference_count),
+        str(mode),
+        pose_video_mask=pose_video_mask,
+        use_internal_sam=bool(use_internal_sam),
+        sam_model=sam_options.get("sam_model"),
+        sam_conditioning=sam_options.get("sam_conditioning"),
+    )
+
+    tiles = manifest["tiles"]
+    tile_videos: list[torch.Tensor] = []
+    tile_summaries: list[dict[str, Any]] = []
+    replacement_mode = str(mode or "replacement") == "replacement"
+    internal_sam_summary: dict[str, Any] = {
+        "enabled": bool(use_internal_sam),
+        "mask_strategy": "not_used",
+    }
+    if bool(use_internal_sam) and replacement_mode:
+        pose_video_mask, reference_masks, internal_sam_summary = _build_tiled_global_sam_masks(
+            pose_video,
+            references,
+            used_refs,
+            sam_options,
+        )
+    elif bool(use_internal_sam):
+        internal_sam_summary = {
+            "enabled": True,
+            "skipped": True,
+            "reason": "animation mode does not use SCAIL replacement masks",
+            "mask_strategy": "not_used",
+        }
+
+    include_masks = bool(replacement_mode)
+    generator_suffix = "global_sam_masks" if bool(use_internal_sam) else "external_masks"
+    print(
+        f"[SCAIL2TiledLongVideo] tiles={len(tiles)} internal_sam={bool(use_internal_sam)} "
+        f"mode={mode} used_refs={used_refs} target={manifest.get('target_size')}"
+    )
+
+    for tile in tiles:
+        tile_number = int(tile.get("tile_number", int(tile.get("index", 0)) + 1))
+        current_seed = _tile_seed(int(seed), tile_number, str(tile_seed_mode))
+        try:
+            tile_pose_video, tile_kwargs, extraction_summary = _extract_tiled_long_video_inputs(
+                pose_video,
+                pose_video_mask,
+                references,
+                reference_masks,
+                manifest,
+                tile,
+                int(reference_count),
+                str(image_resize_mode),
+                str(mask_resize_mode),
+                include_masks=include_masks,
+            )
+            child_unique_id = _tile_child_unique_id(unique_id, tile_number, generator_suffix)
+            generator = SCAIL2ScheduledLongVideo()
+            frames, used_pose_mask, used_reference_mask_timeline, scheduled_summary_text = generator.generate(
+                model,
+                clip,
+                vae,
+                sampler,
+                sigmas,
+                clip_vision,
+                tile_pose_video,
+                segment_plan,
+                current_seed,
+                cfg,
+                mode,
+                max_frames,
+                max_chunk_frames,
+                overlap_frames,
+                reference_count,
+                color_correction,
+                cache_mode=str(cache_mode),
+                prompt=prompt,
+                unique_id=child_unique_id,
+                **tile_kwargs,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Tiled long video failed on tile {tile_number}: {exc}") from exc
+
+        tile_videos.append(frames)
+        tile_summaries.append(
+            {
+                "tile_number": int(tile_number),
+                "seed": int(current_seed),
+                "planned_tile_generate_size": tile.get("tile_generate_size"),
+                "source_crop_bbox": tile.get("source_crop_bbox"),
+                "target_crop_bbox": tile.get("target_crop_bbox"),
+                "extraction": extraction_summary,
+                "generated_shape": _shape(frames),
+                "used_pose_video_mask_shape": _shape(used_pose_mask),
+                "used_reference_mask_timeline_shape": _shape(used_reference_mask_timeline),
+                "scheduled_summary": _parse_summary_text(scheduled_summary_text),
+            }
+        )
+        _empty_cache(force=True)
+
+    actual_manifest = _augment_manifest_with_actual_tile_outputs(
+        manifest,
+        tile_videos,
+        int(max_tile_pixels),
+        bool(enforce_tile_pixel_limit),
+        str(expected_size_mismatch_mode),
+        str(aspect_mismatch_mode),
+        float(aspect_tolerance),
+    )
+    actual_manifest_text = json.dumps(actual_manifest, indent=2)
+    composite_kwargs = {
+        f"tile_{index + 1}_video": video
+        for index, video in enumerate(tile_videos[1:], start=1)
+    }
+    frames, composite_summary_text, debug_preview = SCAIL2TileCompositeVideo().composite(
+        actual_manifest_text,
+        tile_videos[0],
+        int(composite_feather_px),
+        str(tile_fit_mode),
+        str(frame_mismatch_mode),
+        bool(composite_color_correction),
+        base_video=pose_video if bool(composite_color_correction) else None,
+        **composite_kwargs,
+    )
+    summary = {
+        "node": "SCAIL2TiledLongVideoWithSAM" if bool(use_internal_sam) else "SCAIL2TiledLongVideo",
+        "tile_count": int(len(tile_videos)),
+        "target_size": actual_manifest.get("target_size"),
+        "source_size": actual_manifest.get("source_size"),
+        "mode": str(mode),
+        "segment_plan": segment_plan,
+        "used_refs": used_refs,
+        "tile_seed_mode": str(tile_seed_mode),
+        "seed_start": int(seed),
+        "max_tile_pixels": int(max_tile_pixels),
+        "internal_sam": internal_sam_summary,
+        "preflight_warnings": preflight_warnings,
+        "actual_tile_output_warnings": actual_manifest.get("actual_tile_output_warnings", []),
+        "tile_summaries": tile_summaries,
+        "composite_summary": _parse_summary_text(composite_summary_text),
+    }
+    return (
+        frames,
+        actual_manifest_text,
+        _tile_repaint_report(actual_manifest),
+        json.dumps(summary, indent=2),
+        debug_preview,
+    )
+
+
+class SCAIL2TiledLongVideo:
+    @classmethod
+    def INPUT_TYPES(cls):
+        optional = {
+            "pose_video_mask": ("IMAGE",),
+        }
+        for index in range(1, MAX_REFERENCES + 1):
+            optional[f"reference_{index}"] = ("IMAGE",)
+            optional[f"reference_{index}_mask"] = ("IMAGE",)
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "clip": ("CLIP",),
+                "vae": ("VAE",),
+                "sampler": ("SAMPLER",),
+                "sigmas": ("SIGMAS",),
+                "clip_vision": ("CLIP_VISION",),
+                "pose_video": ("IMAGE",),
+                "tile_manifest": ("STRING", {"default": "", "multiline": True, "forceInput": True}),
+                "segment_plan": ("STRING", {"default": DEFAULT_PLAN, "multiline": True}),
+                "seed": ("INT", {"default": 1, "min": 0, "max": 0xFFFFFFFFFFFFFFFF}),
+                "cfg": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 20.0, "step": 0.1}),
+                "mode": (["replacement", "animation"], {"default": "replacement"}),
+                "max_frames": ("INT", {"default": 0, "min": 0, "max": 100000, "step": 1}),
+                "max_chunk_frames": ("INT", {"default": 81, "min": 17, "max": 81, "step": 4}),
+                "overlap_frames": ("INT", {"default": 5, "min": 0, "max": 33, "step": 1}),
+                "reference_count": ("INT", {"default": 2, "min": 1, "max": MAX_REFERENCES, "step": 1}),
+                "color_correction": ("BOOLEAN", {"default": True}),
+                "max_tile_pixels": ("INT", {"default": DEFAULT_MAX_TILE_PIXELS, "min": 0, "max": 4096 * 4096, "step": 1024}),
+                "enforce_tile_pixel_limit": ("BOOLEAN", {"default": True}),
+                "expected_size_mismatch_mode": (["warn", "error", "ignore"], {"default": "warn"}),
+                "aspect_mismatch_mode": (["warn", "error", "ignore"], {"default": "warn"}),
+                "aspect_tolerance": ("FLOAT", {"default": 0.03, "min": 0.0, "max": 0.25, "step": 0.005}),
+                "image_resize_mode": (["bilinear", "bicubic", "nearest"], {"default": "bilinear"}),
+                "mask_resize_mode": (["nearest", "bilinear"], {"default": "nearest"}),
+                "composite_feather_px": ("INT", {"default": 48, "min": 0, "max": 512, "step": 1}),
+                "tile_fit_mode": (["stretch", "center_crop", "pad"], {"default": "stretch"}),
+                "frame_mismatch_mode": (["trim_to_shortest", "error"], {"default": "trim_to_shortest"}),
+                "composite_color_correction": ("BOOLEAN", {"default": False}),
+                "tile_seed_mode": (["offset_by_tile", "same_seed"], {"default": "offset_by_tile"}),
+                "cache_mode": (["disk", "off"], {"default": "disk"}),
+            },
+            "optional": optional,
+            "hidden": {
+                "prompt": "PROMPT",
+                "unique_id": "UNIQUE_ID",
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING", "STRING", "STRING", "IMAGE")
+    RETURN_NAMES = ("frames", "actual_tile_manifest", "tile_repaint_report", "summary", "debug_preview")
+    FUNCTION = "generate"
+    CATEGORY = f"{CATEGORY}/Tile Upscale"
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return False
+
+    def generate(
+        self,
+        model,
+        clip,
+        vae,
+        sampler,
+        sigmas,
+        clip_vision,
+        pose_video: torch.Tensor,
+        tile_manifest: str,
+        segment_plan: str,
+        seed: int,
+        cfg: float,
+        mode: str,
+        max_frames: int,
+        max_chunk_frames: int,
+        overlap_frames: int,
+        reference_count: int,
+        color_correction: bool,
+        max_tile_pixels: int = DEFAULT_MAX_TILE_PIXELS,
+        enforce_tile_pixel_limit: bool = True,
+        expected_size_mismatch_mode: str = "warn",
+        aspect_mismatch_mode: str = "warn",
+        aspect_tolerance: float = 0.03,
+        image_resize_mode: str = "bilinear",
+        mask_resize_mode: str = "nearest",
+        composite_feather_px: int = 48,
+        tile_fit_mode: str = "stretch",
+        frame_mismatch_mode: str = "trim_to_shortest",
+        composite_color_correction: bool = False,
+        tile_seed_mode: str = "offset_by_tile",
+        cache_mode: str = "disk",
+        pose_video_mask: Optional[torch.Tensor] = None,
+        prompt=None,
+        unique_id=None,
+        **kwargs,
+    ):
+        return _run_tiled_long_video(
+            use_internal_sam=False,
+            model=model,
+            clip=clip,
+            vae=vae,
+            sampler=sampler,
+            sigmas=sigmas,
+            clip_vision=clip_vision,
+            pose_video=pose_video,
+            tile_manifest=tile_manifest,
+            segment_plan=segment_plan,
+            seed=int(seed),
+            cfg=float(cfg),
+            mode=str(mode),
+            max_frames=int(max_frames),
+            max_chunk_frames=int(max_chunk_frames),
+            overlap_frames=int(overlap_frames),
+            reference_count=int(reference_count),
+            color_correction=bool(color_correction),
+            cache_mode=str(cache_mode),
+            max_tile_pixels=int(max_tile_pixels),
+            enforce_tile_pixel_limit=bool(enforce_tile_pixel_limit),
+            expected_size_mismatch_mode=str(expected_size_mismatch_mode),
+            aspect_mismatch_mode=str(aspect_mismatch_mode),
+            aspect_tolerance=float(aspect_tolerance),
+            image_resize_mode=str(image_resize_mode),
+            mask_resize_mode=str(mask_resize_mode),
+            composite_feather_px=int(composite_feather_px),
+            tile_fit_mode=str(tile_fit_mode),
+            frame_mismatch_mode=str(frame_mismatch_mode),
+            composite_color_correction=bool(composite_color_correction),
+            tile_seed_mode=str(tile_seed_mode),
+            pose_video_mask=pose_video_mask,
+            sam_options=None,
+            prompt=prompt,
+            unique_id=unique_id,
+            **kwargs,
+        )
+
+
+class SCAIL2TiledLongVideoWithSAM:
+    @classmethod
+    def INPUT_TYPES(cls):
+        optional = {
+            "sam_model": ("MODEL",),
+            "sam_conditioning": ("CONDITIONING",),
+        }
+        for index in range(1, MAX_REFERENCES + 1):
+            optional[f"reference_{index}"] = ("IMAGE",)
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "clip": ("CLIP",),
+                "vae": ("VAE",),
+                "sampler": ("SAMPLER",),
+                "sigmas": ("SIGMAS",),
+                "clip_vision": ("CLIP_VISION",),
+                "pose_video": ("IMAGE",),
+                "tile_manifest": ("STRING", {"default": "", "multiline": True, "forceInput": True}),
+                "segment_plan": ("STRING", {"default": DEFAULT_PLAN, "multiline": True}),
+                "seed": ("INT", {"default": 1, "min": 0, "max": 0xFFFFFFFFFFFFFFFF}),
+                "cfg": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 20.0, "step": 0.1}),
+                "mode": (["replacement", "animation"], {"default": "replacement"}),
+                "max_frames": ("INT", {"default": 0, "min": 0, "max": 100000, "step": 1}),
+                "max_chunk_frames": ("INT", {"default": 81, "min": 17, "max": 81, "step": 4}),
+                "overlap_frames": ("INT", {"default": 5, "min": 0, "max": 33, "step": 1}),
+                "reference_count": ("INT", {"default": 2, "min": 1, "max": MAX_REFERENCES, "step": 1}),
+                "color_correction": ("BOOLEAN", {"default": True}),
+                "object_indices": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "tooltip": "Comma-separated driving-video object indices to include after sorting. Empty = all.",
+                    },
+                ),
+                "reference_object_indices": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "tooltip": "Comma-separated reference-image object indices. Empty = all reference objects.",
+                    },
+                ),
+                "sort_by": (["none", "left_to_right", "area"], {"default": "left_to_right"}),
+                "sam_detection_threshold": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "sam_max_objects": ("INT", {"default": 2, "min": 1, "max": 16, "step": 1}),
+                "sam_detect_interval": ("INT", {"default": 2, "min": 1, "max": 999, "step": 1}),
+                "max_tile_pixels": ("INT", {"default": DEFAULT_MAX_TILE_PIXELS, "min": 0, "max": 4096 * 4096, "step": 1024}),
+                "enforce_tile_pixel_limit": ("BOOLEAN", {"default": True}),
+                "expected_size_mismatch_mode": (["warn", "error", "ignore"], {"default": "warn"}),
+                "aspect_mismatch_mode": (["warn", "error", "ignore"], {"default": "warn"}),
+                "aspect_tolerance": ("FLOAT", {"default": 0.03, "min": 0.0, "max": 0.25, "step": 0.005}),
+                "image_resize_mode": (["bilinear", "bicubic", "nearest"], {"default": "bilinear"}),
+                "mask_resize_mode": (["nearest", "bilinear"], {"default": "nearest"}),
+                "composite_feather_px": ("INT", {"default": 48, "min": 0, "max": 512, "step": 1}),
+                "tile_fit_mode": (["stretch", "center_crop", "pad"], {"default": "stretch"}),
+                "frame_mismatch_mode": (["trim_to_shortest", "error"], {"default": "trim_to_shortest"}),
+                "composite_color_correction": ("BOOLEAN", {"default": False}),
+                "tile_seed_mode": (["offset_by_tile", "same_seed"], {"default": "offset_by_tile"}),
+                "cache_mode": (["disk", "off"], {"default": "disk"}),
+            },
+            "optional": optional,
+            "hidden": {
+                "prompt": "PROMPT",
+                "unique_id": "UNIQUE_ID",
+            },
+        }
+
+    RETURN_TYPES = SCAIL2TiledLongVideo.RETURN_TYPES
+    RETURN_NAMES = SCAIL2TiledLongVideo.RETURN_NAMES
+    FUNCTION = "generate"
+    CATEGORY = f"{CATEGORY}/Tile Upscale"
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return False
+
+    def generate(
+        self,
+        model,
+        clip,
+        vae,
+        sampler,
+        sigmas,
+        clip_vision,
+        pose_video: torch.Tensor,
+        tile_manifest: str,
+        segment_plan: str,
+        seed: int,
+        cfg: float,
+        mode: str,
+        max_frames: int,
+        max_chunk_frames: int,
+        overlap_frames: int,
+        reference_count: int,
+        color_correction: bool,
+        object_indices: str = "",
+        reference_object_indices: str = "",
+        sort_by: str = "left_to_right",
+        sam_detection_threshold: float = 0.5,
+        sam_max_objects: int = 2,
+        sam_detect_interval: int = 2,
+        max_tile_pixels: int = DEFAULT_MAX_TILE_PIXELS,
+        enforce_tile_pixel_limit: bool = True,
+        expected_size_mismatch_mode: str = "warn",
+        aspect_mismatch_mode: str = "warn",
+        aspect_tolerance: float = 0.03,
+        image_resize_mode: str = "bilinear",
+        mask_resize_mode: str = "nearest",
+        composite_feather_px: int = 48,
+        tile_fit_mode: str = "stretch",
+        frame_mismatch_mode: str = "trim_to_shortest",
+        composite_color_correction: bool = False,
+        tile_seed_mode: str = "offset_by_tile",
+        cache_mode: str = "disk",
+        sam_model=None,
+        sam_conditioning=None,
+        prompt=None,
+        unique_id=None,
+        **kwargs,
+    ):
+        return _run_tiled_long_video(
+            use_internal_sam=True,
+            model=model,
+            clip=clip,
+            vae=vae,
+            sampler=sampler,
+            sigmas=sigmas,
+            clip_vision=clip_vision,
+            pose_video=pose_video,
+            tile_manifest=tile_manifest,
+            segment_plan=segment_plan,
+            seed=int(seed),
+            cfg=float(cfg),
+            mode=str(mode),
+            max_frames=int(max_frames),
+            max_chunk_frames=int(max_chunk_frames),
+            overlap_frames=int(overlap_frames),
+            reference_count=int(reference_count),
+            color_correction=bool(color_correction),
+            cache_mode=str(cache_mode),
+            max_tile_pixels=int(max_tile_pixels),
+            enforce_tile_pixel_limit=bool(enforce_tile_pixel_limit),
+            expected_size_mismatch_mode=str(expected_size_mismatch_mode),
+            aspect_mismatch_mode=str(aspect_mismatch_mode),
+            aspect_tolerance=float(aspect_tolerance),
+            image_resize_mode=str(image_resize_mode),
+            mask_resize_mode=str(mask_resize_mode),
+            composite_feather_px=int(composite_feather_px),
+            tile_fit_mode=str(tile_fit_mode),
+            frame_mismatch_mode=str(frame_mismatch_mode),
+            composite_color_correction=bool(composite_color_correction),
+            tile_seed_mode=str(tile_seed_mode),
+            pose_video_mask=None,
+            sam_options={
+                "sam_model": sam_model,
+                "sam_conditioning": sam_conditioning,
+                "object_indices": object_indices,
+                "reference_object_indices": reference_object_indices,
+                "sort_by": sort_by,
+                "sam_detection_threshold": float(sam_detection_threshold),
+                "sam_max_objects": int(sam_max_objects),
+                "sam_detect_interval": int(sam_detect_interval),
+            },
+            prompt=prompt,
+            unique_id=unique_id,
+            **kwargs,
+        )
+
+
 class SCAIL2KeyframeMatrixViewer:
     @classmethod
     def INPUT_TYPES(cls):
@@ -5555,6 +6364,8 @@ NODE_CLASS_MAPPINGS = {
     "SCAIL2TileExtractor": SCAIL2TileExtractor,
     "SCAIL2TileRepaintCollector": SCAIL2TileRepaintCollector,
     "SCAIL2TileCompositeVideo": SCAIL2TileCompositeVideo,
+    "SCAIL2TiledLongVideo": SCAIL2TiledLongVideo,
+    "SCAIL2TiledLongVideoWithSAM": SCAIL2TiledLongVideoWithSAM,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -5573,4 +6384,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SCAIL2TileExtractor": "SCAIL-2 Tile Extractor",
     "SCAIL2TileRepaintCollector": "SCAIL-2 Tile Repaint Collector",
     "SCAIL2TileCompositeVideo": "SCAIL-2 Tile Composite Video",
+    "SCAIL2TiledLongVideo": "SCAIL-2 Tiled Long Video",
+    "SCAIL2TiledLongVideoWithSAM": "SCAIL-2 Tiled Long Video (Internal SAM)",
 }

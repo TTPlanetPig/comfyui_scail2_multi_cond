@@ -1028,7 +1028,7 @@ app.registerExtension({
             };
         }
 
-        if (nodeData.name === "SCAIL2ScheduledLongVideo") {
+        if (["SCAIL2ScheduledLongVideo", "SCAIL2TiledLongVideo"].includes(nodeData.name)) {
             const originalOnNodeCreated = nodeType.prototype.onNodeCreated;
             nodeType.prototype.onNodeCreated = function () {
                 originalOnNodeCreated?.apply(this, arguments);
@@ -1043,7 +1043,7 @@ app.registerExtension({
             };
         }
 
-        if (nodeData.name === "SCAIL2ScheduledLongVideoWithSAM") {
+        if (["SCAIL2ScheduledLongVideoWithSAM", "SCAIL2TiledLongVideoWithSAM"].includes(nodeData.name)) {
             const originalOnNodeCreated = nodeType.prototype.onNodeCreated;
             nodeType.prototype.onNodeCreated = function () {
                 originalOnNodeCreated?.apply(this, arguments);

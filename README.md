@@ -226,10 +226,7 @@ intended workflow is:
 ```text
 first-pass SCAIL-2 frames
   -> SCAIL-2 Manual Tile Plan Builder
-  -> one SCAIL-2 Tile Extractor node per tile
-  -> one SCAIL-2 Scheduled Long Video / Internal SAM node per tile
-  -> SCAIL-2 Tile Repaint Collector
-  -> SCAIL-2 Tile Composite Video
+  -> SCAIL-2 Tiled Long Video / Tiled Long Video (Internal SAM)
   -> SCAIL-2 Head Track Crop
   -> SCAIL-2 Scheduled Long Video / Internal SAM    # face crop pass
   -> SCAIL-2 Face Composite Back
@@ -289,16 +286,33 @@ a manifest if any tile's repaint resolution exceeds that budget. Resize or move
 manual tile rectangles, lower `overlap_ratio`, lower `scale_factor`, or raise
 `max_tile_pixels` before running the expensive repaint pass.
 
-After the tile repaint passes finish, use `SCAIL-2 Tile Repaint Collector`
-before compositing. It reads the actual generated video dimensions, recomputes
-the real source-crop -> repaint and repaint -> final-canvas scale for each tile,
-and outputs `actual_tile_manifest`. Connect that manifest to
+`SCAIL-2 Tiled Long Video` is the automated production node. Connect the
+first-pass `pose_video`, `tile_manifest`, the original `segment_plan`, model
+inputs, and the same references/reference masks used by `SCAIL-2 Scheduled Long
+Video`. The node crops every tile internally, runs the scheduled long-video pass
+once per tile, collects the actual output sizes, recomputes each tile's real
+scale, and composites the tiles back to `tile_manifest.target_size`.
+
+`SCAIL-2 Tiled Long Video (Internal SAM)` follows the same contract, but only
+runs SAM once on the full first-pass video and full reference images. It then
+crops the resulting global pose/reference masks per tile before each internal
+long-video repaint. This keeps object ordering and mask identity consistent
+across tile boundaries while avoiding repeated SAM tracking for every tile.
+
+For manual debugging, you can still run each tile repaint pass as separate
+nodes. After those tile repaint passes finish, use `SCAIL-2 Tile Repaint
+Collector` before compositing. It reads the actual generated video dimensions,
+recomputes the real source-crop -> repaint and repaint -> final-canvas scale for
+each tile, and outputs `actual_tile_manifest`. Connect that manifest to
 `SCAIL-2 Tile Composite Video.tile_manifest`. This handles cases where each tile
 comes back at a different valid resolution, as long as the collector's pixel and
 aspect checks pass.
 
 `SCAIL-2 Tile Repaint Collector` and `SCAIL-2 Tile Composite Video` support up
 to eight tile video inputs. Connect only the tile slots present in the manifest.
+These standalone nodes remain useful for debugging or manually replacing a
+single tile pass; the tiled long-video nodes perform the same collection and
+composite steps internally for normal production workflows.
 
 For people videos, connect a face/head/person mask to
 `Tile Plan Builder.protected_masks`. The planner treats that mask as a protected
