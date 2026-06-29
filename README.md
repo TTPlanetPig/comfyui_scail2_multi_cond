@@ -218,6 +218,82 @@ masks stay soft when the refined crop is resized back to the original bbox;
 `stitch_offset_y_px` apply a final pixel-level paste offset; use negative
 `stitch_offset_x_px` if the pasted face appears a little too far right.
 
+### SCAIL-2 Tile Upscale Pass
+
+Adds a spatial tiling second pass for higher-resolution video generation. The
+intended workflow is:
+
+```text
+first-pass SCAIL-2 frames
+  -> SCAIL-2 Manual Tile Plan Builder
+  -> four SCAIL-2 Tile Extractor nodes, tile_index 1..4
+  -> four SCAIL-2 Scheduled Long Video / Internal SAM nodes
+  -> SCAIL-2 Tile Composite Video
+  -> SCAIL-2 Head Track Crop
+  -> SCAIL-2 Scheduled Long Video / Internal SAM    # face crop pass
+  -> SCAIL-2 Face Composite Back
+  -> VHS_VideoCombine
+```
+
+`SCAIL-2 Manual Tile Plan Builder` is the recommended creative workflow. It
+adds a front-end editor with draggable vertical and horizontal split lines. The
+split lines define the four core tiles; the node then adds `overlap_ratio`
+around each selected core region and writes the same `tile_manifest` consumed by
+`SCAIL-2 Tile Extractor`. The editor stores normalized `split_x` and `split_y`
+in `layout_json`, so the layout survives workflow save/load.
+
+Run the manual planner once to load preview frames into the editor. After it
+executes, the front-end panel shows a video frame preview plus a frame slider;
+drag the white split lines on a representative frame, then rerun the node to
+produce the updated `tile_manifest`. The preview is only for choosing the core
+split lines. Overlap, target crop boxes, and aligned generation sizes are still
+computed by the Python node so downstream stitching remains deterministic.
+
+`SCAIL-2 Tile Plan Builder` remains available for automatic planning. By
+default both tile planners target a 2x final canvas, so a `548x960` first pass
+composites back to `1096x1920`.
+`overlap_ratio` expands each tile crop before the second pass, giving the model
+context across tile boundaries. Because the overlap belongs to the generated
+tile context, each tile's generation size can be larger than the core quadrant
+and is aligned with `tile_align` for SCAIL/Wan-friendly dimensions.
+
+For people videos, connect a face/head/person mask to
+`Tile Plan Builder.protected_masks`. The planner treats that mask as a protected
+region, pads it with `protected_padding_ratio` and `protected_padding_px`, then
+moves the 2x2 split lines away from it when possible. This avoids the worst
+case where the vertical seam cuts through the eyes, nose, or mouth. The
+manifest records `split_plan.protected_split_safe`; if it is `false`, the
+protected region is too large to avoid with the current `min_tile_ratio`, so
+increase overlap, lower `min_tile_ratio`, or rely on the post-tile face-detail
+branch to make one final face pass.
+
+Use one `SCAIL-2 Tile Extractor` per tile. Connect the first-pass video, the
+shared `tile_manifest`, and set `tile_index` from 1 to 4. The extractor crops
+the motion video, optional pose mask, and up to eight references/reference masks
+with the same spatial region. Connect `tile_pose_video`, `tile_pose_video_mask`,
+and the `tile_reference_N` outputs to a normal scheduled SCAIL-2 node. Repeat
+for all four tiles.
+
+`SCAIL-2 Tile Composite Video` stitches the four generated tile videos back into
+the final canvas using feathered overlap weights. Keep `tile_fit_mode` at
+`stretch` for the default extractor output. If the four tile videos differ in
+length, `trim_to_shortest` drops only trailing mismatched frames; use `error`
+when debugging workflow alignment.
+
+For face quality, run the face-detail branch after tile compositing rather than
+before it:
+
+```text
+SCAIL-2 Tile Composite Video.frames
+  -> SCAIL-2 Head Track Crop
+  -> SCAIL-2 Scheduled Long Video / Internal SAM
+  -> SCAIL-2 Face Composite Back.full_body_video = Tile Composite frames
+```
+
+This keeps the face repair aligned to the final high-resolution canvas and lets
+`SCAIL-2 Face Composite Back` clean up face identity, local color, and edge
+blending after the spatial tile pass has already done its whole-frame work.
+
 ### SCAIL-2 Multi Reference Colored Mask
 
 Builds SCAIL-2 colored masks for multiple reference tracks in one place.

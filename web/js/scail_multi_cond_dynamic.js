@@ -462,6 +462,330 @@ function renderMatrix(node, matrix) {
     resizeNode(node);
 }
 
+function parseManualTileLayout(node) {
+    const layoutWidget = widgetByName(node, "layout_json");
+    try {
+        const value = JSON.parse(layoutWidget?.value || "{}");
+        return {
+            split_x: Math.max(0.01, Math.min(0.99, Number(value.split_x ?? 0.5))),
+            split_y: Math.max(0.01, Math.min(0.99, Number(value.split_y ?? 0.5))),
+        };
+    } catch {
+        return { split_x: 0.5, split_y: 0.5 };
+    }
+}
+
+function manualTileMinRatio(node) {
+    const widget = widgetByName(node, "min_tile_ratio");
+    return Math.max(0.05, Math.min(0.45, Number(widget?.value ?? 0.2)));
+}
+
+function manualTileAspect(node) {
+    const previewSize = node.scailManualTilePreview?.source_size;
+    if (Array.isArray(previewSize) && Number(previewSize[0]) > 0 && Number(previewSize[1]) > 0) {
+        return Math.max(0.25, Math.min(4, Number(previewSize[1]) / Number(previewSize[0])));
+    }
+    const outputWidth = Number(widgetByName(node, "output_width")?.value ?? 0);
+    const outputHeight = Number(widgetByName(node, "output_height")?.value ?? 0);
+    if (outputWidth > 0 && outputHeight > 0) {
+        return Math.max(0.25, Math.min(4, outputHeight / outputWidth));
+    }
+    return 960 / 548;
+}
+
+function normalizeManualTilePreview(payload) {
+    let value = payload;
+    if (Array.isArray(value) && value.length === 1) {
+        value = value[0];
+    }
+    if (typeof value === "string") {
+        try {
+            value = JSON.parse(value);
+        } catch {
+            return { items: [] };
+        }
+    }
+    if (Array.isArray(value?.items)) {
+        return value;
+    }
+    if (Array.isArray(value)) {
+        return { items: value };
+    }
+    return { ...(value ?? {}), items: [] };
+}
+
+function extractManualTilePreview(message) {
+    const candidates = [
+        message?.scail_manual_tile_preview,
+        message?.scail_manual_tile_preview_json,
+        message?.ui?.scail_manual_tile_preview,
+        message?.ui?.scail_manual_tile_preview_json,
+        message?.output?.scail_manual_tile_preview,
+        message?.output?.scail_manual_tile_preview_json,
+    ];
+    for (const candidate of candidates) {
+        const normalized = normalizeManualTilePreview(candidate);
+        if (normalized.items.length) {
+            return normalized;
+        }
+    }
+    return null;
+}
+
+function setManualTileLayout(node, splitX, splitY) {
+    const minRatio = manualTileMinRatio(node);
+    const layout = {
+        split_x: Math.max(minRatio, Math.min(1 - minRatio, Number(splitX))),
+        split_y: Math.max(minRatio, Math.min(1 - minRatio, Number(splitY))),
+    };
+    const layoutWidget = widgetByName(node, "layout_json");
+    if (layoutWidget) {
+        layoutWidget.value = JSON.stringify(layout);
+    }
+    node.scailManualTileLayout = layout;
+    renderManualTileEditor(node);
+}
+
+function ensureManualTileEditor(node) {
+    if (node.scailManualTileContainer) {
+        return node.scailManualTileContainer;
+    }
+    const layoutWidget = widgetByName(node, "layout_json");
+    setWidgetVisible(layoutWidget, false);
+
+    const container = document.createElement("div");
+    container.className = "scail-manual-tile-editor";
+    container.style.cssText = [
+        "box-sizing:border-box",
+        "width:100%",
+        "padding:8px",
+        "border:1px solid rgba(140,148,160,.35)",
+        "border-radius:6px",
+        "background:#101827",
+        "color:#e5e7eb",
+        "font:12px/1.35 system-ui,-apple-system,BlinkMacSystemFont,sans-serif",
+    ].join(";");
+
+    if (node.addDOMWidget) {
+        const widget = node.addDOMWidget("manual_tile_editor", "Manual Tile Editor", container, {
+            serialize: false,
+            hideOnZoom: false,
+        });
+        widget.computeSize = () => [
+            Math.max(460, node.size?.[0] ?? 460),
+            Math.max(270, container.scrollHeight + 18),
+        ];
+    } else {
+        node.addWidget("text", "manual_tile_editor", "Manual Tile Editor", () => {}, { serialize: false });
+    }
+    node.scailManualTileContainer = container;
+    renderManualTileEditor(node);
+    return container;
+}
+
+function renderManualTileEditor(node) {
+    const container = node.scailManualTileContainer;
+    if (!container) {
+        return;
+    }
+    const current = node.scailManualTileLayout ?? parseManualTileLayout(node);
+    const minRatio = manualTileMinRatio(node);
+    const splitX = Math.max(minRatio, Math.min(1 - minRatio, current.split_x));
+    const splitY = Math.max(minRatio, Math.min(1 - minRatio, current.split_y));
+    const aspect = manualTileAspect(node);
+    const preview = node.scailManualTilePreview ?? { items: [] };
+    const previewItems = Array.isArray(preview.items) ? preview.items : [];
+    const previewIndex = Math.max(
+        0,
+        Math.min(previewItems.length - 1, Number(node.scailManualTilePreviewIndex ?? 0))
+    );
+    node.scailManualTilePreviewIndex = previewIndex;
+    const previewItem = previewItems[previewIndex];
+
+    container.replaceChildren();
+
+    const header = document.createElement("div");
+    header.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px;";
+    const title = document.createElement("div");
+    title.textContent = "Manual Tile Core Layout";
+    title.style.cssText = "font-weight:700;font-size:13px;";
+    const value = document.createElement("div");
+    value.textContent = `x ${(splitX * 100).toFixed(1)}% / y ${(splitY * 100).toFixed(1)}%`;
+    value.style.cssText = "opacity:.78;text-align:right;";
+    header.append(title, value);
+
+    const stage = document.createElement("div");
+    const stageHeight = Math.max(180, Math.min(420, Math.round(260 * aspect)));
+    stage.style.cssText = [
+        "position:relative",
+        "height:" + stageHeight + "px",
+        "border:1px solid rgba(226,232,240,.45)",
+        "border-radius:6px",
+        "overflow:hidden",
+        "background:linear-gradient(135deg,#172033,#0f172a)",
+        "touch-action:none",
+        "cursor:crosshair",
+    ].join(";");
+
+    if (previewItem) {
+        const image = document.createElement("img");
+        image.src = matrixImageUrl(previewItem);
+        image.loading = "eager";
+        image.draggable = false;
+        image.style.cssText = [
+            "position:absolute",
+            "inset:0",
+            "width:100%",
+            "height:100%",
+            "object-fit:fill",
+            "user-select:none",
+            "pointer-events:none",
+        ].join(";");
+        stage.append(image);
+    } else {
+        const empty = document.createElement("div");
+        empty.textContent = "Run this node once to load preview frames.";
+        empty.style.cssText = [
+            "position:absolute",
+            "inset:0",
+            "display:flex",
+            "align-items:center",
+            "justify-content:center",
+            "color:rgba(226,232,240,.72)",
+            "text-align:center",
+            "padding:16px",
+            "pointer-events:none",
+        ].join(";");
+        stage.append(empty);
+    }
+
+    const makeRegion = (label, style) => {
+        const item = document.createElement("div");
+        item.textContent = label;
+        item.style.cssText = [
+            "position:absolute",
+            "box-sizing:border-box",
+            "display:flex",
+            "align-items:center",
+            "justify-content:center",
+            "border:1px solid rgba(226,232,240,.2)",
+            "background:rgba(15,23,42,.16)",
+            "color:rgba(226,232,240,.76)",
+            "font-weight:700",
+            "letter-spacing:0",
+            style,
+        ].join(";");
+        return item;
+    };
+    stage.append(
+        makeRegion("1", `left:0;top:0;width:${splitX * 100}%;height:${splitY * 100}%;`),
+        makeRegion("2", `left:${splitX * 100}%;top:0;width:${(1 - splitX) * 100}%;height:${splitY * 100}%;`),
+        makeRegion("3", `left:0;top:${splitY * 100}%;width:${splitX * 100}%;height:${(1 - splitY) * 100}%;`),
+        makeRegion("4", `left:${splitX * 100}%;top:${splitY * 100}%;width:${(1 - splitX) * 100}%;height:${(1 - splitY) * 100}%;`)
+    );
+
+    const vLine = document.createElement("div");
+    vLine.style.cssText = [
+        "position:absolute",
+        `left:calc(${splitX * 100}% - 2px)`,
+        "top:0",
+        "width:4px",
+        "height:100%",
+        "background:#f8fafc",
+        "box-shadow:0 0 0 1px rgba(15,23,42,.8),0 0 14px rgba(248,250,252,.45)",
+        "cursor:ew-resize",
+    ].join(";");
+    const hLine = document.createElement("div");
+    hLine.style.cssText = [
+        "position:absolute",
+        "left:0",
+        `top:calc(${splitY * 100}% - 2px)`,
+        "width:100%",
+        "height:4px",
+        "background:#f8fafc",
+        "box-shadow:0 0 0 1px rgba(15,23,42,.8),0 0 14px rgba(248,250,252,.45)",
+        "cursor:ns-resize",
+    ].join(";");
+    stage.append(vLine, hLine);
+
+    const updateFromPointer = (event, axis) => {
+        const rect = stage.getBoundingClientRect();
+        const nextX = (event.clientX - rect.left) / Math.max(1, rect.width);
+        const nextY = (event.clientY - rect.top) / Math.max(1, rect.height);
+        setManualTileLayout(node, axis === "y" ? splitX : nextX, axis === "x" ? splitY : nextY);
+    };
+    const beginDrag = (event, axis) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const target = event.currentTarget;
+        target.setPointerCapture?.(event.pointerId);
+        const move = (moveEvent) => updateFromPointer(moveEvent, axis);
+        const end = (endEvent) => {
+            target.releasePointerCapture?.(endEvent.pointerId);
+            window.removeEventListener("pointermove", move);
+            window.removeEventListener("pointerup", end);
+        };
+        window.addEventListener("pointermove", move);
+        window.addEventListener("pointerup", end);
+        updateFromPointer(event, axis);
+    };
+    vLine.addEventListener("pointerdown", (event) => beginDrag(event, "x"));
+    hLine.addEventListener("pointerdown", (event) => beginDrag(event, "y"));
+    stage.addEventListener("pointerdown", (event) => {
+        const rect = stage.getBoundingClientRect();
+        const x = (event.clientX - rect.left) / Math.max(1, rect.width);
+        const y = (event.clientY - rect.top) / Math.max(1, rect.height);
+        const axis = Math.abs(x - splitX) < Math.abs(y - splitY) ? "x" : "y";
+        beginDrag(event, axis);
+    });
+
+    const controls = document.createElement("div");
+    controls.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:8px;flex-wrap:wrap;";
+    const note = document.createElement("div");
+    note.textContent = previewItem
+        ? `Preview ${previewIndex + 1}/${previewItems.length}: ${previewItem.label ?? `frame ${previewItem.frame_1_based ?? ""}`}`
+        : "Drag the white split lines. Overlap is added by the node.";
+    note.style.cssText = "opacity:.72;";
+    const reset = document.createElement("button");
+    reset.type = "button";
+    reset.textContent = "Reset center";
+    reset.style.cssText = [
+        "font:inherit",
+        "color:#0f172a",
+        "background:#e2e8f0",
+        "border:1px solid #cbd5e1",
+        "border-radius:4px",
+        "padding:4px 7px",
+        "cursor:pointer",
+    ].join(";");
+    reset.onclick = () => setManualTileLayout(node, 0.5, 0.5);
+    controls.append(note, reset);
+
+    if (previewItems.length > 1) {
+        const frameControl = document.createElement("div");
+        frameControl.style.cssText = "display:flex;align-items:center;gap:8px;margin-top:8px;";
+        const label = document.createElement("div");
+        label.textContent = "Frame";
+        label.style.cssText = "opacity:.78;min-width:40px;";
+        const slider = document.createElement("input");
+        slider.type = "range";
+        slider.min = "0";
+        slider.max = String(previewItems.length - 1);
+        slider.step = "1";
+        slider.value = String(previewIndex);
+        slider.style.cssText = "width:100%;";
+        slider.oninput = () => {
+            node.scailManualTilePreviewIndex = Number(slider.value);
+            renderManualTileEditor(node);
+        };
+        frameControl.append(label, slider);
+        container.append(header, stage, controls, frameControl);
+    } else {
+        container.append(header, stage, controls);
+    }
+    resizeNode(node);
+}
+
 app.registerExtension({
     name: "scail_multi_cond.dynamic_inputs",
     beforeRegisterNodeDef(nodeType, nodeData) {
@@ -522,6 +846,39 @@ app.registerExtension({
             nodeType.prototype.onConfigure = function () {
                 originalOnConfigure?.apply(this, arguments);
                 requestAnimationFrame(() => updateMultiReferenceMask(this));
+            };
+        }
+
+        if (nodeData.name === "SCAIL2ManualTilePlanBuilder") {
+            const originalOnNodeCreated = nodeType.prototype.onNodeCreated;
+            nodeType.prototype.onNodeCreated = function () {
+                originalOnNodeCreated?.apply(this, arguments);
+                ensureManualTileEditor(this);
+                setManualTileLayout(this, parseManualTileLayout(this).split_x, parseManualTileLayout(this).split_y);
+            };
+
+            const originalOnConfigure = nodeType.prototype.onConfigure;
+            nodeType.prototype.onConfigure = function () {
+                originalOnConfigure?.apply(this, arguments);
+                requestAnimationFrame(() => {
+                    ensureManualTileEditor(this);
+                    renderManualTileEditor(this);
+                });
+            };
+
+            const originalOnExecuted = nodeType.prototype.onExecuted;
+            nodeType.prototype.onExecuted = function (message) {
+                originalOnExecuted?.apply(this, arguments);
+                const preview = extractManualTilePreview(message);
+                if (preview) {
+                    this.scailManualTilePreview = preview;
+                    this.scailManualTilePreviewIndex = Math.min(
+                        Number(this.scailManualTilePreviewIndex ?? 0),
+                        Math.max(0, preview.items.length - 1)
+                    );
+                    ensureManualTileEditor(this);
+                    renderManualTileEditor(this);
+                }
             };
         }
 

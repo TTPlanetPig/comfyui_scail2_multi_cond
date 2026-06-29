@@ -2046,6 +2046,430 @@ def _draw_manifest_debug(video: torch.Tensor, frames: list[dict[str, Any]], max_
     return torch.cat(previews, dim=0).contiguous() if previews else video[:1, :, :, :3].detach().cpu().contiguous()
 
 
+def _align_up(value: int, align: int) -> int:
+    value = max(1, int(value))
+    align = max(1, int(align))
+    return int(math.ceil(value / align) * align)
+
+
+def _resize_image_batch(image: torch.Tensor, height: int, width: int, mode: str = "bilinear") -> torch.Tensor:
+    return _resize_image_tensor_like(
+        image,
+        torch.empty((1, max(1, int(height)), max(1, int(width)), int(image.shape[-1]))),
+        mode=mode,
+    )
+
+
+def _parse_tile_manifest(tile_manifest: str) -> dict[str, Any]:
+    try:
+        manifest = json.loads(str(tile_manifest or "").strip())
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"tile_manifest must be valid JSON: {exc}") from exc
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("tiles"), list):
+        raise ValueError("tile_manifest must contain a tiles array.")
+    return manifest
+
+
+def _tile_preview_from_manifest(video: torch.Tensor, manifest: dict[str, Any], max_frames: int = 1) -> torch.Tensor:
+    frames = video[: max(1, min(int(max_frames), int(video.shape[0])))].detach().cpu().float().clamp(0, 1).clone()
+    colors = [
+        (0.1, 0.9, 0.25),
+        (0.95, 0.25, 0.15),
+        (0.15, 0.45, 0.95),
+        (0.95, 0.75, 0.15),
+    ]
+    for tile in manifest.get("tiles", []):
+        bbox = tile.get("source_crop_bbox")
+        core = tile.get("source_core_bbox")
+        if isinstance(bbox, list) and len(bbox) == 4:
+            _draw_rect(frames, tuple(int(value) for value in bbox), colors[int(tile.get("index", 0)) % len(colors)])
+        if isinstance(core, list) and len(core) == 4:
+            _draw_rect(frames, tuple(int(value) for value in core), (1.0, 1.0, 1.0))
+    protected = manifest.get("protected_region")
+    if isinstance(protected, dict):
+        bbox = protected.get("source_bbox")
+        if isinstance(bbox, list) and len(bbox) == 4:
+            _draw_rect(frames, tuple(int(value) for value in bbox), (1.0, 0.0, 1.0))
+    return frames.contiguous()
+
+
+def _expand_bbox(
+    bbox: tuple[int, int, int, int],
+    width: int,
+    height: int,
+    padding_ratio: float,
+    padding_px: int,
+) -> tuple[int, int, int, int]:
+    x0, y0, x1, y1 = _clamp_bbox(bbox, int(width), int(height))
+    box_w = max(1, x1 - x0)
+    box_h = max(1, y1 - y0)
+    pad_x = int(math.ceil(box_w * max(0.0, float(padding_ratio)) + max(0, int(padding_px))))
+    pad_y = int(math.ceil(box_h * max(0.0, float(padding_ratio)) + max(0, int(padding_px))))
+    return _clamp_bbox((x0 - pad_x, y0 - pad_y, x1 + pad_x, y1 + pad_y), int(width), int(height))
+
+
+def _protected_bbox_from_masks(
+    masks: torch.Tensor,
+    frame_count: int,
+    height: int,
+    width: int,
+    padding_ratio: float,
+    padding_px: int,
+) -> Optional[dict[str, Any]]:
+    normalized = _normalize_video_mask(masks, int(frame_count), int(height), int(width), name="protected_masks")
+    union = normalized.amax(dim=0)
+    raw = _bbox_from_mask_frame(union)
+    if raw is None:
+        return None
+    padded = _expand_bbox(raw, int(width), int(height), float(padding_ratio), int(padding_px))
+    area = max(1, (padded[2] - padded[0]) * (padded[3] - padded[1]))
+    return {
+        "source": "protected_masks",
+        "raw_source_bbox": [int(value) for value in raw],
+        "source_bbox": [int(value) for value in padded],
+        "padding_ratio": float(padding_ratio),
+        "padding_px": int(padding_px),
+        "area_ratio": float(area / max(1, int(width) * int(height))),
+    }
+
+
+def _choose_protected_split(
+    length: int,
+    protected_interval: Optional[tuple[int, int]],
+    min_tile_ratio: float,
+) -> dict[str, Any]:
+    length = max(2, int(length))
+    center = int(round(length / 2.0))
+    min_ratio = max(0.05, min(0.45, float(min_tile_ratio)))
+    min_pos = max(1, int(math.ceil(length * min_ratio)))
+    max_pos = min(length - 1, int(math.floor(length * (1.0 - min_ratio))))
+    if min_pos > max_pos:
+        min_pos = max_pos = max(1, min(length - 1, center))
+
+    def clamp_position(value: int) -> int:
+        return max(min_pos, min(max_pos, int(value)))
+
+    if protected_interval is None:
+        return {
+            "position": clamp_position(center),
+            "mode": "center",
+            "avoids_protected_region": True,
+            "min_position": int(min_pos),
+            "max_position": int(max_pos),
+        }
+
+    p0, p1 = protected_interval
+    p0 = max(0, min(length, int(p0)))
+    p1 = max(0, min(length, int(p1)))
+    if p1 < p0:
+        p0, p1 = p1, p0
+    center_pos = clamp_position(center)
+    if not (p0 < center_pos < p1):
+        return {
+            "position": center_pos,
+            "mode": "center_outside_protected_region",
+            "avoids_protected_region": True,
+            "protected_interval": [int(p0), int(p1)],
+            "min_position": int(min_pos),
+            "max_position": int(max_pos),
+        }
+
+    candidates = []
+    for raw_position, side in ((p0, "before_protected_region"), (p1, "after_protected_region")):
+        position = clamp_position(raw_position)
+        avoids = not (p0 < position < p1)
+        if avoids:
+            candidates.append((abs(position - center), position, side))
+    if candidates:
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        _distance, position, side = candidates[0]
+        return {
+            "position": int(position),
+            "mode": side,
+            "avoids_protected_region": True,
+            "protected_interval": [int(p0), int(p1)],
+            "min_position": int(min_pos),
+            "max_position": int(max_pos),
+        }
+
+    return {
+        "position": center_pos,
+        "mode": "fallback_center_protected_region_too_large",
+        "avoids_protected_region": False,
+        "protected_interval": [int(p0), int(p1)],
+        "min_position": int(min_pos),
+        "max_position": int(max_pos),
+    }
+
+
+def _parse_manual_tile_layout(layout_json: str) -> dict[str, Any]:
+    text = str(layout_json or "").strip()
+    if not text:
+        return {"split_x": 0.5, "split_y": 0.5, "source": "default_center"}
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"layout_json must be valid JSON: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ValueError("layout_json must be a JSON object.")
+    split_x = float(value.get("split_x", 0.5))
+    split_y = float(value.get("split_y", 0.5))
+    return {
+        **value,
+        "split_x": max(0.01, min(0.99, split_x)),
+        "split_y": max(0.01, min(0.99, split_y)),
+    }
+
+
+def _build_2x2_tile_manifest(
+    source_video: torch.Tensor,
+    target_w: int,
+    target_h: int,
+    overlap_ratio: float,
+    tile_align: int,
+    feather_px: int,
+    x_edges: list[int],
+    y_edges: list[int],
+    *,
+    mode: str,
+    extra: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    _frames, source_h, source_w, channels = source_video.shape
+    rows = 2
+    cols = 2
+    target_w = max(cols, int(target_w))
+    target_h = max(rows, int(target_h))
+    overlap_ratio = max(0.0, min(0.45, float(overlap_ratio)))
+    tile_align = max(1, int(tile_align))
+    scale_x = target_w / max(1, int(source_w))
+    scale_y = target_h / max(1, int(source_h))
+    if len(x_edges) != 3 or len(y_edges) != 3:
+        raise ValueError("2x2 tile manifest requires exactly three x_edges and three y_edges.")
+    x_edges = [max(0, min(int(source_w), int(value))) for value in x_edges]
+    y_edges = [max(0, min(int(source_h), int(value))) for value in y_edges]
+    x_edges[0], x_edges[-1] = 0, int(source_w)
+    y_edges[0], y_edges[-1] = 0, int(source_h)
+    if not (x_edges[0] < x_edges[1] < x_edges[2]) or not (y_edges[0] < y_edges[1] < y_edges[2]):
+        raise ValueError(f"Invalid tile edges: x_edges={x_edges}, y_edges={y_edges}")
+
+    tiles: list[dict[str, Any]] = []
+    for row in range(rows):
+        core_y0 = int(y_edges[row])
+        core_y1 = int(y_edges[row + 1])
+        core_h = max(1, core_y1 - core_y0)
+        overlap_y = int(math.ceil(core_h * overlap_ratio))
+        crop_y0 = max(0, core_y0 - overlap_y)
+        crop_y1 = min(int(source_h), core_y1 + overlap_y)
+        for col in range(cols):
+            core_x0 = int(x_edges[col])
+            core_x1 = int(x_edges[col + 1])
+            core_w = max(1, core_x1 - core_x0)
+            overlap_x = int(math.ceil(core_w * overlap_ratio))
+            crop_x0 = max(0, core_x0 - overlap_x)
+            crop_x1 = min(int(source_w), core_x1 + overlap_x)
+            target_crop_bbox = [
+                int(round(crop_x0 * scale_x)),
+                int(round(crop_y0 * scale_y)),
+                int(round(crop_x1 * scale_x)),
+                int(round(crop_y1 * scale_y)),
+            ]
+            target_core_bbox = [
+                int(round(core_x0 * scale_x)),
+                int(round(core_y0 * scale_y)),
+                int(round(core_x1 * scale_x)),
+                int(round(core_y1 * scale_y)),
+            ]
+            target_crop_w = max(1, target_crop_bbox[2] - target_crop_bbox[0])
+            target_crop_h = max(1, target_crop_bbox[3] - target_crop_bbox[1])
+            tiles.append(
+                {
+                    "index": len(tiles),
+                    "tile_number": len(tiles) + 1,
+                    "row": int(row),
+                    "col": int(col),
+                    "source_core_bbox": [int(core_x0), int(core_y0), int(core_x1), int(core_y1)],
+                    "source_crop_bbox": [int(crop_x0), int(crop_y0), int(crop_x1), int(crop_y1)],
+                    "target_core_bbox": target_core_bbox,
+                    "target_crop_bbox": target_crop_bbox,
+                    "target_crop_size": [int(target_crop_w), int(target_crop_h)],
+                    "tile_generate_size": [
+                        int(_align_up(target_crop_w, tile_align)),
+                        int(_align_up(target_crop_h, tile_align)),
+                    ],
+                    "overlap_px_source": [int(overlap_x), int(overlap_y)],
+                }
+            )
+
+    manifest = {
+        "version": 1,
+        "mode": str(mode),
+        "source_shape": _shape(source_video),
+        "source_size": [int(source_w), int(source_h)],
+        "target_size": [int(target_w), int(target_h)],
+        "rows": rows,
+        "cols": cols,
+        "tile_count": len(tiles),
+        "scale_factor": float(target_w / max(1, int(source_w))),
+        "scale": [float(scale_x), float(scale_y)],
+        "overlap_ratio": float(overlap_ratio),
+        "tile_align": int(tile_align),
+        "default_feather_px": int(feather_px),
+        "channels": int(channels),
+        "split_plan": {
+            "x_edges": [int(value) for value in x_edges],
+            "y_edges": [int(value) for value in y_edges],
+        },
+        "tiles": tiles,
+    }
+    if extra:
+        manifest.update(extra)
+    return manifest
+
+
+def _save_manual_tile_preview_frames(
+    video: torch.Tensor,
+    manifest: dict[str, Any],
+    filename_prefix: str,
+    preview_frame_count: int,
+) -> dict[str, Any]:
+    import os
+
+    import numpy as np
+    from PIL import Image
+
+    try:
+        import folder_paths
+    except Exception:
+        return {
+            "items": [],
+            "reason": "folder_paths_unavailable",
+            "source_shape": _shape(video),
+        }
+
+    if not isinstance(video, torch.Tensor) or video.ndim != 4 or int(video.shape[0]) <= 0:
+        return {"items": [], "reason": "invalid_video", "source_shape": _shape(video)}
+    frame_count = int(video.shape[0])
+    wanted = max(1, min(24, int(preview_frame_count), frame_count))
+    if wanted == 1:
+        indices = [0]
+    else:
+        indices = [int(round(index * (frame_count - 1) / (wanted - 1))) for index in range(wanted)]
+
+    base_dir = folder_paths.get_temp_directory()
+    subfolder = "scail_manual_tile_preview"
+    target_dir = os.path.join(base_dir, subfolder)
+    os.makedirs(target_dir, exist_ok=True)
+    prefix = _matrix_safe_filename_part(filename_prefix or "scail_manual_tile")
+    fingerprint = _stable_fingerprint(
+        {
+            "prefix": prefix,
+            "shape": _shape(video),
+            "indices": indices,
+            "manual_layout": manifest.get("manual_layout"),
+            "target_size": manifest.get("target_size"),
+        }
+    )[:8]
+
+    items: list[dict[str, Any]] = []
+    for item_index, frame_index in enumerate(indices):
+        frame = video[frame_index].detach().cpu().float().clamp(0, 1)
+        if int(frame.shape[-1]) > 3:
+            frame = frame[..., :3]
+        if int(frame.shape[-1]) < 3:
+            frame = frame[..., :1].repeat(1, 1, 3)
+        array = (frame.numpy() * 255.0).round().astype(np.uint8)
+        image = Image.fromarray(array, mode="RGB")
+        filename = f"{prefix}_{fingerprint}_{item_index:03d}_frame{frame_index + 1}.png"
+        image.save(os.path.join(target_dir, filename))
+        items.append(
+            {
+                "index": int(item_index),
+                "frame_0_based": int(frame_index),
+                "frame_1_based": int(frame_index + 1),
+                "filename": filename,
+                "subfolder": subfolder,
+                "type": "temp",
+                "label": f"frame {frame_index + 1}",
+            }
+        )
+
+    return {
+        "items": items,
+        "count": len(items),
+        "source_shape": _shape(video),
+        "source_size": manifest.get("source_size"),
+        "manual_layout": manifest.get("manual_layout"),
+        "split_plan": manifest.get("split_plan"),
+        "target_size": manifest.get("target_size"),
+    }
+
+
+def _crop_resize_image_tensor(
+    image: torch.Tensor,
+    source_bbox: list[int],
+    target_height: int,
+    target_width: int,
+    mode: str = "bilinear",
+) -> torch.Tensor:
+    if not isinstance(image, torch.Tensor) or image.ndim != 4:
+        raise ValueError("image must be a ComfyUI IMAGE tensor.")
+    _, height, width, _channels = image.shape
+    x0, y0, x1, y1 = _clamp_bbox(tuple(int(value) for value in source_bbox), int(width), int(height))
+    cropped = image[:, y0:y1, x0:x1, :].detach().cpu().float().clamp(0, 1).contiguous()
+    return _resize_image_batch(cropped, int(target_height), int(target_width), mode=mode).contiguous().clamp(0, 1)
+
+
+def _scaled_bbox_for_image(source_bbox: list[int], source_size: list[int], image: torch.Tensor) -> list[int]:
+    if not isinstance(image, torch.Tensor) or image.ndim != 4:
+        raise ValueError("image must be a ComfyUI IMAGE tensor.")
+    source_w, source_h = int(source_size[0]), int(source_size[1])
+    image_h, image_w = int(image.shape[1]), int(image.shape[2])
+    x0, y0, x1, y1 = [int(value) for value in source_bbox]
+    return [
+        int(round(x0 * image_w / max(1, source_w))),
+        int(round(y0 * image_h / max(1, source_h))),
+        int(round(x1 * image_w / max(1, source_w))),
+        int(round(y1 * image_h / max(1, source_h))),
+    ]
+
+
+def _blank_image_like_tile(tile_video: torch.Tensor, frames: int = 1) -> torch.Tensor:
+    return torch.zeros(
+        (max(1, int(frames)), int(tile_video.shape[1]), int(tile_video.shape[2]), int(tile_video.shape[-1])),
+        dtype=tile_video.dtype,
+        device=tile_video.device,
+    )
+
+
+def _tile_weight_mask(height: int, width: int, crop_bbox: list[int], core_bbox: list[int], feather_px: int) -> torch.Tensor:
+    height = max(1, int(height))
+    width = max(1, int(width))
+    feather_px = max(0, int(feather_px))
+    if feather_px <= 0:
+        return torch.ones((height, width), dtype=torch.float32)
+    x0, y0, _x1, _y1 = [int(value) for value in crop_bbox]
+    cx0, cy0, cx1, cy1 = [int(value) for value in core_bbox]
+    local_core = [
+        max(0, min(width, cx0 - x0)),
+        max(0, min(height, cy0 - y0)),
+        max(0, min(width, cx1 - x0)),
+        max(0, min(height, cy1 - y0)),
+    ]
+    y = torch.arange(height, dtype=torch.float32).view(height, 1)
+    x = torch.arange(width, dtype=torch.float32).view(1, width)
+    lx0, ly0, lx1, ly1 = local_core
+    left = ((x + 1.0) / max(1, feather_px)).clamp(0, 1)
+    top = ((y + 1.0) / max(1, feather_px)).clamp(0, 1)
+    right = ((width - x) / max(1, feather_px)).clamp(0, 1)
+    bottom = ((height - y) / max(1, feather_px)).clamp(0, 1)
+    outer = torch.minimum(torch.minimum(left, right), torch.minimum(top, bottom))
+    core = torch.zeros((height, width), dtype=torch.float32)
+    core[ly0:ly1, lx0:lx1] = 1.0
+    if feather_px > 0:
+        core = _binary_mask_morph(core.unsqueeze(0), expand_px=feather_px, blur_px=feather_px)[0]
+    return torch.maximum(core, outer * 0.5).clamp(0, 1)
+
+
 class SCAIL2SegmentPlanner:
     @classmethod
     def INPUT_TYPES(cls):
@@ -2939,13 +3363,13 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
         overlap_frames: int,
         reference_count: int,
         color_correction: bool,
+        cache_mode: str = "disk",
         object_indices: str = "",
         reference_object_indices: str = "",
         sort_by: str = "left_to_right",
         sam_detection_threshold: float = 0.5,
         sam_max_objects: int = 2,
         sam_detect_interval: int = 2,
-        cache_mode: str = "disk",
         sam_model=None,
         sam_conditioning=None,
         prompt=None,
@@ -3899,6 +4323,616 @@ class SCAIL2FaceCompositeBack:
         return (output.contiguous().clamp(0, 1), json.dumps(summary, indent=2), debug_preview)
 
 
+class SCAIL2TilePlanBuilder:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "source_video": ("IMAGE",),
+                "output_width": ("INT", {"default": 0, "min": 0, "max": 8192, "step": 1}),
+                "output_height": ("INT", {"default": 0, "min": 0, "max": 8192, "step": 1}),
+                "scale_factor": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 8.0, "step": 0.05}),
+                "overlap_ratio": ("FLOAT", {"default": 0.10, "min": 0.0, "max": 0.45, "step": 0.01}),
+                "tile_align": ("INT", {"default": 32, "min": 1, "max": 256, "step": 1}),
+                "feather_px": ("INT", {"default": 48, "min": 0, "max": 512, "step": 1}),
+                "min_tile_ratio": ("FLOAT", {"default": 0.30, "min": 0.05, "max": 0.45, "step": 0.01}),
+                "protected_padding_ratio": ("FLOAT", {"default": 0.45, "min": 0.0, "max": 2.0, "step": 0.05}),
+                "protected_padding_px": ("INT", {"default": 12, "min": 0, "max": 512, "step": 1}),
+            },
+            "optional": {
+                "protected_masks": ("MASK",),
+            }
+        }
+
+    RETURN_TYPES = ("STRING", "IMAGE")
+    RETURN_NAMES = ("tile_manifest", "debug_preview")
+    FUNCTION = "build"
+    CATEGORY = f"{CATEGORY}/Tile Upscale"
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        fingerprint_inputs: dict[str, Any] = {}
+        for key in sorted(kwargs):
+            value = kwargs[key]
+            fingerprint_inputs[key] = value if isinstance(value, (str, int, float, bool)) or value is None else type(value).__name__
+        return _stable_fingerprint(fingerprint_inputs)
+
+    def build(
+        self,
+        source_video: torch.Tensor,
+        output_width: int = 0,
+        output_height: int = 0,
+        scale_factor: float = 2.0,
+        overlap_ratio: float = 0.10,
+        tile_align: int = 32,
+        feather_px: int = 48,
+        min_tile_ratio: float = 0.30,
+        protected_padding_ratio: float = 0.45,
+        protected_padding_px: int = 12,
+        protected_masks: Optional[torch.Tensor] = None,
+    ):
+        if not isinstance(source_video, torch.Tensor) or source_video.ndim != 4:
+            raise ValueError("source_video must be a ComfyUI IMAGE tensor.")
+        _frames, source_h, source_w, channels = source_video.shape
+        rows = 2
+        cols = 2
+        scale = max(1.0, float(scale_factor))
+        target_w = int(output_width) if int(output_width) > 0 else int(round(int(source_w) * scale))
+        target_h = int(output_height) if int(output_height) > 0 else int(round(int(source_h) * scale))
+        target_w = max(cols, int(target_w))
+        target_h = max(rows, int(target_h))
+        overlap_ratio = max(0.0, min(0.45, float(overlap_ratio)))
+        tile_align = max(1, int(tile_align))
+        scale_x = target_w / max(1, int(source_w))
+        scale_y = target_h / max(1, int(source_h))
+        protected_region = None
+        if protected_masks is not None:
+            protected_region = _protected_bbox_from_masks(
+                protected_masks,
+                int(source_video.shape[0]),
+                int(source_h),
+                int(source_w),
+                float(protected_padding_ratio),
+                int(protected_padding_px),
+            )
+        protected_bbox = protected_region.get("source_bbox") if isinstance(protected_region, dict) else None
+        split_x_plan = _choose_protected_split(
+            int(source_w),
+            (int(protected_bbox[0]), int(protected_bbox[2])) if isinstance(protected_bbox, list) and len(protected_bbox) == 4 else None,
+            float(min_tile_ratio),
+        )
+        split_y_plan = _choose_protected_split(
+            int(source_h),
+            (int(protected_bbox[1]), int(protected_bbox[3])) if isinstance(protected_bbox, list) and len(protected_bbox) == 4 else None,
+            float(min_tile_ratio),
+        )
+        x_edges = [0, int(split_x_plan["position"]), int(source_w)]
+        y_edges = [0, int(split_y_plan["position"]), int(source_h)]
+
+        tiles: list[dict[str, Any]] = []
+        for row in range(rows):
+            core_y0 = int(y_edges[row])
+            core_y1 = int(y_edges[row + 1])
+            core_h = max(1, core_y1 - core_y0)
+            overlap_y = int(math.ceil(core_h * overlap_ratio))
+            crop_y0 = max(0, core_y0 - overlap_y)
+            crop_y1 = min(int(source_h), core_y1 + overlap_y)
+            for col in range(cols):
+                core_x0 = int(x_edges[col])
+                core_x1 = int(x_edges[col + 1])
+                core_w = max(1, core_x1 - core_x0)
+                overlap_x = int(math.ceil(core_w * overlap_ratio))
+                crop_x0 = max(0, core_x0 - overlap_x)
+                crop_x1 = min(int(source_w), core_x1 + overlap_x)
+                target_crop_bbox = [
+                    int(round(crop_x0 * scale_x)),
+                    int(round(crop_y0 * scale_y)),
+                    int(round(crop_x1 * scale_x)),
+                    int(round(crop_y1 * scale_y)),
+                ]
+                target_core_bbox = [
+                    int(round(core_x0 * scale_x)),
+                    int(round(core_y0 * scale_y)),
+                    int(round(core_x1 * scale_x)),
+                    int(round(core_y1 * scale_y)),
+                ]
+                target_crop_w = max(1, target_crop_bbox[2] - target_crop_bbox[0])
+                target_crop_h = max(1, target_crop_bbox[3] - target_crop_bbox[1])
+                tiles.append(
+                    {
+                        "index": len(tiles),
+                        "tile_number": len(tiles) + 1,
+                        "row": int(row),
+                        "col": int(col),
+                        "source_core_bbox": [int(core_x0), int(core_y0), int(core_x1), int(core_y1)],
+                        "source_crop_bbox": [int(crop_x0), int(crop_y0), int(crop_x1), int(crop_y1)],
+                        "target_core_bbox": target_core_bbox,
+                        "target_crop_bbox": target_crop_bbox,
+                        "target_crop_size": [int(target_crop_w), int(target_crop_h)],
+                        "tile_generate_size": [
+                            int(_align_up(target_crop_w, tile_align)),
+                            int(_align_up(target_crop_h, tile_align)),
+                        ],
+                        "overlap_px_source": [int(overlap_x), int(overlap_y)],
+                    }
+                )
+
+        protected_owner_tile = None
+        if isinstance(protected_bbox, list) and len(protected_bbox) == 4:
+            px0, py0, px1, py1 = [int(value) for value in protected_bbox]
+            best_area = -1
+            for tile in tiles:
+                tx0, ty0, tx1, ty1 = [int(value) for value in tile["source_core_bbox"]]
+                ix0 = max(px0, tx0)
+                iy0 = max(py0, ty0)
+                ix1 = min(px1, tx1)
+                iy1 = min(py1, ty1)
+                area = max(0, ix1 - ix0) * max(0, iy1 - iy0)
+                tile["protected_core_intersection_area"] = int(area)
+                if area > best_area:
+                    best_area = area
+                    protected_owner_tile = int(tile["tile_number"])
+            for tile in tiles:
+                tile["is_protected_owner_tile"] = int(tile["tile_number"]) == int(protected_owner_tile)
+
+        manifest = {
+            "version": 1,
+            "mode": "2x2_face_safe_spatial_tile_upscale" if protected_region is not None else "2x2_spatial_tile_upscale",
+            "source_shape": _shape(source_video),
+            "source_size": [int(source_w), int(source_h)],
+            "target_size": [int(target_w), int(target_h)],
+            "rows": rows,
+            "cols": cols,
+            "tile_count": len(tiles),
+            "scale_factor": float(scale),
+            "scale": [float(scale_x), float(scale_y)],
+            "overlap_ratio": float(overlap_ratio),
+            "tile_align": int(tile_align),
+            "default_feather_px": int(feather_px),
+            "min_tile_ratio": float(min_tile_ratio),
+            "protected_region": protected_region,
+            "protected_owner_tile": protected_owner_tile,
+            "split_plan": {
+                "x": split_x_plan,
+                "y": split_y_plan,
+                "x_edges": x_edges,
+                "y_edges": y_edges,
+                "protected_split_safe": bool(
+                    split_x_plan.get("avoids_protected_region", True)
+                    and split_y_plan.get("avoids_protected_region", True)
+                ),
+            },
+            "channels": int(channels),
+            "tiles": tiles,
+            "note": (
+                "Use one SCAIL-2 Tile Extractor per tile, then stitch generated tile videos with "
+                "SCAIL-2 Tile Composite Video. For best face quality, run the Face Detail branch after "
+                "the tile composite on the final high-resolution frames."
+            ),
+        }
+        return (json.dumps(manifest, indent=2), _tile_preview_from_manifest(source_video, manifest))
+
+
+class SCAIL2ManualTilePlanBuilder:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "source_video": ("IMAGE",),
+                "layout_json": (
+                    "STRING",
+                    {
+                        "default": '{"split_x":0.5,"split_y":0.5}',
+                        "multiline": False,
+                        "tooltip": "Written by the visual tile editor. Normalized split_x/split_y define the four core tiles.",
+                    },
+                ),
+                "output_width": ("INT", {"default": 0, "min": 0, "max": 8192, "step": 1}),
+                "output_height": ("INT", {"default": 0, "min": 0, "max": 8192, "step": 1}),
+                "scale_factor": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 8.0, "step": 0.05}),
+                "overlap_ratio": ("FLOAT", {"default": 0.10, "min": 0.0, "max": 0.45, "step": 0.01}),
+                "tile_align": ("INT", {"default": 32, "min": 1, "max": 256, "step": 1}),
+                "feather_px": ("INT", {"default": 48, "min": 0, "max": 512, "step": 1}),
+                "min_tile_ratio": ("FLOAT", {"default": 0.20, "min": 0.05, "max": 0.45, "step": 0.01}),
+                "preview_frame_count": ("INT", {"default": 8, "min": 1, "max": 24, "step": 1}),
+                "preview_filename_prefix": ("STRING", {"default": "scail_manual_tile"}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING", "IMAGE")
+    RETURN_NAMES = ("tile_manifest", "debug_preview")
+    FUNCTION = "build"
+    CATEGORY = f"{CATEGORY}/Tile Upscale"
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        fingerprint_inputs: dict[str, Any] = {}
+        for key in sorted(kwargs):
+            value = kwargs[key]
+            fingerprint_inputs[key] = value if isinstance(value, (str, int, float, bool)) or value is None else type(value).__name__
+        return _stable_fingerprint(fingerprint_inputs)
+
+    def build(
+        self,
+        source_video: torch.Tensor,
+        layout_json: str = '{"split_x":0.5,"split_y":0.5}',
+        output_width: int = 0,
+        output_height: int = 0,
+        scale_factor: float = 2.0,
+        overlap_ratio: float = 0.10,
+        tile_align: int = 32,
+        feather_px: int = 48,
+        min_tile_ratio: float = 0.20,
+        preview_frame_count: int = 8,
+        preview_filename_prefix: str = "scail_manual_tile",
+    ):
+        if not isinstance(source_video, torch.Tensor) or source_video.ndim != 4:
+            raise ValueError("source_video must be a ComfyUI IMAGE tensor.")
+        _frames, source_h, source_w, _channels = source_video.shape
+        scale = max(1.0, float(scale_factor))
+        target_w = int(output_width) if int(output_width) > 0 else int(round(int(source_w) * scale))
+        target_h = int(output_height) if int(output_height) > 0 else int(round(int(source_h) * scale))
+        layout = _parse_manual_tile_layout(layout_json)
+        min_ratio = max(0.05, min(0.45, float(min_tile_ratio)))
+        split_x = max(min_ratio, min(1.0 - min_ratio, float(layout.get("split_x", 0.5))))
+        split_y = max(min_ratio, min(1.0 - min_ratio, float(layout.get("split_y", 0.5))))
+        split_x_px = max(1, min(int(source_w) - 1, int(round(float(source_w) * split_x))))
+        split_y_px = max(1, min(int(source_h) - 1, int(round(float(source_h) * split_y))))
+        x_edges = [0, int(split_x_px), int(source_w)]
+        y_edges = [0, int(split_y_px), int(source_h)]
+        manifest = _build_2x2_tile_manifest(
+            source_video,
+            int(target_w),
+            int(target_h),
+            float(overlap_ratio),
+            int(tile_align),
+            int(feather_px),
+            x_edges,
+            y_edges,
+            mode="2x2_manual_spatial_tile_upscale",
+            extra={
+                "manual_layout": {
+                    **layout,
+                    "split_x": float(split_x),
+                    "split_y": float(split_y),
+                    "split_x_px": int(split_x_px),
+                    "split_y_px": int(split_y_px),
+                    "min_tile_ratio": float(min_ratio),
+                },
+                "note": (
+                    "Manual tile layout: user chooses the core split lines in the front-end editor; "
+                    "the node adds overlap and aligned generation sizes automatically."
+                ),
+            },
+        )
+        manifest_text = json.dumps(manifest, indent=2)
+        debug_preview = _tile_preview_from_manifest(source_video, manifest)
+        preview = _save_manual_tile_preview_frames(
+            source_video,
+            manifest,
+            str(preview_filename_prefix or "scail_manual_tile"),
+            int(preview_frame_count),
+        )
+        return {
+            "ui": {
+                "scail_manual_tile_preview": [preview],
+                "scail_manual_tile_preview_json": [json.dumps(preview)],
+            },
+            "result": (manifest_text, debug_preview),
+        }
+
+
+class SCAIL2TileExtractor:
+    @classmethod
+    def INPUT_TYPES(cls):
+        optional: dict[str, Any] = {
+            "pose_video_mask": ("IMAGE",),
+        }
+        for index in range(1, MAX_REFERENCES + 1):
+            optional[f"reference_{index}"] = ("IMAGE",)
+            optional[f"reference_{index}_mask"] = ("IMAGE",)
+        return {
+            "required": {
+                "source_video": ("IMAGE",),
+                "tile_manifest": ("STRING", {"default": "", "multiline": True, "forceInput": True}),
+                "tile_index": ("INT", {"default": 1, "min": 1, "max": 4, "step": 1}),
+                "reference_count": ("INT", {"default": 1, "min": 1, "max": MAX_REFERENCES, "step": 1}),
+                "image_resize_mode": (["bilinear", "bicubic", "nearest"], {"default": "bilinear"}),
+                "mask_resize_mode": (["nearest", "bilinear"], {"default": "nearest"}),
+            },
+            "optional": optional,
+        }
+
+    RETURN_TYPES = (
+        "IMAGE",
+        "IMAGE",
+        "IMAGE",
+        "IMAGE",
+        "IMAGE",
+        "IMAGE",
+        "IMAGE",
+        "IMAGE",
+        "IMAGE",
+        "IMAGE",
+        "IMAGE",
+        "IMAGE",
+        "IMAGE",
+        "IMAGE",
+        "IMAGE",
+        "IMAGE",
+        "IMAGE",
+        "IMAGE",
+        "STRING",
+        "IMAGE",
+    )
+    RETURN_NAMES = (
+        "tile_pose_video",
+        "tile_pose_video_mask",
+        "tile_reference_1",
+        "tile_reference_2",
+        "tile_reference_3",
+        "tile_reference_4",
+        "tile_reference_5",
+        "tile_reference_6",
+        "tile_reference_7",
+        "tile_reference_8",
+        "tile_reference_1_mask",
+        "tile_reference_2_mask",
+        "tile_reference_3_mask",
+        "tile_reference_4_mask",
+        "tile_reference_5_mask",
+        "tile_reference_6_mask",
+        "tile_reference_7_mask",
+        "tile_reference_8_mask",
+        "summary",
+        "debug_preview",
+    )
+    FUNCTION = "extract"
+    CATEGORY = f"{CATEGORY}/Tile Upscale"
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        fingerprint_inputs: dict[str, Any] = {}
+        for key in sorted(kwargs):
+            value = kwargs[key]
+            fingerprint_inputs[key] = value if isinstance(value, (str, int, float, bool)) or value is None else type(value).__name__
+        return _stable_fingerprint(fingerprint_inputs)
+
+    def extract(
+        self,
+        source_video: torch.Tensor,
+        tile_manifest: str,
+        tile_index: int = 1,
+        reference_count: int = 1,
+        image_resize_mode: str = "bilinear",
+        mask_resize_mode: str = "nearest",
+        pose_video_mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ):
+        if not isinstance(source_video, torch.Tensor) or source_video.ndim != 4:
+            raise ValueError("source_video must be a ComfyUI IMAGE tensor.")
+        manifest = _parse_tile_manifest(tile_manifest)
+        tiles = manifest["tiles"]
+        index = int(tile_index) - 1
+        if index < 0 or index >= len(tiles):
+            raise ValueError(f"tile_index {tile_index} is outside manifest tile count {len(tiles)}.")
+        tile = tiles[index]
+        target_w, target_h = [int(value) for value in tile["tile_generate_size"]]
+        source_bbox = [int(value) for value in tile["source_crop_bbox"]]
+        tile_pose_video = _crop_resize_image_tensor(
+            source_video,
+            source_bbox,
+            target_h,
+            target_w,
+            mode=str(image_resize_mode),
+        )
+
+        if pose_video_mask is not None:
+            tile_pose_mask = _crop_resize_image_tensor(
+                pose_video_mask,
+                source_bbox,
+                target_h,
+                target_w,
+                mode=str(mask_resize_mode),
+            )
+        else:
+            tile_pose_mask = torch.zeros_like(tile_pose_video)
+
+        active_reference_count = max(1, min(MAX_REFERENCES, int(reference_count)))
+        tile_references: list[torch.Tensor] = []
+        tile_reference_masks: list[torch.Tensor] = []
+        reference_summary: list[dict[str, Any]] = []
+        blank = _blank_image_like_tile(tile_pose_video, frames=1)
+        source_size = manifest.get("source_size", [int(source_video.shape[2]), int(source_video.shape[1])])
+        for ref_index in range(1, MAX_REFERENCES + 1):
+            reference = kwargs.get(f"reference_{ref_index}")
+            reference_mask = kwargs.get(f"reference_{ref_index}_mask")
+            if reference is not None and ref_index <= active_reference_count:
+                ref_bbox = _scaled_bbox_for_image(source_bbox, source_size, reference)
+                tile_ref = _crop_resize_image_tensor(reference[:1], ref_bbox, target_h, target_w, mode=str(image_resize_mode))
+                reference_summary.append(
+                    {
+                        "reference": int(ref_index),
+                        "status": "ok",
+                        "source_shape": _shape(reference),
+                        "source_crop_bbox": ref_bbox,
+                        "tile_shape": _shape(tile_ref),
+                    }
+                )
+            else:
+                tile_ref = blank.clone()
+                reference_summary.append({"reference": int(ref_index), "status": "missing_or_inactive"})
+            if reference_mask is not None and ref_index <= active_reference_count:
+                mask_bbox = _scaled_bbox_for_image(source_bbox, source_size, reference_mask)
+                tile_mask = _crop_resize_image_tensor(reference_mask[:1], mask_bbox, target_h, target_w, mode=str(mask_resize_mode))
+            else:
+                tile_mask = torch.zeros_like(tile_ref)
+            tile_references.append(tile_ref.contiguous())
+            tile_reference_masks.append(tile_mask.contiguous())
+
+        debug_preview = tile_pose_video[: min(4, int(tile_pose_video.shape[0]))].detach().cpu().contiguous()
+        summary = {
+            "tile_index": int(tile_index),
+            "tile": tile,
+            "source_video_shape": _shape(source_video),
+            "tile_pose_video_shape": _shape(tile_pose_video),
+            "tile_pose_video_mask_shape": _shape(tile_pose_mask),
+            "reference_count": int(active_reference_count),
+            "references": reference_summary,
+            "image_resize_mode": str(image_resize_mode),
+            "mask_resize_mode": str(mask_resize_mode),
+            "connect_to": "SCAIL-2 Scheduled Long Video pose_video/reference_N/reference_N_mask inputs.",
+        }
+        return (
+            tile_pose_video,
+            tile_pose_mask,
+            *tile_references,
+            *tile_reference_masks,
+            json.dumps(summary, indent=2),
+            debug_preview,
+        )
+
+
+class SCAIL2TileCompositeVideo:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "tile_manifest": ("STRING", {"default": "", "multiline": True, "forceInput": True}),
+                "tile_1_video": ("IMAGE",),
+                "tile_2_video": ("IMAGE",),
+                "tile_3_video": ("IMAGE",),
+                "tile_4_video": ("IMAGE",),
+                "feather_px": ("INT", {"default": 48, "min": 0, "max": 512, "step": 1}),
+                "tile_fit_mode": (["stretch", "center_crop", "pad"], {"default": "stretch"}),
+                "frame_mismatch_mode": (["trim_to_shortest", "error"], {"default": "trim_to_shortest"}),
+                "color_correction": ("BOOLEAN", {"default": False}),
+            },
+            "optional": {
+                "base_video": ("IMAGE",),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING", "IMAGE")
+    RETURN_NAMES = ("frames", "summary", "debug_preview")
+    FUNCTION = "composite"
+    CATEGORY = f"{CATEGORY}/Tile Upscale"
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        fingerprint_inputs: dict[str, Any] = {}
+        for key in sorted(kwargs):
+            value = kwargs[key]
+            fingerprint_inputs[key] = value if isinstance(value, (str, int, float, bool)) or value is None else type(value).__name__
+        return _stable_fingerprint(fingerprint_inputs)
+
+    def composite(
+        self,
+        tile_manifest: str,
+        tile_1_video: torch.Tensor,
+        tile_2_video: torch.Tensor,
+        tile_3_video: torch.Tensor,
+        tile_4_video: torch.Tensor,
+        feather_px: int = 48,
+        tile_fit_mode: str = "stretch",
+        frame_mismatch_mode: str = "trim_to_shortest",
+        color_correction: bool = False,
+        base_video: Optional[torch.Tensor] = None,
+    ):
+        manifest = _parse_tile_manifest(tile_manifest)
+        tiles = manifest.get("tiles", [])
+        if len(tiles) != 4:
+            raise ValueError("SCAIL-2 Tile Composite Video currently requires a 2x2 manifest with 4 tiles.")
+        tile_videos = [tile_1_video, tile_2_video, tile_3_video, tile_4_video]
+        for index, video in enumerate(tile_videos, start=1):
+            if not isinstance(video, torch.Tensor) or video.ndim != 4:
+                raise ValueError(f"tile_{index}_video must be a ComfyUI IMAGE tensor.")
+        frame_counts = [int(video.shape[0]) for video in tile_videos]
+        normalized_frame_mismatch_mode = str(frame_mismatch_mode or "trim_to_shortest").strip()
+        if normalized_frame_mismatch_mode not in {"trim_to_shortest", "error"}:
+            normalized_frame_mismatch_mode = "trim_to_shortest"
+        if normalized_frame_mismatch_mode == "error" and len(set(frame_counts)) != 1:
+            raise ValueError(f"tile video frame counts must match: {frame_counts}")
+        frame_count = min(frame_counts)
+        if frame_count <= 0:
+            raise ValueError("tile videos contain no frames.")
+        target_w, target_h = [int(value) for value in manifest.get("target_size", [0, 0])]
+        if target_w <= 0 or target_h <= 0:
+            raise ValueError("tile_manifest target_size is invalid.")
+        normalized_tile_fit_mode = str(tile_fit_mode or "stretch").strip()
+        if normalized_tile_fit_mode not in {"stretch", "center_crop", "pad"}:
+            normalized_tile_fit_mode = "stretch"
+
+        output = torch.zeros((frame_count, target_h, target_w, 3), dtype=torch.float32)
+        weights = torch.zeros((frame_count, target_h, target_w, 1), dtype=torch.float32)
+        base_target: Optional[torch.Tensor] = None
+        if bool(color_correction) and base_video is not None and isinstance(base_video, torch.Tensor) and base_video.ndim == 4:
+            base_target = _resize_image_batch(
+                base_video[:frame_count].detach().cpu().float().clamp(0, 1),
+                target_h,
+                target_w,
+                mode="bilinear",
+            )[:, :, :, :3].contiguous()
+
+        paste_events: list[dict[str, Any]] = []
+        for tile, video in zip(tiles, tile_videos):
+            crop_bbox = [int(value) for value in tile["target_crop_bbox"]]
+            core_bbox = [int(value) for value in tile["target_core_bbox"]]
+            x0, y0, x1, y1 = _clamp_bbox(tuple(crop_bbox), target_w, target_h)
+            crop_w = max(1, x1 - x0)
+            crop_h = max(1, y1 - y0)
+            fitted = _fit_image_to_size(
+                video[:frame_count].detach().cpu().float().clamp(0, 1)[:, :, :, :3],
+                crop_h,
+                crop_w,
+                fit_mode=normalized_tile_fit_mode,
+                mode="bilinear",
+            )
+            mask = _tile_weight_mask(crop_h, crop_w, [x0, y0, x1, y1], core_bbox, int(feather_px)).view(1, crop_h, crop_w, 1)
+            mask = mask.repeat(frame_count, 1, 1, 1).contiguous()
+            if base_target is not None:
+                target_patch = base_target[:, y0:y1, x0:x1, :]
+                fitted, _color_info = _local_mean_std_color_match(fitted, target_patch, mask)
+            output[:, y0:y1, x0:x1, :] += fitted[:, :, :, :3] * mask
+            weights[:, y0:y1, x0:x1, :] += mask
+            paste_events.append(
+                {
+                    "tile_number": int(tile.get("tile_number", len(paste_events) + 1)),
+                    "target_crop_bbox": [int(x0), int(y0), int(x1), int(y1)],
+                    "target_core_bbox": core_bbox,
+                    "input_shape": _shape(video),
+                    "fitted_shape": _shape(fitted),
+                }
+            )
+
+        output = output / weights.clamp_min(1e-6)
+        uncovered = weights <= 1e-6
+        if bool(uncovered.any()):
+            output = output.masked_fill(uncovered.expand_as(output), 0.0)
+        debug_preview = output[: min(4, frame_count)].detach().cpu().contiguous().clamp(0, 1)
+        summary = {
+            "target_size": [int(target_w), int(target_h)],
+            "output_shape": _shape(output),
+            "input_frame_counts": {
+                "tile_1_video": int(frame_counts[0]),
+                "tile_2_video": int(frame_counts[1]),
+                "tile_3_video": int(frame_counts[2]),
+                "tile_4_video": int(frame_counts[3]),
+            },
+            "used_frame_count": int(frame_count),
+            "frame_mismatch_mode": normalized_frame_mismatch_mode,
+            "feather_px": int(feather_px),
+            "tile_fit_mode": normalized_tile_fit_mode,
+            "color_correction": bool(color_correction and base_target is not None),
+            "paste_events": paste_events,
+            "recommended_face_detail_next_step": (
+                "Connect frames to SCAIL-2 Head Track Crop, run a face-detail SCAIL pass on the crop, "
+                "then use SCAIL-2 Face Composite Back."
+            ),
+        }
+        return (output.contiguous().clamp(0, 1), json.dumps(summary, indent=2), debug_preview)
+
+
 class SCAIL2KeyframeMatrixViewer:
     @classmethod
     def INPUT_TYPES(cls):
@@ -3969,6 +5003,10 @@ NODE_CLASS_MAPPINGS = {
     "SCAIL2HeadTrackCrop": SCAIL2HeadTrackCrop,
     "SCAIL2AlignReferenceFaceToCrop": SCAIL2AlignReferenceFaceToCrop,
     "SCAIL2FaceCompositeBack": SCAIL2FaceCompositeBack,
+    "SCAIL2TilePlanBuilder": SCAIL2TilePlanBuilder,
+    "SCAIL2ManualTilePlanBuilder": SCAIL2ManualTilePlanBuilder,
+    "SCAIL2TileExtractor": SCAIL2TileExtractor,
+    "SCAIL2TileCompositeVideo": SCAIL2TileCompositeVideo,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -3982,4 +5020,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SCAIL2HeadTrackCrop": "SCAIL-2 Head Track Crop",
     "SCAIL2AlignReferenceFaceToCrop": "SCAIL-2 Align Reference Face To Crop",
     "SCAIL2FaceCompositeBack": "SCAIL-2 Face Composite Back",
+    "SCAIL2TilePlanBuilder": "SCAIL-2 Tile Plan Builder",
+    "SCAIL2ManualTilePlanBuilder": "SCAIL-2 Manual Tile Plan Builder",
+    "SCAIL2TileExtractor": "SCAIL-2 Tile Extractor",
+    "SCAIL2TileCompositeVideo": "SCAIL-2 Tile Composite Video",
 }
