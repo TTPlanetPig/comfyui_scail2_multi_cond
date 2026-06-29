@@ -544,11 +544,13 @@ Run this after changing tile or tiled long-video node wiring:
 
 ```bash
 python3 -B scripts/smoke_tiled_nodes.py
+node scripts/smoke_manual_tile_editor.mjs
 ```
 
-This test does not run model inference. It verifies node registration, 7-tile
+These tests do not run model inference. They verify node registration, 7-tile
 manifest planning, 32-pixel tile alignment, pixel-budget rejection, external
-mask vs. internal SAM inputs, and the global-SAM-then-tile-crop strategy.
+mask vs. internal SAM inputs, the global-SAM-then-tile-crop strategy, and the
+manual tile editor drag/height safeguards.
 
 ## Included Workflows
 

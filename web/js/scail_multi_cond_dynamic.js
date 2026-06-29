@@ -653,8 +653,11 @@ function writeManualTileLayout(node, tiles, selectedIndex = 0) {
         tiles: normalizedTiles.length ? normalizedTiles : manualTilesFromSplit(node, 0.5, 0.5),
     };
     const layoutWidget = widgetByName(node, "layout_json");
+    const serialized = JSON.stringify(layout);
     if (layoutWidget) {
-        layoutWidget.value = JSON.stringify(layout);
+        if (layoutWidget.value !== serialized) {
+            layoutWidget.value = serialized;
+        }
     }
     node.scailManualTileLayout = layout;
     node.scailManualTileSelectedIndex = Math.max(
@@ -738,7 +741,7 @@ function ensureManualTileEditor(node) {
         });
         widget.computeSize = () => [
             Math.max(460, node.size?.[0] ?? 460),
-            Math.max(320, container.scrollHeight + 18),
+            Math.max(320, Number(node.scailManualTileEditorHeight ?? 320)),
         ];
     } else {
         node.addWidget("text", "manual_tile_editor", "Manual Tile Editor", () => {}, { serialize: false });
@@ -776,6 +779,9 @@ function renderManualTileEditor(node) {
     const sourceSize = manualTileSourceSize(node);
     const selectedPixelRect = manualTilePixelRect(node, tiles[selectedIndex]);
     const align = manualTileAlign(node);
+    const stageHeight = Math.max(180, Math.min(420, Math.round(260 * aspect)));
+    const editorHeight = stageHeight + (previewItems.length > 1 ? 150 : 118);
+    node.scailManualTileEditorHeight = editorHeight;
 
     container.replaceChildren();
 
@@ -792,7 +798,6 @@ function renderManualTileEditor(node) {
     header.append(title, value);
 
     const stage = document.createElement("div");
-    const stageHeight = Math.max(180, Math.min(420, Math.round(260 * aspect)));
     stage.style.cssText = [
         "position:relative",
         "height:" + stageHeight + "px",
@@ -843,14 +848,28 @@ function renderManualTileEditor(node) {
             y: clampNumber((event.clientY - rect.top) / Math.max(1, rect.height), 0, 1),
         };
     };
-    const beginTileDrag = (event, tileIndex, mode) => {
+    const setRegionTileStyle = (element, tile) => {
+        if (!element) {
+            return;
+        }
+        element.style.left = tile.x0 * 100 + "%";
+        element.style.top = tile.y0 * 100 + "%";
+        element.style.width = Math.max(0.1, (tile.x1 - tile.x0) * 100) + "%";
+        element.style.height = Math.max(0.1, (tile.y1 - tile.y0) * 100) + "%";
+    };
+
+    const beginTileDrag = (event, tileIndex, mode, regionElement) => {
         event.preventDefault();
         event.stopPropagation();
         node.scailManualTileSelectedIndex = tileIndex;
+        const target = event.currentTarget;
+        target.setPointerCapture?.(event.pointerId);
         const startPoint = pointFromEvent(event);
         const startTiles = tiles.map((tile) => ({ ...tile }));
         const startTile = startTiles[tileIndex];
         const apply = (moveEvent) => {
+            moveEvent.preventDefault();
+            moveEvent.stopPropagation();
             const point = pointFromEvent(moveEvent);
             const dx = point.x - startPoint.x;
             const dy = point.y - startPoint.y;
@@ -878,14 +897,20 @@ function renderManualTileEditor(node) {
             }
             nextTiles[tileIndex] = normalizeManualTileRect(node, nextTile);
             writeManualTileLayout(node, nextTiles, tileIndex);
+            setRegionTileStyle(regionElement, nextTiles[tileIndex]);
+            scheduleCanvas(node);
+        };
+        const end = (endEvent) => {
+            endEvent.preventDefault();
+            endEvent.stopPropagation();
+            target.releasePointerCapture?.(endEvent.pointerId);
+            window.removeEventListener("pointermove", apply, true);
+            window.removeEventListener("pointerup", end, true);
             renderManualTileEditor(node);
         };
-        const end = () => {
-            window.removeEventListener("pointermove", apply);
-            window.removeEventListener("pointerup", end);
-        };
-        window.addEventListener("pointermove", apply);
-        window.addEventListener("pointerup", end);
+        window.addEventListener("pointermove", apply, true);
+        window.addEventListener("pointerup", end, true);
+        apply(event);
     };
 
     for (const [index, tile] of tiles.entries()) {
@@ -912,7 +937,7 @@ function renderManualTileEditor(node) {
             "cursor:move",
             "user-select:none",
         ].join(";");
-        region.addEventListener("pointerdown", (event) => beginTileDrag(event, index, "move"));
+        region.addEventListener("pointerdown", (event) => beginTileDrag(event, index, "move", region));
         const handle = document.createElement("div");
         handle.title = "Resize tile " + (index + 1);
         handle.style.cssText = [
@@ -926,7 +951,7 @@ function renderManualTileEditor(node) {
             "border-top:1px solid rgba(15,23,42,.8)",
             "cursor:nwse-resize",
         ].join(";");
-        handle.addEventListener("pointerdown", (event) => beginTileDrag(event, index, "resize"));
+        handle.addEventListener("pointerdown", (event) => beginTileDrag(event, index, "resize", region));
         region.append(handle);
         stage.append(region);
     }
