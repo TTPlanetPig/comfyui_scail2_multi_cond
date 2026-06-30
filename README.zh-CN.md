@@ -272,6 +272,9 @@ manifest 会解析为 `1096x1920`，并在 `target_size_adjustment` 里记录请
 `tile_manifest`、原始 `segment_plan`、模型输入，以及和普通长视频节点相同的
 `reference_N` / mask 即可。节点内部会按 tile 自动裁切 `pose_video`、对应的
 `reference_N` 和 mask，再逐块调用长视频生成，最后自动拼合。
+`overlap_ratio` 只会作用在和其他 tile 真实相邻的边上；画框外不会补内容，
+中间有空隙的边也不会互相扩 overlap。每块会在 manifest 里记录
+`overlap_edges_px_source`，方便检查左右上下哪几条边参与了上下文扩展。
 拼合时使用 core 优先的 feather：overlap 主要作为生成上下文，不会整段大面积参与最终平均，
 只有 core 边缘会柔和过渡到相邻 tile。
 

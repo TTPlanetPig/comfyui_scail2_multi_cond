@@ -241,8 +241,9 @@ The editor highlights uncovered source areas and snaps tile edges to the canvas
 or neighboring tile edges while moving/resizing. The Python node defaults to
 `coverage_policy=auto_fill`, so gappy hand-written layouts are completed before
 manifest generation unless you switch the policy to `error` or `ignore`.
-The node then adds `overlap_ratio` around each selected core region and writes the same
-`tile_manifest` consumed by `SCAIL-2 Tile Extractor`. The editor stores
+The node then adds `overlap_ratio` on tile edges that touch another tile and
+writes the same `tile_manifest` consumed by `SCAIL-2 Tile Extractor`. Outer
+canvas edges and non-adjacent gap edges are not padded. The editor stores
 normalized `layout_json.tiles`, so the layout survives workflow save/load.
 
 The manual planner also accepts a `layout_json.tiles` array for non-2x2 layouts,
@@ -253,10 +254,10 @@ This is the backend contract for a richer rectangle editor:
 {"tiles":[{"x0":0.0,"y0":0.0,"x1":0.62,"y1":0.55},{"x":0.45,"y":0.50,"w":0.55,"h":0.50}]}
 ```
 
-Every tile is independently expanded by `overlap_ratio`; `tile_generate_size`
-is snapped to `tile_align` using `resolution_snap_mode` (`nearest`, `ceil`, or
-`floor`). This lets hand-drawn tiles have different aspect ratios while keeping
-the repaint sizes on model-friendly 32-pixel steps.
+Every tile records per-edge overlap as `overlap_edges_px_source`;
+`tile_generate_size` is snapped to `tile_align` using `resolution_snap_mode`
+(`nearest`, `ceil`, or `floor`). This lets hand-drawn tiles have different
+aspect ratios while keeping the repaint sizes on model-friendly 32-pixel steps.
 
 Run the manual planner once to load preview frames into the editor. After it
 executes, the front-end panel shows a video frame preview plus a frame slider;
@@ -273,10 +274,11 @@ the planners preserve the source-video aspect ratio and adjust the actual
 manifest target size automatically. For example, a `548x960` source with a
 requested `1080x1920` target resolves to `1096x1920`; the manifest records this
 under `target_size_adjustment`.
-`overlap_ratio` expands each tile crop before the second pass, giving the model
-context across tile boundaries. Because the overlap belongs to the generated
-tile context, each tile's generation size can be larger than the core quadrant
-and is aligned with `tile_align` for SCAIL/Wan-friendly dimensions.
+`overlap_ratio` expands each tile crop only on edges that touch another tile,
+giving the model context across real tile boundaries. Because the overlap
+belongs to the generated tile context, each tile's generation size can be
+larger than the core quadrant and is aligned with `tile_align` for
+SCAIL/Wan-friendly dimensions.
 
 Both tile planners output `tile_resolution_report` in addition to
 `tile_manifest`. Use that report to configure each tile repaint pass. For every

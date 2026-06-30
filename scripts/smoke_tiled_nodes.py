@@ -88,6 +88,73 @@ def main() -> None:
         "single-width target should use width as aspect-preserving basis",
     )
 
+    two_by_two = nodes._build_2x2_tile_manifest(
+        FakeVideo(),
+        1096,
+        1920,
+        0.10,
+        32,
+        48,
+        [0, 274, 548],
+        [0, 480, 960],
+        mode="smoke_2x2_edge_overlap",
+    )
+    assert_true(
+        two_by_two["tiles"][0]["overlap_edges_px_source"] == {"left": 0, "right": 28, "top": 0, "bottom": 48},
+        "top-left 2x2 tile should only overlap right and bottom edges",
+    )
+    assert_true(
+        two_by_two["tiles"][0]["source_crop_bbox"] == [0, 0, 302, 528],
+        "top-left 2x2 crop should not expand outside the canvas",
+    )
+    assert_true(
+        two_by_two["tiles"][3]["overlap_edges_px_source"] == {"left": 28, "right": 0, "top": 48, "bottom": 0},
+        "bottom-right 2x2 tile should only overlap left and top edges",
+    )
+    assert_true(
+        two_by_two["tiles"][3]["source_crop_bbox"] == [246, 432, 548, 960],
+        "bottom-right 2x2 crop should not expand outside the canvas",
+    )
+
+    separated_manual = nodes._build_rect_tile_manifest(
+        FakeVideo(),
+        1096,
+        1920,
+        0.10,
+        32,
+        48,
+        [[0, 0, 200, 960], [348, 0, 548, 960]],
+        mode="smoke_non_adjacent_manual_tiles",
+    )
+    assert_true(
+        separated_manual["tiles"][0]["source_crop_bbox"] == [0, 0, 200, 960],
+        "manual tile with a gap to its neighbor should not expand across the gap",
+    )
+    assert_true(
+        separated_manual["tiles"][0]["overlap_edges_px_source"]["right"] == 0,
+        "manual tile should not mark a non-adjacent right edge as overlap",
+    )
+
+    touching_manual = nodes._build_rect_tile_manifest(
+        FakeVideo(),
+        1096,
+        1920,
+        0.10,
+        32,
+        48,
+        [[0, 0, 274, 960], [274, 0, 548, 960]],
+        mode="smoke_adjacent_manual_tiles",
+        enforce_tile_pixel_limit=False,
+    )
+    assert_true(
+        touching_manual["tiles"][0]["source_crop_bbox"] == [0, 0, 302, 960],
+        "manual tile touching a neighbor should expand into the shared edge",
+    )
+    assert_true(
+        touching_manual["tiles"][1]["source_crop_bbox"] == [246, 0, 548, 960],
+        "right manual tile touching a neighbor should expand into the shared edge",
+    )
+
     x_edges = [0, 78, 156, 234, 312, 390, 469, 548]
     core_bboxes = [[x_edges[index], 0, x_edges[index + 1], 960] for index in range(7)]
     manifest = nodes._build_rect_tile_manifest(

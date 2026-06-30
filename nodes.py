@@ -2615,10 +2615,41 @@ def _resolve_tile_target_size(
     }
 
 
+def _intervals_overlap(a0: int, a1: int, b0: int, b1: int) -> bool:
+    return min(int(a1), int(b1)) > max(int(a0), int(b0))
+
+
+def _manual_neighbor_overlap_edges(
+    core_bboxes: list[list[int]],
+    tile_index: int,
+    overlap_x: int,
+    overlap_y: int,
+) -> dict[str, int]:
+    bbox = [int(value) for value in core_bboxes[int(tile_index)]]
+    x0, y0, x1, y1 = bbox
+    tolerance = 1
+    edges = {"left": 0, "right": 0, "top": 0, "bottom": 0}
+    for index, other_raw in enumerate(core_bboxes):
+        if index == int(tile_index):
+            continue
+        ox0, oy0, ox1, oy1 = [int(value) for value in other_raw]
+        vertical_overlap = _intervals_overlap(y0, y1, oy0, oy1)
+        horizontal_overlap = _intervals_overlap(x0, x1, ox0, ox1)
+        if vertical_overlap and (abs(ox1 - x0) <= tolerance or ox0 < x0 < ox1):
+            edges["left"] = int(overlap_x)
+        if vertical_overlap and (abs(ox0 - x1) <= tolerance or ox0 < x1 < ox1):
+            edges["right"] = int(overlap_x)
+        if horizontal_overlap and (abs(oy1 - y0) <= tolerance or oy0 < y0 < oy1):
+            edges["top"] = int(overlap_y)
+        if horizontal_overlap and (abs(oy0 - y1) <= tolerance or oy0 < y1 < oy1):
+            edges["bottom"] = int(overlap_y)
+    return edges
+
+
 def _format_tile_resolution_report(manifest: dict[str, Any]) -> str:
     constraints = manifest.get("tile_output_constraints", {})
     lines = [
-        "# tile | repaint_resolution | pixels | source_crop | target_crop | repaint_scale | composite_scale",
+        "# tile | repaint_resolution | pixels | source_crop | target_crop | repaint_scale | composite_scale | overlap_edges",
     ]
     for tile in manifest.get("tiles", []):
         tile_number = int(tile.get("tile_number", int(tile.get("index", 0)) + 1))
@@ -2628,6 +2659,11 @@ def _format_tile_resolution_report(manifest: dict[str, Any]) -> str:
         pixels = int(tile.get("tile_generate_pixels", generate_w * generate_h))
         repaint_scale = tile.get("tile_repaint_scale", [0, 0])
         composite_scale = tile.get("tile_to_target_scale", [0, 0])
+        overlap_edges = tile.get("overlap_edges_px_source", {})
+        overlap_summary = (
+            f"L{int(overlap_edges.get('left', 0))}/R{int(overlap_edges.get('right', 0))}/"
+            f"T{int(overlap_edges.get('top', 0))}/B{int(overlap_edges.get('bottom', 0))}"
+        )
         lines.append(
             " | ".join(
                 [
@@ -2638,6 +2674,7 @@ def _format_tile_resolution_report(manifest: dict[str, Any]) -> str:
                     f"{target_w}x{target_h}",
                     f"{float(repaint_scale[0]):.4f}x,{float(repaint_scale[1]):.4f}y",
                     f"{float(composite_scale[0]):.4f}x,{float(composite_scale[1]):.4f}y",
+                    overlap_summary,
                 ]
             )
         )
@@ -2847,15 +2884,25 @@ def _build_2x2_tile_manifest(
         core_y1 = int(y_edges[row + 1])
         core_h = max(1, core_y1 - core_y0)
         overlap_y = int(math.ceil(core_h * overlap_ratio))
-        crop_y0 = max(0, core_y0 - overlap_y)
-        crop_y1 = min(int(source_h), core_y1 + overlap_y)
+        overlap_top = int(overlap_y if row > 0 else 0)
+        overlap_bottom = int(overlap_y if row < rows - 1 else 0)
+        crop_y0 = max(0, core_y0 - overlap_top)
+        crop_y1 = min(int(source_h), core_y1 + overlap_bottom)
         for col in range(cols):
             core_x0 = int(x_edges[col])
             core_x1 = int(x_edges[col + 1])
             core_w = max(1, core_x1 - core_x0)
             overlap_x = int(math.ceil(core_w * overlap_ratio))
-            crop_x0 = max(0, core_x0 - overlap_x)
-            crop_x1 = min(int(source_w), core_x1 + overlap_x)
+            overlap_left = int(overlap_x if col > 0 else 0)
+            overlap_right = int(overlap_x if col < cols - 1 else 0)
+            edge_overlaps = {
+                "left": overlap_left,
+                "right": overlap_right,
+                "top": overlap_top,
+                "bottom": overlap_bottom,
+            }
+            crop_x0 = max(0, core_x0 - overlap_left)
+            crop_x1 = min(int(source_w), core_x1 + overlap_right)
             target_crop_bbox = [
                 int(round(crop_x0 * scale_x)),
                 int(round(crop_y0 * scale_y)),
@@ -2913,6 +2960,7 @@ def _build_2x2_tile_manifest(
                     "aspect_ratio": float(tile_generate_w / max(1, tile_generate_h)),
                     "within_tile_pixel_limit": bool(max_tile_pixels <= 0 or tile_generate_pixels <= max_tile_pixels),
                     "overlap_px_source": [int(overlap_x), int(overlap_y)],
+                    "overlap_edges_px_source": edge_overlaps,
                 }
             )
 
@@ -2990,18 +3038,23 @@ def _build_rect_tile_manifest(
     if len(core_bboxes) > MAX_TILES:
         raise ValueError(f"manual tile layout supports at most {MAX_TILES} tiles.")
 
+    normalized_core_bboxes = [
+        list(_clamp_bbox(tuple(int(value) for value in bbox), int(source_w), int(source_h)))
+        for bbox in core_bboxes
+    ]
     tiles: list[dict[str, Any]] = []
     oversized_tiles: list[dict[str, Any]] = []
-    for tile_index, bbox in enumerate(core_bboxes):
-        core_x0, core_y0, core_x1, core_y1 = _clamp_bbox(tuple(int(value) for value in bbox), int(source_w), int(source_h))
+    for tile_index, bbox in enumerate(normalized_core_bboxes):
+        core_x0, core_y0, core_x1, core_y1 = [int(value) for value in bbox]
         core_w = max(1, core_x1 - core_x0)
         core_h = max(1, core_y1 - core_y0)
         overlap_x = int(math.ceil(core_w * overlap_ratio))
         overlap_y = int(math.ceil(core_h * overlap_ratio))
-        crop_x0 = max(0, core_x0 - overlap_x)
-        crop_y0 = max(0, core_y0 - overlap_y)
-        crop_x1 = min(int(source_w), core_x1 + overlap_x)
-        crop_y1 = min(int(source_h), core_y1 + overlap_y)
+        edge_overlaps = _manual_neighbor_overlap_edges(normalized_core_bboxes, tile_index, overlap_x, overlap_y)
+        crop_x0 = max(0, core_x0 - edge_overlaps["left"])
+        crop_y0 = max(0, core_y0 - edge_overlaps["top"])
+        crop_x1 = min(int(source_w), core_x1 + edge_overlaps["right"])
+        crop_y1 = min(int(source_h), core_y1 + edge_overlaps["bottom"])
         target_crop_bbox = [
             int(round(crop_x0 * scale_x)),
             int(round(crop_y0 * scale_y)),
@@ -3059,6 +3112,7 @@ def _build_rect_tile_manifest(
                 "aspect_ratio": float(tile_generate_w / max(1, tile_generate_h)),
                 "within_tile_pixel_limit": bool(max_tile_pixels <= 0 or tile_generate_pixels <= max_tile_pixels),
                 "overlap_px_source": [int(overlap_x), int(overlap_y)],
+                "overlap_edges_px_source": edge_overlaps,
             }
         )
 
