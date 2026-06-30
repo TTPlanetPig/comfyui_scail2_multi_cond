@@ -82,6 +82,10 @@ def main() -> None:
         list(tiled_required).index("composite_blend_mode") < list(tiled_required).index("free_tail_window"),
         "composite_blend_mode should stay before free_tail_window",
     )
+    free_tail_spec = tiled_required["free_tail_window"]
+    assert_true(free_tail_spec[0] == "INT", "free_tail_window should be a numeric tail-frame control")
+    assert_true(free_tail_spec[1]["default"] == 0, "free_tail_window default should disable free tail")
+    assert_true(free_tail_spec[1]["step"] == 4, "free_tail_window should step by four frames")
 
     assert_true(nodes._tile_seed(123, 1, "same_seed") == 123, "same_seed changed tile 1")
     assert_true(nodes._tile_seed(123, 7, "same_seed") == 123, "same_seed changed tile 7")
@@ -113,12 +117,23 @@ def main() -> None:
     assert_true(sum(int(segment["frames"]) for segment in clipped_segments) == 49, "plan should clip to video length")
     clipped_chunks = nodes._build_chunk_plan(clipped_segments, 81, 5)
     assert_true(len(clipped_chunks) == 1, "49 clipped frames should fit in one base chunk")
+    assert_true(nodes._normalize_free_tail_window_frames(True) == 4, "legacy true should map to 4 free-tail frames")
+    assert_true(nodes._normalize_free_tail_window_frames(False) == 0, "legacy false should disable free tail")
+    assert_true(nodes._normalize_free_tail_window_frames(6) == 8, "free-tail frames should snap up to a multiple of four")
     assert_true(
-        nodes._free_tail_window_target_length(49, 81, 49) == 53,
+        nodes._free_tail_window_target_length(49, 81, 49, 4) == 53,
         "49-frame free tail should add one latent step, not fill the whole 81-frame window",
     )
     assert_true(
-        nodes._free_tail_window_target_length(81, 81, 81) is None,
+        nodes._free_tail_window_target_length(49, 81, 49, 8) == 57,
+        "49-frame free tail should support two latent tail steps",
+    )
+    assert_true(
+        nodes._free_tail_window_target_length(49, 81, 49, 0) is None,
+        "zero free-tail frames should disable the final tail window",
+    )
+    assert_true(
+        nodes._free_tail_window_target_length(81, 81, 81, 4) is None,
         "full 81-frame windows should report no room for a free tail",
     )
     source_region = [246, 432, 548, 960]

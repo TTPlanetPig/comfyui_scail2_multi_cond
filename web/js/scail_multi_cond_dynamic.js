@@ -7,15 +7,367 @@ const MAX_SEGMENTS = 8;
 const MAX_REFERENCES = 8;
 const MAX_TILES = 8;
 const LONG_VIDEO_STATUS_EVENT = "scail2_long_video_status";
+const SCAIL_TOOLTIP_DELAY_MS = 3000;
 const LONG_VIDEO_NODE_TYPES = new Set([
     "SCAIL2ScheduledLongVideo",
     "SCAIL2ScheduledLongVideoWithSAM",
     "SCAIL2TiledLongVideo",
     "SCAIL2TiledLongVideoWithSAM",
 ]);
+const SCAIL_WIDGET_TOOLTIPS = new Map([
+    ["segment_count", "Number of plan segments to expose in this builder."],
+    ["segment_plan", "Frame plan used by the long-video scheduler. Each row selects frames, reference, prompt, negative prompt, and optional boundary overlap."],
+    ["max_frames", "Optional hard cap for output frames. Use 0 to follow the input video length and segment plan."],
+    ["pose_frame_count", "Frame count used for planning when no pose video is connected to this helper."],
+    ["max_chunk_frames", "Maximum frames in one SCAIL sampling window. SCAIL windows must be 4n+1 and are capped at 81."],
+    ["overlap_frames", "Frames reused from the previous chunk as previous_frames context. Higher values improve continuity but reduce new frames per chunk."],
+    ["boundary_overlap", "Override overlap only at this segment boundary, useful when changing references."],
+    ["reference_count", "Number of reference image slots to keep active."],
+    ["seed", "Base random seed. Tiled nodes may offset this per tile depending on tile_seed_mode."],
+    ["cfg", "Classifier-free guidance scale passed to sampling."],
+    ["mode", "replacement uses pose/reference masks; animation skips replacement masks and only uses motion/reference conditioning."],
+    ["color_correction", "Match chunk color against previous context after overlap removal."],
+    ["cache_mode", "disk reuses the last matching node result when inputs fingerprint the same; off always recomputes."],
+    ["free_tail_window", "Blank final conditioning frames to append and discard. 0 disables; 4 adds one latent step, 8 adds two, etc."],
+    ["object_indices", "Comma-separated tracked object indices from the driving video. Empty keeps all objects after sorting."],
+    ["reference_object_indices", "Comma-separated tracked object indices from the reference image. Empty keeps all reference objects."],
+    ["sort_by", "How tracked objects are ordered before object index filtering."],
+    ["sam_detection_threshold", "SAM detection confidence threshold. Higher values are stricter."],
+    ["sam_max_objects", "Maximum objects SAM should track."],
+    ["sam_detect_interval", "Frame interval for SAM detection refresh during tracking."],
+    ["tile_manifest", "JSON tile plan describing source crops, target crops, target size, overlap, and repaint constraints."],
+    ["output_width", "Requested final output width. Some builders adjust it to preserve aspect ratio and alignment."],
+    ["output_height", "Requested final output height. Some builders adjust it to preserve aspect ratio and alignment."],
+    ["scale_factor", "Fallback upscale multiplier when output width or height is not explicitly set."],
+    ["overlap_ratio", "Tile overlap ratio applied only where tiles touch neighboring tiles."],
+    ["tile_align", "Pixel alignment step for tile boxes and generated tile sizes."],
+    ["resolution_snap_mode", "Controls how target output resolution is snapped to alignment constraints."],
+    ["feather_px", "Blend feather width in output pixels for tile or face compositing."],
+    ["composite_feather_px", "Blend feather width used when tiled long video composites generated tile videos."],
+    ["min_tile_ratio", "Minimum allowed tile width/height ratio relative to the source frame."],
+    ["protected_padding_ratio", "Extra protected-area padding as a ratio of source dimensions."],
+    ["protected_padding_px", "Extra protected-area padding in source pixels."],
+    ["max_tile_pixels", "Maximum generated pixels allowed for each tile. Use this to stay under model limits."],
+    ["enforce_tile_pixel_limit", "Reject tile plans or repaint videos that exceed max_tile_pixels."],
+    ["expected_size_mismatch_mode", "What to do when a generated tile video does not match the planned tile size."],
+    ["aspect_mismatch_mode", "What to do when a generated tile aspect ratio differs from the planned tile aspect ratio."],
+    ["aspect_tolerance", "Allowed aspect-ratio error before aspect_mismatch_mode is triggered."],
+    ["image_resize_mode", "Resize filter used for reference images and pose/tile image crops."],
+    ["mask_resize_mode", "Resize filter used for masks. nearest keeps mask edges crisp."],
+    ["tile_fit_mode", "How generated tile video is fit into the planned tile region before compositing."],
+    ["frame_mismatch_mode", "How to handle tile videos with different frame counts."],
+    ["composite_color_correction", "Match tile colors during final compositing."],
+    ["tile_seed_mode", "Use the same seed for every tile or offset the seed by tile number."],
+    ["composite_blend_mode", "Tile seam blending method. core_feather is standard; ttp_seam uses the alternate TTP-style blend."],
+    ["blend_mode", "Tile composite blend method."],
+    ["layout_json", "Manual tile layout written by the visual editor. Keep this connected through the builder output."],
+    ["preview_frame_count", "Number of preview frames saved for the manual tile editor."],
+    ["preview_filename_prefix", "Filename prefix for manual tile preview images."],
+    ["coverage_policy", "How the manual tile builder handles uncovered source areas."],
+    ["tile_index", "1-based tile number to extract from the tile manifest."],
+    ["include_final_anchor", "Also export the final frame as a keyframe anchor."],
+    ["contact_sheet_columns", "Number of columns in the keyframe contact sheet."],
+    ["contact_sheet_thumbnail_width", "Thumbnail width used in the keyframe contact sheet."],
+    ["boundary_anchor_mode", "Which frame is used as the anchor around chunk boundaries."],
+    ["planner_summary", "Optional planner JSON summary. When connected, chunk/keyframe helpers use it instead of rebuilding a plan."],
+    ["filename_prefix", "Filename prefix used when saving viewer output images."],
+    ["save_location", "Where viewer output images are saved."],
+    ["display_group", "Which keyframe group the matrix viewer displays."],
+    ["crop_padding_ratio", "Relative padding around the tracked head crop."],
+    ["square_align", "Pixel alignment for square face crops."],
+    ["temporal_smoothing", "Amount of smoothing applied to tracked crop motion."],
+    ["mask_expand_px", "Pixels to expand masks before blur or compositing."],
+    ["mask_blur_px", "Pixels used to blur mask edges."],
+    ["crop_mode", "Face/head crop shape strategy."],
+    ["mask_component_mode", "Which mask components are kept for face/head tracking."],
+    ["target_frame_index", "Frame index used as the alignment target."],
+    ["face_scale", "Scale applied to the detected reference face before fitting."],
+    ["x_offset_ratio", "Horizontal reference-face offset inside the aligned crop."],
+    ["y_offset_ratio", "Vertical reference-face offset inside the aligned crop."],
+    ["face_size_basis", "Which face measurement is used as the size basis for alignment."],
+    ["target_face_select", "Which detected face to use in the target crop."],
+    ["reference_face_select", "Which detected face to use in the reference image."],
+    ["padding_mode", "How pixels outside the reference image are filled during alignment."],
+    ["insightface_model", "InsightFace model name used by the face aligner."],
+    ["provider", "Execution provider for face detection when available."],
+    ["det_size", "Detector input size for InsightFace."],
+    ["face_detector_backend", "Face detector backend used for reference alignment."],
+    ["mediapipe_model_selection", "MediaPipe face detection model selection."],
+    ["mediapipe_min_detection_confidence", "Minimum confidence for MediaPipe face detection."],
+    ["window_fit_mode", "How the aligned reference image is fit into the crop window."],
+    ["mask_contract_px", "Pixels to contract the face mask before compositing back."],
+    ["color_match_method", "Color matching method for face compositing."],
+    ["face_fit_mode", "How the refined face video is fit back into the original crop."],
+    ["stitch_mask_expand_px", "Pixels to expand the stitch mask at paste-back time."],
+    ["stitch_mask_resize_mode", "Resize filter used for stitch masks."],
+    ["stitch_offset_x_px", "Horizontal paste-back offset in pixels."],
+    ["stitch_offset_y_px", "Vertical paste-back offset in pixels."],
+]);
 
 function widgetByName(node, name) {
     return node.widgets?.find((widget) => widget.name === name);
+}
+
+let scailTooltipListenersInstalled = false;
+let scailTooltipElement = null;
+let scailTooltipTimer = null;
+let scailTooltipHoverKey = "";
+let scailTooltipHover = null;
+
+function scailTooltipForName(name) {
+    const text = SCAIL_WIDGET_TOOLTIPS.get(name);
+    if (text) {
+        return text;
+    }
+    if (/^segment_\d+_frames$/.test(name)) {
+        return "Number of output frames kept for this segment.";
+    }
+    if (/^segment_\d+_reference$/.test(name)) {
+        return "Reference image slot used by this segment.";
+    }
+    if (/^segment_\d+_prompt$/.test(name)) {
+        return "Positive prompt used only for this segment.";
+    }
+    if (/^segment_\d+_negative$/.test(name)) {
+        return "Negative prompt used only for this segment.";
+    }
+    if (/^segment_\d+_boundary_overlap$/.test(name)) {
+        return "Optional overlap override when entering this segment. Leave blank to use overlap_frames.";
+    }
+    if (/^reference_\d+$/.test(name)) {
+        return "Reference image for segment_plan rows that select this reference number.";
+    }
+    if (/^reference_\d+_mask$/.test(name)) {
+        return "Replacement mask paired with the matching reference image.";
+    }
+    if (/^reference_\d+_track_data$/.test(name)) {
+        return "SAM track data for this reference image, used to build replacement masks.";
+    }
+    if (/^tile_\d+_video$/.test(name)) {
+        return "Generated repaint video for this tile number.";
+    }
+    return "";
+}
+
+function scailTooltipForWidget(node, widget) {
+    const existing =
+        widget?.tooltip ??
+        widget?.options?.tooltip ??
+        widget?.callback?.tooltip ??
+        "";
+    return String(existing || scailTooltipForName(String(widget?.name ?? "")) || "").trim();
+}
+
+function installScailWidgetTooltips(node) {
+    ensureScailTooltipListeners();
+    for (const widget of node.widgets ?? []) {
+        const tooltip = scailTooltipForWidget(node, widget);
+        if (!tooltip) {
+            continue;
+        }
+        widget.tooltip = tooltip;
+        if (widget.options && typeof widget.options === "object" && !Array.isArray(widget.options)) {
+            widget.options.tooltip = tooltip;
+        }
+    }
+}
+
+function ensureScailTooltipElement() {
+    if (scailTooltipElement) {
+        return scailTooltipElement;
+    }
+    const element = document.createElement("div");
+    element.className = "scail-widget-tooltip";
+    element.style.cssText = [
+        "position:fixed",
+        "z-index:100000",
+        "display:none",
+        "pointer-events:none",
+        "max-width:320px",
+        "padding:8px 10px",
+        "border:1px solid rgba(148,163,184,.45)",
+        "border-radius:6px",
+        "background:rgba(15,23,42,.96)",
+        "color:#e5e7eb",
+        "box-shadow:0 12px 28px rgba(0,0,0,.35)",
+        "font:12px/1.4 system-ui,-apple-system,BlinkMacSystemFont,sans-serif",
+        "white-space:normal",
+        "overflow-wrap:anywhere",
+    ].join(";");
+    document.body.append(element);
+    scailTooltipElement = element;
+    return element;
+}
+
+function positionScailTooltip(event) {
+    const element = ensureScailTooltipElement();
+    const margin = 12;
+    const maxX = Math.max(margin, window.innerWidth - element.offsetWidth - margin);
+    const maxY = Math.max(margin, window.innerHeight - element.offsetHeight - margin);
+    const x = Math.min(maxX, Math.max(margin, event.clientX + 14));
+    const y = Math.min(maxY, Math.max(margin, event.clientY + 16));
+    element.style.left = `${x}px`;
+    element.style.top = `${y}px`;
+}
+
+function hideScailTooltip() {
+    if (scailTooltipTimer) {
+        clearTimeout(scailTooltipTimer);
+        scailTooltipTimer = null;
+    }
+    scailTooltipHoverKey = "";
+    scailTooltipHover = null;
+    if (scailTooltipElement) {
+        scailTooltipElement.style.display = "none";
+    }
+}
+
+function canvasEventToGraphPoint(event) {
+    const graphCanvas = app.canvas;
+    const canvas = graphCanvas?.canvas;
+    if (!canvas) {
+        return null;
+    }
+    let offset = null;
+    try {
+        offset = graphCanvas.convertEventToCanvasOffset?.(event);
+    } catch {
+        offset = null;
+    }
+    if (!Array.isArray(offset)) {
+        const rect = canvas.getBoundingClientRect();
+        offset = [event.clientX - rect.left, event.clientY - rect.top];
+    }
+    try {
+        const converted = graphCanvas.ds?.convertOffsetToCanvas?.(offset);
+        if (Array.isArray(converted)) {
+            return converted;
+        }
+    } catch {
+        // Fallback below handles older LiteGraph builds.
+    }
+    const scale = Number(graphCanvas.ds?.scale ?? 1) || 1;
+    const dsOffset = graphCanvas.ds?.offset ?? [0, 0];
+    return [
+        (offset[0] - Number(dsOffset[0] ?? 0)) / scale,
+        (offset[1] - Number(dsOffset[1] ?? 0)) / scale,
+    ];
+}
+
+function scailWidgetBounds(node, widget) {
+    if (!widget || widget.hidden) {
+        return null;
+    }
+    const y = Number(widget.last_y);
+    if (!Number.isFinite(y)) {
+        return null;
+    }
+    let height = Number(widget.computedHeight ?? widget.height ?? 0);
+    if (!Number.isFinite(height) || height <= 0) {
+        try {
+            const computed = widget.computeSize?.(node.size?.[0] ?? 420);
+            if (Array.isArray(computed)) {
+                height = Number(computed[1]);
+            }
+        } catch {
+            height = 0;
+        }
+    }
+    if (!Number.isFinite(height) || height <= 0) {
+        height = 20;
+    }
+    const margin = 6;
+    return {
+        x: Number(node.pos?.[0] ?? 0) + margin,
+        y: Number(node.pos?.[1] ?? 0) + y,
+        width: Math.max(1, Number(node.size?.[0] ?? 420) - margin * 2),
+        height,
+    };
+}
+
+function findHoveredScailWidget(event) {
+    const point = canvasEventToGraphPoint(event);
+    if (!point) {
+        return null;
+    }
+    const nodes = app.graph?._nodes ?? [];
+    for (let nodeIndex = nodes.length - 1; nodeIndex >= 0; nodeIndex -= 1) {
+        const node = nodes[nodeIndex];
+        const nodeName = String(node?.scailNodeName ?? node?.type ?? "");
+        if (!nodeName.startsWith("SCAIL2")) {
+            continue;
+        }
+        const nodeX = Number(node.pos?.[0] ?? 0);
+        const nodeY = Number(node.pos?.[1] ?? 0);
+        const nodeW = Number(node.size?.[0] ?? 0);
+        const nodeH = Number(node.size?.[1] ?? 0);
+        if (point[0] < nodeX || point[0] > nodeX + nodeW || point[1] < nodeY || point[1] > nodeY + nodeH) {
+            continue;
+        }
+        installScailWidgetTooltips(node);
+        for (const widget of node.widgets ?? []) {
+            const tooltip = scailTooltipForWidget(node, widget);
+            if (!tooltip) {
+                continue;
+            }
+            const bounds = scailWidgetBounds(node, widget);
+            if (!bounds) {
+                continue;
+            }
+            if (
+                point[0] >= bounds.x &&
+                point[0] <= bounds.x + bounds.width &&
+                point[1] >= bounds.y &&
+                point[1] <= bounds.y + bounds.height
+            ) {
+                return { node, widget, tooltip };
+            }
+        }
+    }
+    return null;
+}
+
+function handleScailTooltipMove(event) {
+    const hit = findHoveredScailWidget(event);
+    if (!hit) {
+        hideScailTooltip();
+        return;
+    }
+    const key = `${hit.node.id ?? hit.node.title}:${hit.widget.name}`;
+    if (key === scailTooltipHoverKey) {
+        scailTooltipHover = { ...hit, event };
+        if (scailTooltipElement?.style.display === "block") {
+            positionScailTooltip(event);
+        }
+        return;
+    }
+    hideScailTooltip();
+    scailTooltipHoverKey = key;
+    scailTooltipHover = { ...hit, event };
+    scailTooltipTimer = window.setTimeout(() => {
+        if (!scailTooltipHover || scailTooltipHoverKey !== key) {
+            return;
+        }
+        const element = ensureScailTooltipElement();
+        element.textContent = scailTooltipHover.tooltip;
+        element.style.display = "block";
+        positionScailTooltip(scailTooltipHover.event);
+    }, SCAIL_TOOLTIP_DELAY_MS);
+}
+
+function ensureScailTooltipListeners() {
+    if (scailTooltipListenersInstalled) {
+        return;
+    }
+    const canvas = app.canvas?.canvas;
+    if (!canvas) {
+        return;
+    }
+    scailTooltipListenersInstalled = true;
+    canvas.addEventListener("mousemove", handleScailTooltipMove, { passive: true });
+    canvas.addEventListener("mouseleave", hideScailTooltip, { passive: true });
+    canvas.addEventListener("mousedown", hideScailTooltip, { passive: true });
+    canvas.addEventListener("wheel", hideScailTooltip, { passive: true });
 }
 
 function setWidgetVisible(widget, visible) {
@@ -1529,6 +1881,22 @@ function renderManualTileEditor(node) {
 app.registerExtension({
     name: "scail_multi_cond.dynamic_inputs",
     beforeRegisterNodeDef(nodeType, nodeData) {
+        if (String(nodeData.name ?? "").startsWith("SCAIL2")) {
+            const originalOnNodeCreated = nodeType.prototype.onNodeCreated;
+            nodeType.prototype.onNodeCreated = function () {
+                originalOnNodeCreated?.apply(this, arguments);
+                this.scailNodeName = nodeData.name;
+                requestAnimationFrame(() => installScailWidgetTooltips(this));
+            };
+
+            const originalOnConfigure = nodeType.prototype.onConfigure;
+            nodeType.prototype.onConfigure = function () {
+                originalOnConfigure?.apply(this, arguments);
+                this.scailNodeName = nodeData.name;
+                requestAnimationFrame(() => installScailWidgetTooltips(this));
+            };
+        }
+
         if (nodeData.name === "SCAIL2SegmentPlanBuilder") {
             const originalOnNodeCreated = nodeType.prototype.onNodeCreated;
             nodeType.prototype.onNodeCreated = function () {

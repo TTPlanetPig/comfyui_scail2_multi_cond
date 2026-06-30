@@ -39,6 +39,10 @@ assert(/status_unique_id=unique_id/.test(tiledRunnerSource), "tiled child schedu
 assert(/status_prefix=f"Tile/.test(tiledRunnerSource), "tiled child status should include tile prefix");
 
 assert(/const LONG_VIDEO_STATUS_EVENT = "scail2_long_video_status"/.test(uiSource), "frontend should define matching status event");
+assert(/const SCAIL_TOOLTIP_DELAY_MS = 3000/.test(uiSource), "frontend widget tooltips should use the requested three-second hover delay");
+assert(/function installScailWidgetTooltips/.test(uiSource), "frontend should install widget tooltip metadata");
+assert(/function handleScailTooltipMove/.test(uiSource), "frontend should handle canvas widget hover tooltips");
+assert(/startsWith\("SCAIL2"\)/.test(registerSource), "all SCAIL2 nodes should install widget tooltips");
 assert(/function ensureLongVideoStatusWidget/.test(uiStatusSource), "frontend should create a status widget");
 assert(/function renderLongVideoStatus/.test(uiStatusSource), "frontend should render status text");
 assert(/api\.addEventListener\?\.\(LONG_VIDEO_STATUS_EVENT, handleLongVideoStatus\)/.test(uiStatusSource), "frontend should listen for backend status events");

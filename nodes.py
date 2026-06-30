@@ -16,6 +16,7 @@ CATEGORY = "SCAIL-2/Scheduled"
 MAX_REFERENCES = 8
 MAX_TILES = 8
 DEFAULT_MAX_TILE_PIXELS = 1280 * 720
+FREE_TAIL_WINDOW_MAX_FRAMES = 64
 LONG_VIDEO_STATUS_EVENT = "scail2_long_video_status"
 DEFAULT_PLAN = """# frames | reference | prompt | negative | boundary_overlap
 49 | 1 | first segment prompt | | 5
@@ -342,14 +343,28 @@ def _normalize_overlap(value: int, max_chunk_frames: int) -> int:
     return min(_floor_to_4n_plus_1(requested), 33, int(max_chunk_frames) - 4)
 
 
+def _normalize_free_tail_window_frames(value: Any) -> int:
+    if isinstance(value, bool):
+        return 4 if value else 0
+    requested = max(0, int(value or 0))
+    if requested <= 0:
+        return 0
+    requested = min(FREE_TAIL_WINDOW_MAX_FRAMES, requested)
+    return ((requested + 3) // 4) * 4
+
+
 def _free_tail_window_target_length(
     raw_length: int,
     max_chunk_frames: int,
     remaining: int,
+    tail_frames: int,
 ) -> Optional[int]:
+    requested_tail_frames = _normalize_free_tail_window_frames(tail_frames)
+    if requested_tail_frames <= 0:
+        return None
     raw_length = max(1, int(raw_length))
     max_chunk_frames = min(81, _ceil_to_4n_plus_1(max(17, int(max_chunk_frames))))
-    target_length = _ceil_to_4n_plus_1(raw_length + 4)
+    target_length = _ceil_to_4n_plus_1(raw_length + requested_tail_frames)
     if target_length < 17 and int(remaining) > 1:
         target_length = 17
     if int(target_length) > int(max_chunk_frames):
@@ -1074,12 +1089,15 @@ def _resize_image_tensor_like(image: torch.Tensor, target: torch.Tensor, *, mode
 
 def _free_tail_window_input_spec() -> tuple[str, dict[str, Any]]:
     return (
-        "BOOLEAN",
+        "INT",
         {
-            "default": False,
+            "default": 0,
+            "min": 0,
+            "max": FREE_TAIL_WINDOW_MAX_FRAMES,
+            "step": 4,
             "tooltip": (
-                "Fill the final sampling window with blank, unreferenced tail frames, "
-                "then discard those tail frames from the returned outputs."
+                "Blank conditioning frames appended only to the final sampling window, then discarded. "
+                "Use 0 to disable; 4 adds one latent step, 8 adds two, and so on."
             ),
         },
     )
@@ -3877,7 +3895,7 @@ class SCAIL2ScheduledLongVideo:
         reference_count: int,
         color_correction: bool,
         cache_mode: str = "disk",
-        free_tail_window: bool = False,
+        free_tail_window: int = 0,
         pose_video_mask=None,
         prompt=None,
         unique_id=None,
@@ -3887,7 +3905,7 @@ class SCAIL2ScheduledLongVideo:
     ):
         if not isinstance(pose_video, torch.Tensor) or pose_video.ndim != 4:
             raise ValueError("pose_video must be a ComfyUI IMAGE tensor.")
-        free_tail_window = bool(free_tail_window)
+        free_tail_window = _normalize_free_tail_window_frames(free_tail_window)
         status_id = unique_id if status_unique_id is None else status_unique_id
         status_prefix_text = str(status_prefix or "")
 
@@ -3923,7 +3941,7 @@ class SCAIL2ScheduledLongVideo:
                 "overlap_frames": int(overlap_frames),
                 "reference_count": int(reference_count),
                 "color_correction": bool(color_correction),
-                "free_tail_window": bool(free_tail_window),
+                "free_tail_window": int(free_tail_window),
                 "pose_video_mask": _tensor_fingerprint(pose_video_mask),
                 "dynamic_inputs": _cache_marker(kwargs),
             }
@@ -4066,7 +4084,8 @@ class SCAIL2ScheduledLongVideo:
         chunk_summaries: list[dict[str, Any]] = []
         last_segment_reference = None
         free_tail_window_summary: dict[str, Any] = {
-            "enabled": bool(free_tail_window),
+            "enabled": int(free_tail_window) > 0,
+            "requested_tail_frames": int(free_tail_window),
             "applied": False,
             "strategy": "blank_conditioning_tail_in_final_window",
             "forced_pre_tail_split": False,
@@ -4108,12 +4127,13 @@ class SCAIL2ScheduledLongVideo:
                 if wanted_keep <= 0:
                     raise RuntimeError("Internal planner produced an empty chunk.")
                 forced_pre_tail_split = False
-                if free_tail_window and is_final_segment and wanted_keep >= remaining and remaining > 1:
+                if int(free_tail_window) > 0 and is_final_segment and wanted_keep >= remaining and remaining > 1:
                     projected_raw_length = int(wanted_keep) if not has_previous else int(wanted_keep) + int(actual_overlap)
                     projected_tail_length = _free_tail_window_target_length(
                         projected_raw_length,
                         max_chunk_frames,
                         remaining,
+                        free_tail_window,
                     )
                     projected_tail_frames = (
                         0
@@ -4137,9 +4157,9 @@ class SCAIL2ScheduledLongVideo:
                 if wanted_keep <= 0:
                     raise RuntimeError("overlap_frames leaves no room for new frames.")
                 raw_length = wanted_keep if not has_previous else wanted_keep + actual_overlap
-                is_final_output_chunk = bool(free_tail_window) and is_final_segment and int(wanted_keep) >= int(remaining)
+                is_final_output_chunk = int(free_tail_window) > 0 and is_final_segment and int(wanted_keep) >= int(remaining)
                 if is_final_output_chunk:
-                    free_tail_length = _free_tail_window_target_length(raw_length, max_chunk_frames, remaining)
+                    free_tail_length = _free_tail_window_target_length(raw_length, max_chunk_frames, remaining, free_tail_window)
                     if free_tail_length is not None and int(free_tail_length) > int(length):
                         length = int(free_tail_length)
                 tail_window_padding_frames = max(0, int(length) - int(raw_length))
@@ -4317,6 +4337,7 @@ class SCAIL2ScheduledLongVideo:
                         "kept_frames": int(kept.shape[0]),
                         "produced_total": int(produced),
                         "free_tail_window": {
+                            "requested_tail_frames": int(free_tail_window),
                             "forced_pre_tail_split": bool(forced_pre_tail_split),
                             "applied": bool(tail_window_applied),
                             "conditioning_tail_frames": int(tail_conditioning_frames),
@@ -4474,7 +4495,7 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
         reference_count: int,
         color_correction: bool,
         cache_mode: str = "disk",
-        free_tail_window: bool = False,
+        free_tail_window: int = 0,
         object_indices: str = "",
         reference_object_indices: str = "",
         sort_by: str = "left_to_right",
@@ -4491,6 +4512,7 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
     ):
         if not isinstance(pose_video, torch.Tensor) or pose_video.ndim != 4:
             raise ValueError("pose_video must be a ComfyUI IMAGE tensor.")
+        free_tail_window = _normalize_free_tail_window_frames(free_tail_window)
         status_id = unique_id if status_unique_id is None else status_unique_id
         status_prefix_text = str(status_prefix or "")
 
@@ -4545,7 +4567,7 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
                 "overlap_frames": int(overlap_frames),
                 "reference_count": int(reference_count),
                 "color_correction": bool(color_correction),
-                "free_tail_window": bool(free_tail_window),
+                "free_tail_window": int(free_tail_window),
                 "object_indices": object_indices,
                 "reference_object_indices": reference_object_indices,
                 "sort_by": sort_by,
@@ -4601,7 +4623,7 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
                 reference_count,
                 color_correction,
                 cache_mode="off",
-                free_tail_window=bool(free_tail_window),
+                free_tail_window=int(free_tail_window),
                 prompt=prompt,
                 unique_id=unique_id,
                 status_unique_id=status_id,
@@ -4720,7 +4742,7 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
             reference_count,
             color_correction,
             cache_mode="off",
-            free_tail_window=bool(free_tail_window),
+            free_tail_window=int(free_tail_window),
             prompt=prompt,
             unique_id=unique_id,
             status_unique_id=status_id,
@@ -6554,7 +6576,7 @@ def _run_tiled_long_video(
     frame_mismatch_mode: str,
     composite_color_correction: bool,
     tile_seed_mode: str,
-    free_tail_window: bool,
+    free_tail_window: int,
     pose_video_mask: Optional[torch.Tensor],
     sam_options: Optional[dict[str, Any]],
     prompt=None,
@@ -6563,6 +6585,7 @@ def _run_tiled_long_video(
 ):
     if not isinstance(pose_video, torch.Tensor) or pose_video.ndim != 4:
         raise ValueError("pose_video must be a ComfyUI IMAGE tensor.")
+    free_tail_window = _normalize_free_tail_window_frames(free_tail_window)
     status_node_name = "SCAIL2TiledLongVideoWithSAM" if bool(use_internal_sam) else "SCAIL2TiledLongVideo"
 
     def send_status(stage: str, message: str, *, progress: Optional[dict[str, Any]] = None, **extra: Any) -> None:
@@ -6686,7 +6709,7 @@ def _run_tiled_long_video(
                 reference_count,
                 color_correction,
                 cache_mode=str(cache_mode),
-                free_tail_window=bool(free_tail_window),
+                free_tail_window=int(free_tail_window),
                 prompt=prompt,
                 unique_id=child_unique_id,
                 status_unique_id=unique_id,
@@ -6762,7 +6785,7 @@ def _run_tiled_long_video(
         "used_refs": used_refs,
         "tile_seed_mode": str(tile_seed_mode),
         "seed_start": int(seed),
-        "free_tail_window": bool(free_tail_window),
+        "free_tail_window": int(free_tail_window),
         "max_tile_pixels": int(max_tile_pixels),
         "composite_blend_mode": str(composite_blend_mode),
         "internal_sam": internal_sam_summary,
@@ -6874,7 +6897,7 @@ class SCAIL2TiledLongVideo:
         tile_seed_mode: str = "offset_by_tile",
         cache_mode: str = "disk",
         composite_blend_mode: str = "core_feather",
-        free_tail_window: bool = False,
+        free_tail_window: int = 0,
         pose_video_mask: Optional[torch.Tensor] = None,
         prompt=None,
         unique_id=None,
@@ -6913,7 +6936,7 @@ class SCAIL2TiledLongVideo:
             frame_mismatch_mode=str(frame_mismatch_mode),
             composite_color_correction=bool(composite_color_correction),
             tile_seed_mode=str(tile_seed_mode),
-            free_tail_window=bool(free_tail_window),
+            free_tail_window=int(free_tail_window),
             pose_video_mask=pose_video_mask,
             sam_options=None,
             prompt=prompt,
@@ -7039,7 +7062,7 @@ class SCAIL2TiledLongVideoWithSAM:
         tile_seed_mode: str = "offset_by_tile",
         cache_mode: str = "disk",
         composite_blend_mode: str = "core_feather",
-        free_tail_window: bool = False,
+        free_tail_window: int = 0,
         sam_model=None,
         sam_conditioning=None,
         prompt=None,
@@ -7079,7 +7102,7 @@ class SCAIL2TiledLongVideoWithSAM:
             frame_mismatch_mode=str(frame_mismatch_mode),
             composite_color_correction=bool(composite_color_correction),
             tile_seed_mode=str(tile_seed_mode),
-            free_tail_window=bool(free_tail_window),
+            free_tail_window=int(free_tail_window),
             pose_video_mask=None,
             sam_options={
                 "sam_model": sam_model,
