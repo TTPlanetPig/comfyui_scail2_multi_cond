@@ -16,6 +16,7 @@ CATEGORY = "SCAIL-2/Scheduled"
 MAX_REFERENCES = 8
 MAX_TILES = 8
 DEFAULT_MAX_TILE_PIXELS = 1280 * 720
+LONG_VIDEO_STATUS_EVENT = "scail2_long_video_status"
 DEFAULT_PLAN = """# frames | reference | prompt | negative | boundary_overlap
 49 | 1 | first segment prompt | | 5
 121 | 2 | second segment prompt | | 5
@@ -24,6 +25,35 @@ DEFAULT_PLAN = """# frames | reference | prompt | negative | boundary_overlap
 """
 _INSIGHTFACE_APP_CACHE: dict[tuple[str, str, int], Any] = {}
 _MEDIAPIPE_FACE_DETECTION_CACHE: dict[tuple[int, float], Any] = {}
+
+
+def _send_long_video_status(
+    unique_id: Any,
+    node_name: str,
+    stage: str,
+    message: str,
+    *,
+    progress: Optional[dict[str, Any]] = None,
+    **extra: Any,
+) -> None:
+    if unique_id is None:
+        return
+    payload: dict[str, Any] = {
+        "node_id": str(unique_id),
+        "node": str(node_name),
+        "stage": str(stage),
+        "message": str(message),
+        "timestamp": float(time.time()),
+    }
+    if progress is not None:
+        payload["progress"] = progress
+    payload.update(extra)
+    try:
+        from server import PromptServer
+
+        PromptServer.instance.send_sync(LONG_VIDEO_STATUS_EVENT, payload)
+    except Exception:
+        pass
 
 
 def _shape(value: Any) -> list[int]:
@@ -3836,11 +3866,27 @@ class SCAIL2ScheduledLongVideo:
         pose_video_mask=None,
         prompt=None,
         unique_id=None,
+        status_unique_id=None,
+        status_prefix: str = "",
         **kwargs,
     ):
         if not isinstance(pose_video, torch.Tensor) or pose_video.ndim != 4:
             raise ValueError("pose_video must be a ComfyUI IMAGE tensor.")
         free_tail_window = bool(free_tail_window)
+        status_id = unique_id if status_unique_id is None else status_unique_id
+        status_prefix_text = str(status_prefix or "")
+
+        def send_status(stage: str, message: str, *, progress: Optional[dict[str, Any]] = None, **extra: Any) -> None:
+            _send_long_video_status(
+                status_id,
+                "SCAIL2ScheduledLongVideo",
+                stage,
+                f"{status_prefix_text}{message}",
+                progress=progress,
+                **extra,
+            )
+
+        send_status("preparing", "Preparing long video")
 
         call_cache_key = _stable_fingerprint(
             {
@@ -3873,11 +3919,13 @@ class SCAIL2ScheduledLongVideo:
         cached_result = getattr(self, "_last_generate_cache_result", None)
         if cached_key == call_cache_key and cached_result is not None:
             print("[SCAIL2ScheduledLongVideo] semantic cache hit; returning previous result without sampling.")
+            send_status("cache_hit", "Cache hit; using previous result", progress={"current": 1, "total": 1})
             return _clone_cached_result(cached_result)
         if use_disk_cache:
             disk_result = _load_single_slot_disk_cache("SCAIL2ScheduledLongVideo", unique_id, call_cache_key)
             if disk_result is not None:
                 print("[SCAIL2ScheduledLongVideo] disk cache hit; returning previous result without sampling.")
+                send_status("cache_hit", "Disk cache hit; loading previous result", progress={"current": 1, "total": 1})
                 self._last_generate_cache_key = call_cache_key
                 self._last_generate_cache_result = _clone_cached_result(disk_result)
                 return _clone_cached_result(disk_result)
@@ -3892,6 +3940,11 @@ class SCAIL2ScheduledLongVideo:
         replacement_mode = mode == "replacement"
         planned_chunks = _build_chunk_plan(segments, max_chunk_frames, overlap)
         planned_frames = sum(segment["frames"] for segment in segments)
+        send_status(
+            "planning",
+            f"Planning {planned_frames} frame(s) across {len(planned_chunks)} chunk(s)",
+            progress={"current": 0, "total": max(1, len(planned_chunks))},
+        )
         print(
             "[SCAIL2ScheduledLongVideo] "
             f"pose_frames={total_pose_frames} planned_frames={planned_frames} "
@@ -3931,6 +3984,7 @@ class SCAIL2ScheduledLongVideo:
             raise ValueError(f"segment_plan references missing image input(s): {missing}")
 
         if replacement_mode:
+            send_status("validating_masks", "Validating replacement masks")
             if pose_video_mask is None:
                 raise ValueError("replacement mode requires pose_video_mask from Create SCAIL-2 Colored Mask.")
             missing_masks = [index for index in used_refs if index not in reference_masks]
@@ -3970,9 +4024,20 @@ class SCAIL2ScheduledLongVideo:
             "[SCAIL2ScheduledLongVideo] prewarm "
             f"references={used_refs} prompt_pairs={len(prompt_pairs)}"
         )
-        for index in used_refs:
+        for ref_position, index in enumerate(used_refs, start=1):
+            send_status(
+                "encoding_references",
+                f"Encoding reference {ref_position}/{len(used_refs)}",
+                progress={"current": ref_position, "total": max(1, len(used_refs))},
+                reference=int(index),
+            )
             get_reference(index)
-        for prompt, negative in prompt_pairs:
+        for prompt_position, (prompt, negative) in enumerate(prompt_pairs, start=1):
+            send_status(
+                "encoding_prompts",
+                f"Encoding prompt pair {prompt_position}/{len(prompt_pairs)}",
+                progress={"current": prompt_position, "total": max(1, len(prompt_pairs))},
+            )
             get_prompt(prompt, negative)
         print("[SCAIL2ScheduledLongVideo] prewarm done")
 
@@ -4066,6 +4131,14 @@ class SCAIL2ScheduledLongVideo:
                     f"offset_input={video_frame_offset} internal_window_offset={internal_window_offset} "
                     f"produced_before={produced} free_tail={tail_window_applied}"
                 )
+                chunk_progress = {"current": int(chunk_index) + 1, "total": max(1, len(planned_chunks))}
+                send_status(
+                    "building_conditioning",
+                    f"Chunk {chunk_index + 1}/{max(1, len(planned_chunks))}: building conditioning",
+                    progress=chunk_progress,
+                    chunk_index=int(chunk_index),
+                    reference=int(segment["reference"]),
+                )
                 previous_frames_for_scail = (
                     previous_frames[-actual_overlap:].contiguous()
                     if previous_frames is not None and actual_overlap > 0
@@ -4113,6 +4186,12 @@ class SCAIL2ScheduledLongVideo:
                 if len(scail_out) != 4:
                     raise RuntimeError("WanSCAILToVideo returned an unexpected result.")
                 chunk_positive, chunk_negative, latent, _next_offset = scail_out
+                send_status(
+                    "sampling",
+                    f"Chunk {chunk_index + 1}/{max(1, len(planned_chunks))}: sampling",
+                    progress=chunk_progress,
+                    chunk_index=int(chunk_index),
+                )
                 latent_to_decode = _sample_for_decode(
                     model=model,
                     positive=chunk_positive,
@@ -4122,6 +4201,12 @@ class SCAIL2ScheduledLongVideo:
                     latent=latent,
                     seed=int(seed) + chunk_index,
                     cfg=float(cfg),
+                )
+                send_status(
+                    "decoding",
+                    f"Chunk {chunk_index + 1}/{max(1, len(planned_chunks))}: decoding",
+                    progress=chunk_progress,
+                    chunk_index=int(chunk_index),
                 )
                 decoded = _decode_latent_to_frames(vae, latent_to_decode)
 
@@ -4184,6 +4269,12 @@ class SCAIL2ScheduledLongVideo:
                     previous_frames = torch.cat(stitched, dim=0)[-overlap:].contiguous()
                 else:
                     previous_frames = None
+                send_status(
+                    "stitching_chunks",
+                    f"Chunk {chunk_index + 1}: stitched {produced}/{planned_frames} frame(s)",
+                    progress={"current": int(produced), "total": max(1, int(planned_frames))},
+                    chunk_index=int(chunk_index),
+                )
 
                 chunk_summaries.append(
                     {
@@ -4268,6 +4359,7 @@ class SCAIL2ScheduledLongVideo:
         if use_disk_cache:
             _save_single_slot_disk_cache("SCAIL2ScheduledLongVideo", unique_id, call_cache_key, result)
         _empty_cache(force=True)
+        send_status("done", f"Done: {int(frames.shape[0])} frame(s)", progress={"current": 1, "total": 1})
         return result
 
 
@@ -4371,10 +4463,26 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
         sam_conditioning=None,
         prompt=None,
         unique_id=None,
+        status_unique_id=None,
+        status_prefix: str = "",
         **kwargs,
     ):
         if not isinstance(pose_video, torch.Tensor) or pose_video.ndim != 4:
             raise ValueError("pose_video must be a ComfyUI IMAGE tensor.")
+        status_id = unique_id if status_unique_id is None else status_unique_id
+        status_prefix_text = str(status_prefix or "")
+
+        def send_status(stage: str, message: str, *, progress: Optional[dict[str, Any]] = None, **extra: Any) -> None:
+            _send_long_video_status(
+                status_id,
+                "SCAIL2ScheduledLongVideoWithSAM",
+                stage,
+                f"{status_prefix_text}{message}",
+                progress=progress,
+                **extra,
+            )
+
+        send_status("preparing", "Preparing internal SAM long video")
 
         active_reference_count = max(1, min(MAX_REFERENCES, int(reference_count)))
         segments = _parse_plan(segment_plan, pose_frame_count=int(pose_video.shape[0]), max_frames=max_frames)
@@ -4434,6 +4542,7 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
                 "[SCAIL2ScheduledLongVideoWithSAM] semantic cache hit; "
                 "returning previous result without SAM tracking/sampling."
             )
+            send_status("cache_hit", "Cache hit; using previous result", progress={"current": 1, "total": 1})
             return _clone_cached_result(cached_result)
         if use_disk_cache:
             disk_result = _load_single_slot_disk_cache("SCAIL2ScheduledLongVideoWithSAM", unique_id, call_cache_key)
@@ -4442,11 +4551,13 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
                     "[SCAIL2ScheduledLongVideoWithSAM] disk cache hit; "
                     "returning previous result without SAM tracking/sampling."
                 )
+                send_status("cache_hit", "Disk cache hit; loading previous result", progress={"current": 1, "total": 1})
                 self._last_internal_sam_cache_key = call_cache_key
                 self._last_internal_sam_cache_result = _clone_cached_result(disk_result)
                 return _clone_cached_result(disk_result)
 
         if not replacement_mode:
+            send_status("skipping_sam", "Animation mode: skipping SAM masks")
             generate_kwargs: dict[str, Any] = {}
             for index, image in references.items():
                 generate_kwargs[f"reference_{index}"] = image
@@ -4471,6 +4582,8 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
                 free_tail_window=bool(free_tail_window),
                 prompt=prompt,
                 unique_id=unique_id,
+                status_unique_id=status_id,
+                status_prefix=status_prefix_text,
                 **generate_kwargs,
             )
             try:
@@ -4486,6 +4599,7 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
             self._last_internal_sam_cache_result = _clone_cached_result(result)
             if use_disk_cache:
                 _save_single_slot_disk_cache("SCAIL2ScheduledLongVideoWithSAM", unique_id, call_cache_key, result)
+            send_status("done", "Done", progress={"current": 1, "total": 1})
             return result
 
         if sam_model is None or sam_conditioning is None:
@@ -4497,6 +4611,7 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
             f"object_indices='{object_indices}' reference_object_indices='{reference_object_indices}' "
             f"sort_by={sort_by}"
         )
+        send_status("running_sam_pose", "Running SAM on pose video")
         driving_track_data = _run_sam3_track(
             pose_video,
             sam_model,
@@ -4509,7 +4624,13 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
         pose_video_mask = None
         reference_masks: dict[int, torch.Tensor] = {}
         track_summary: list[dict[str, Any]] = []
-        for index in used_refs:
+        for ref_position, index in enumerate(used_refs, start=1):
+            send_status(
+                "running_sam_reference",
+                f"Running SAM on reference {ref_position}/{len(used_refs)}",
+                progress={"current": ref_position, "total": max(1, len(used_refs))},
+                reference=int(index),
+            )
             reference_track_data = _run_sam3_track(
                 references[index],
                 sam_model,
@@ -4519,6 +4640,12 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
                 detect_interval=1,
             )
 
+            send_status(
+                "building_masks",
+                f"Building replacement masks for reference {ref_position}/{len(used_refs)}",
+                progress={"current": ref_position, "total": max(1, len(used_refs))},
+                reference=int(index),
+            )
             current_pose_mask, _ = _create_scail_masks(
                 driving_track_data,
                 reference_track_data,
@@ -4574,6 +4701,8 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
             free_tail_window=bool(free_tail_window),
             prompt=prompt,
             unique_id=unique_id,
+            status_unique_id=status_id,
+            status_prefix=status_prefix_text,
             **generate_kwargs,
         )
         try:
@@ -4595,6 +4724,7 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
         self._last_internal_sam_cache_result = _clone_cached_result(result)
         if use_disk_cache:
             _save_single_slot_disk_cache("SCAIL2ScheduledLongVideoWithSAM", unique_id, call_cache_key, result)
+        send_status("done", "Done", progress={"current": 1, "total": 1})
         return result
 
 
@@ -6171,6 +6301,9 @@ def _build_tiled_global_sam_masks(
     references: dict[int, torch.Tensor],
     used_refs: list[int],
     sam_options: dict[str, Any],
+    *,
+    status_unique_id: Any = None,
+    status_node_name: str = "SCAIL2TiledLongVideoWithSAM",
 ) -> tuple[torch.Tensor, dict[int, torch.Tensor], dict[str, Any]]:
     sam_model = sam_options.get("sam_model")
     sam_conditioning = sam_options.get("sam_conditioning")
@@ -6191,6 +6324,7 @@ def _build_tiled_global_sam_masks(
         f"pose_frames={int(pose_video.shape[0])} refs={used_refs} "
         f"object_indices='{object_indices}' reference_object_indices='{reference_object_indices}' sort_by={sort_by}"
     )
+    _send_long_video_status(status_unique_id, status_node_name, "running_global_sam_pose", "Running global SAM on pose video")
     driving_track_data = _run_sam3_track(
         pose_video,
         sam_model,
@@ -6203,7 +6337,15 @@ def _build_tiled_global_sam_masks(
     pose_video_mask = None
     reference_masks: dict[int, torch.Tensor] = {}
     track_summary: list[dict[str, Any]] = []
-    for index in used_refs:
+    for ref_position, index in enumerate(used_refs, start=1):
+        _send_long_video_status(
+            status_unique_id,
+            status_node_name,
+            "running_global_sam_reference",
+            f"Running global SAM on reference {ref_position}/{len(used_refs)}",
+            progress={"current": ref_position, "total": max(1, len(used_refs))},
+            reference=int(index),
+        )
         reference_track_data = _run_sam3_track(
             references[index],
             sam_model,
@@ -6211,6 +6353,14 @@ def _build_tiled_global_sam_masks(
             detection_threshold=detection_threshold,
             max_objects=max_objects,
             detect_interval=1,
+        )
+        _send_long_video_status(
+            status_unique_id,
+            status_node_name,
+            "building_global_masks",
+            f"Building global masks for reference {ref_position}/{len(used_refs)}",
+            progress={"current": ref_position, "total": max(1, len(used_refs))},
+            reference=int(index),
         )
         current_pose_mask, _ = _create_scail_masks(
             driving_track_data,
@@ -6239,6 +6389,7 @@ def _build_tiled_global_sam_masks(
 
     if pose_video_mask is None:
         raise RuntimeError("Global internal SAM tracking produced no pose_video_mask.")
+    _send_long_video_status(status_unique_id, status_node_name, "global_masks_ready", "Global SAM masks ready")
 
     return (
         pose_video_mask.detach().contiguous(),
@@ -6390,7 +6541,19 @@ def _run_tiled_long_video(
 ):
     if not isinstance(pose_video, torch.Tensor) or pose_video.ndim != 4:
         raise ValueError("pose_video must be a ComfyUI IMAGE tensor.")
+    status_node_name = "SCAIL2TiledLongVideoWithSAM" if bool(use_internal_sam) else "SCAIL2TiledLongVideo"
 
+    def send_status(stage: str, message: str, *, progress: Optional[dict[str, Any]] = None, **extra: Any) -> None:
+        _send_long_video_status(
+            unique_id,
+            status_node_name,
+            stage,
+            message,
+            progress=progress,
+            **extra,
+        )
+
+    send_status("validating_manifest", "Validating tile manifest")
     manifest = _parse_tile_manifest(tile_manifest)
     preflight_warnings = _validate_tiled_long_video_manifest(
         manifest,
@@ -6398,7 +6561,9 @@ def _run_tiled_long_video(
         int(max_tile_pixels),
         bool(enforce_tile_pixel_limit),
     )
+    send_status("planning_tiles", f"Planning {len(manifest.get('tiles', []))} tile(s)")
     segments = _parse_plan(segment_plan, pose_frame_count=int(pose_video.shape[0]), max_frames=max_frames)
+    send_status("collecting_references", "Collecting tiled references and masks")
     references, reference_masks = _collect_reference_inputs(
         kwargs,
         int(reference_count),
@@ -6426,11 +6591,14 @@ def _run_tiled_long_video(
         "mask_strategy": "not_used",
     }
     if bool(use_internal_sam) and replacement_mode:
+        send_status("running_global_sam", "Running global SAM before tile cropping")
         pose_video_mask, reference_masks, internal_sam_summary = _build_tiled_global_sam_masks(
             pose_video,
             references,
             used_refs,
             sam_options,
+            status_unique_id=unique_id,
+            status_node_name=status_node_name,
         )
     elif bool(use_internal_sam):
         internal_sam_summary = {
@@ -6447,10 +6615,17 @@ def _run_tiled_long_video(
         f"mode={mode} used_refs={used_refs} target={manifest.get('target_size')}"
     )
 
-    for tile in tiles:
+    for tile_position, tile in enumerate(tiles, start=1):
         tile_number = int(tile.get("tile_number", int(tile.get("index", 0)) + 1))
         current_seed = _tile_seed(int(seed), tile_number, str(tile_seed_mode))
         try:
+            tile_progress = {"current": tile_position, "total": max(1, len(tiles))}
+            send_status(
+                "cropping_tile_inputs",
+                f"Tile {tile_position}/{len(tiles)}: cropping inputs",
+                progress=tile_progress,
+                tile_number=int(tile_number),
+            )
             tile_pose_video, tile_kwargs, extraction_summary = _extract_tiled_long_video_inputs(
                 pose_video,
                 pose_video_mask,
@@ -6465,6 +6640,12 @@ def _run_tiled_long_video(
             )
             child_unique_id = _tile_child_unique_id(unique_id, tile_number, generator_suffix)
             generator = SCAIL2ScheduledLongVideo()
+            send_status(
+                "running_tile",
+                f"Tile {tile_position}/{len(tiles)}: running long video",
+                progress=tile_progress,
+                tile_number=int(tile_number),
+            )
             frames, used_pose_mask, used_reference_mask_timeline, scheduled_summary_text = generator.generate(
                 model,
                 clip,
@@ -6486,9 +6667,17 @@ def _run_tiled_long_video(
                 free_tail_window=bool(free_tail_window),
                 prompt=prompt,
                 unique_id=child_unique_id,
+                status_unique_id=unique_id,
+                status_prefix=f"Tile {tile_position}/{len(tiles)}: ",
                 **tile_kwargs,
             )
         except Exception as exc:
+            send_status(
+                "error",
+                f"Tile {tile_position}/{len(tiles)} failed: {exc}",
+                progress={"current": tile_position, "total": max(1, len(tiles))},
+                tile_number=int(tile_number),
+            )
             raise RuntimeError(f"Tiled long video failed on tile {tile_number}: {exc}") from exc
 
         tile_videos.append(frames)
@@ -6507,7 +6696,14 @@ def _run_tiled_long_video(
             }
         )
         _empty_cache(force=True)
+        send_status(
+            "tile_complete",
+            f"Tile {tile_position}/{len(tiles)} complete",
+            progress={"current": tile_position, "total": max(1, len(tiles))},
+            tile_number=int(tile_number),
+        )
 
+    send_status("collecting_tile_outputs", "Collecting tile outputs")
     actual_manifest = _augment_manifest_with_actual_tile_outputs(
         manifest,
         tile_videos,
@@ -6522,6 +6718,7 @@ def _run_tiled_long_video(
         f"tile_{index + 1}_video": video
         for index, video in enumerate(tile_videos[1:], start=1)
     }
+    send_status("compositing_tiles", "Compositing tiles")
     frames, composite_summary_text, debug_preview = SCAIL2TileCompositeVideo().composite(
         actual_manifest_text,
         tile_videos[0],
@@ -6552,6 +6749,7 @@ def _run_tiled_long_video(
         "tile_summaries": tile_summaries,
         "composite_summary": _parse_summary_text(composite_summary_text),
     }
+    send_status("done", f"Done: {int(frames.shape[0])} frame(s)", progress={"current": 1, "total": 1})
     return (
         frames,
         actual_manifest_text,

@@ -6,6 +6,13 @@ console.log("[SCAIL Multi Cond] dynamic UI extension loaded");
 const MAX_SEGMENTS = 8;
 const MAX_REFERENCES = 8;
 const MAX_TILES = 8;
+const LONG_VIDEO_STATUS_EVENT = "scail2_long_video_status";
+const LONG_VIDEO_NODE_TYPES = new Set([
+    "SCAIL2ScheduledLongVideo",
+    "SCAIL2ScheduledLongVideoWithSAM",
+    "SCAIL2TiledLongVideo",
+    "SCAIL2TiledLongVideoWithSAM",
+]);
 
 function widgetByName(node, name) {
     return node.widgets?.find((widget) => widget.name === name);
@@ -41,6 +48,104 @@ function resizeNode(node) {
     }
     scheduleCanvas(node);
 }
+
+function findGraphNodeById(nodeId) {
+    const nodeIdText = String(nodeId ?? "");
+    if (!nodeIdText) {
+        return null;
+    }
+    const numericId = Number(nodeIdText);
+    if (Number.isFinite(numericId)) {
+        const direct = app.graph?.getNodeById?.(numericId) ?? app.graph?._nodes_by_id?.[numericId];
+        if (direct) {
+            return direct;
+        }
+    }
+    return app.graph?._nodes?.find((node) => String(node.id) === nodeIdText) ?? null;
+}
+
+function ensureLongVideoStatusWidget(node) {
+    if (node.scailLongVideoStatusContainer) {
+        return node.scailLongVideoStatusContainer;
+    }
+    const container = document.createElement("div");
+    container.className = "scail-long-video-status";
+    container.style.cssText = [
+        "box-sizing:border-box",
+        "width:100%",
+        "min-height:36px",
+        "padding:7px 8px",
+        "border:1px solid rgba(125,211,252,.32)",
+        "border-left:3px solid #38bdf8",
+        "border-radius:5px",
+        "background:#0f172a",
+        "color:#e2e8f0",
+        "font:12px/1.35 system-ui,-apple-system,BlinkMacSystemFont,sans-serif",
+    ].join(";");
+
+    if (node.addDOMWidget) {
+        const widget = node.addDOMWidget("scail_long_video_status", "SCAIL-2 Status", container, {
+            serialize: false,
+            hideOnZoom: false,
+        });
+        widget.computeSize = () => [
+            Math.max(420, node.size?.[0] ?? 420),
+            46,
+        ];
+    } else {
+        node.addWidget("text", "scail_long_video_status", "Idle", () => {}, { serialize: false });
+    }
+    node.scailLongVideoStatusContainer = container;
+    renderLongVideoStatus(node, node.scailLongVideoStatus ?? { stage: "idle", message: "Idle" });
+    return container;
+}
+
+function renderLongVideoStatus(node, status) {
+    const container = ensureLongVideoStatusWidget(node);
+    const detail = status ?? {};
+    node.scailLongVideoStatus = detail;
+    const stage = String(detail.stage ?? "idle");
+    const message = String(detail.message ?? stage);
+    const progress = detail.progress ?? {};
+    const current = Number(progress.current);
+    const total = Number(progress.total);
+    const hasProgress = Number.isFinite(current) && Number.isFinite(total) && total > 0;
+    const timestamp = Number(detail.timestamp);
+    const timeText = Number.isFinite(timestamp)
+        ? new Date(timestamp * 1000).toLocaleTimeString()
+        : new Date().toLocaleTimeString();
+
+    container.replaceChildren();
+    const main = document.createElement("div");
+    main.textContent = message;
+    main.style.cssText = "font-weight:700;white-space:normal;overflow-wrap:anywhere;";
+    const meta = document.createElement("div");
+    meta.textContent = [
+        stage,
+        hasProgress ? `${Math.round(current)}/${Math.round(total)}` : "",
+        timeText,
+    ].filter(Boolean).join(" · ");
+    meta.style.cssText = "opacity:.72;margin-top:2px;";
+    container.append(main, meta);
+    container.style.borderLeftColor = stage === "done" || stage === "cache_hit"
+        ? "#22c55e"
+        : stage === "error"
+            ? "#ef4444"
+            : "#38bdf8";
+    scheduleCanvas(node);
+}
+
+function handleLongVideoStatus(event) {
+    const detail = event?.detail ?? event;
+    const node = findGraphNodeById(detail?.node_id);
+    if (!node) {
+        return;
+    }
+    ensureLongVideoStatusWidget(node);
+    renderLongVideoStatus(node, detail);
+}
+
+api.addEventListener?.(LONG_VIDEO_STATUS_EVENT, handleLongVideoStatus);
 
 function updateSegmentBuilder(node) {
     const countWidget = widgetByName(node, "segment_count");
@@ -1407,12 +1512,16 @@ app.registerExtension({
                 originalOnNodeCreated?.apply(this, arguments);
                 addUpdateButton(this, "Update reference inputs", updateScheduledGenerator);
                 updateScheduledGenerator(this);
+                ensureLongVideoStatusWidget(this);
             };
 
             const originalOnConfigure = nodeType.prototype.onConfigure;
             nodeType.prototype.onConfigure = function () {
                 originalOnConfigure?.apply(this, arguments);
-                requestAnimationFrame(() => updateScheduledGenerator(this));
+                requestAnimationFrame(() => {
+                    updateScheduledGenerator(this);
+                    ensureLongVideoStatusWidget(this);
+                });
             };
         }
 
@@ -1422,12 +1531,16 @@ app.registerExtension({
                 originalOnNodeCreated?.apply(this, arguments);
                 addUpdateButton(this, "Update reference inputs", updateScheduledGeneratorWithSAM);
                 updateScheduledGeneratorWithSAM(this);
+                ensureLongVideoStatusWidget(this);
             };
 
             const originalOnConfigure = nodeType.prototype.onConfigure;
             nodeType.prototype.onConfigure = function () {
                 originalOnConfigure?.apply(this, arguments);
-                requestAnimationFrame(() => updateScheduledGeneratorWithSAM(this));
+                requestAnimationFrame(() => {
+                    updateScheduledGeneratorWithSAM(this);
+                    ensureLongVideoStatusWidget(this);
+                });
             };
         }
 
