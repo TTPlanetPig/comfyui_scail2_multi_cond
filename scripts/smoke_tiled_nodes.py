@@ -72,6 +72,12 @@ def main() -> None:
     assert_true("reference_1_mask" in external_optional, "external tiled node should expose reference masks")
     assert_true("reference_1_mask" not in internal_optional, "internal SAM node should not expose reference masks")
     assert_true({"sam_model", "sam_conditioning"} <= set(internal_optional), "internal SAM inputs missing")
+    composite_required = nodes.SCAIL2TileCompositeVideo.INPUT_TYPES()["required"]
+    tiled_required = nodes.SCAIL2TiledLongVideo.INPUT_TYPES()["required"]
+    assert_true("blend_mode" in composite_required, "tile composite should expose blend_mode")
+    assert_true("composite_blend_mode" in tiled_required, "tiled long video should expose composite_blend_mode")
+    assert_true(list(composite_required)[-1] == "blend_mode", "new tile composite widgets should append after existing widgets")
+    assert_true(list(tiled_required)[-1] == "composite_blend_mode", "new tiled long video widgets should append after existing widgets")
 
     assert_true(nodes._tile_seed(123, 1, "same_seed") == 123, "same_seed changed tile 1")
     assert_true(nodes._tile_seed(123, 7, "same_seed") == 123, "same_seed changed tile 7")
@@ -305,7 +311,8 @@ def main() -> None:
     tile_weight_source = inspect.getsource(nodes._tile_weight_mask)
     assert_true("outer * 0.5" not in tile_weight_source, "tile composite should not give the whole overlap crop fallback weight")
     assert_true("expand_px=feather_px" not in tile_weight_source, "tile composite should not expand core across the whole overlap")
-    assert_true("blur_px=feather_px" in tile_weight_source, "tile composite should feather the core edge")
+    assert_true("core_feather" in tile_weight_source, "tile composite should keep the original core feather mode")
+    assert_true("ttp_seam" in tile_weight_source, "tile composite should expose the TTP-style seam feather mode")
 
     print("smoke_tiled_nodes: ok")
 

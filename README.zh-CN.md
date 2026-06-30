@@ -277,6 +277,9 @@ manifest 会解析为 `1096x1920`，并在 `target_size_adjustment` 里记录请
 `overlap_edges_px_source`，方便检查左右上下哪几条边参与了上下文扩展。
 拼合时使用 core 优先的 feather：overlap 主要作为生成上下文，不会整段大面积参与最终平均，
 只有 core 边缘会柔和过渡到相邻 tile。
+默认 `composite_blend_mode=core_feather`。如果接缝重影比硬边更明显，可以测试
+`composite_blend_mode=ttp_seam`；它参考 TTP 图像拼接，把混合压到更窄的接缝带，
+减少两块独立生成画面被大面积平均的像素数量。
 
 如果你想单独调试每一块，再使用 `SCAIL-2 Tile Extractor` 手动导出每块视频，
 分别生成后接 `SCAIL-2 Tile Repaint Collector` 和 `SCAIL-2 Tile Composite Video`。

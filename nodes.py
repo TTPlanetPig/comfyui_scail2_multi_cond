@@ -3280,7 +3280,7 @@ def _blank_image_like_tile(tile_video: torch.Tensor, frames: int = 1) -> torch.T
     )
 
 
-def _tile_weight_mask(height: int, width: int, crop_bbox: list[int], core_bbox: list[int], feather_px: int) -> torch.Tensor:
+def _tile_weight_mask_core_feather(height: int, width: int, crop_bbox: list[int], core_bbox: list[int], feather_px: int) -> torch.Tensor:
     height = max(1, int(height))
     width = max(1, int(width))
     feather_px = max(0, int(feather_px))
@@ -3298,6 +3298,62 @@ def _tile_weight_mask(height: int, width: int, crop_bbox: list[int], core_bbox: 
     if feather_px <= 0:
         return core.clamp(0, 1)
     return _binary_mask_morph(core.unsqueeze(0), blur_px=feather_px)[0].clamp(0, 1)
+
+
+def _tile_weight_mask_ttp_seam(height: int, width: int, crop_bbox: list[int], core_bbox: list[int], feather_px: int) -> torch.Tensor:
+    height = max(1, int(height))
+    width = max(1, int(width))
+    feather_px = max(0, int(feather_px))
+    x0, y0, _x1, _y1 = [int(value) for value in crop_bbox]
+    cx0, cy0, cx1, cy1 = [int(value) for value in core_bbox]
+    lx0 = max(0, min(width, cx0 - x0))
+    ly0 = max(0, min(height, cy0 - y0))
+    lx1 = max(0, min(width, cx1 - x0))
+    ly1 = max(0, min(height, cy1 - y0))
+    if feather_px <= 0:
+        core = torch.zeros((height, width), dtype=torch.float32)
+        core[ly0:ly1, lx0:lx1] = 1.0
+        return core.clamp(0, 1)
+
+    def axis_weights(size: int, start: int, end: int) -> torch.Tensor:
+        coords = torch.arange(int(size), dtype=torch.float32) + 0.5
+        weights = torch.ones((int(size),), dtype=torch.float32)
+
+        left_context = max(0, int(start))
+        if left_context > 0:
+            blend = max(1.0, float(min(int(feather_px), left_context * 2)))
+            ramp_start = float(start) - blend / 2.0
+            ramp_end = float(start) + blend / 2.0
+            left_ramp = ((coords - ramp_start) / max(1e-6, ramp_end - ramp_start)).clamp(0, 1)
+            weights = torch.minimum(weights, left_ramp)
+
+        right_context = max(0, int(size) - int(end))
+        if right_context > 0:
+            blend = max(1.0, float(min(int(feather_px), right_context * 2)))
+            ramp_start = float(end) - blend / 2.0
+            ramp_end = float(end) + blend / 2.0
+            right_ramp = (1.0 - ((coords - ramp_start) / max(1e-6, ramp_end - ramp_start))).clamp(0, 1)
+            weights = torch.minimum(weights, right_ramp)
+
+        return weights.clamp(0, 1)
+
+    x_weights = axis_weights(width, lx0, lx1).view(1, width)
+    y_weights = axis_weights(height, ly0, ly1).view(height, 1)
+    return (y_weights * x_weights).clamp(0, 1)
+
+
+def _tile_weight_mask(
+    height: int,
+    width: int,
+    crop_bbox: list[int],
+    core_bbox: list[int],
+    feather_px: int,
+    blend_mode: str = "core_feather",
+) -> torch.Tensor:
+    normalized = str(blend_mode or "core_feather").strip()
+    if normalized == "ttp_seam":
+        return _tile_weight_mask_ttp_seam(height, width, crop_bbox, core_bbox, feather_px)
+    return _tile_weight_mask_core_feather(height, width, crop_bbox, core_bbox, feather_px)
 
 
 class SCAIL2SegmentPlanner:
@@ -5720,6 +5776,7 @@ class SCAIL2TileCompositeVideo:
                 "tile_fit_mode": (["stretch", "center_crop", "pad"], {"default": "stretch"}),
                 "frame_mismatch_mode": (["trim_to_shortest", "error"], {"default": "trim_to_shortest"}),
                 "color_correction": ("BOOLEAN", {"default": False}),
+                "blend_mode": (["core_feather", "ttp_seam"], {"default": "core_feather"}),
             },
             "optional": optional,
         }
@@ -5745,6 +5802,7 @@ class SCAIL2TileCompositeVideo:
         tile_fit_mode: str = "stretch",
         frame_mismatch_mode: str = "trim_to_shortest",
         color_correction: bool = False,
+        blend_mode: str = "core_feather",
         base_video: Optional[torch.Tensor] = None,
         **kwargs,
     ):
@@ -5777,6 +5835,9 @@ class SCAIL2TileCompositeVideo:
         normalized_tile_fit_mode = str(tile_fit_mode or "stretch").strip()
         if normalized_tile_fit_mode not in {"stretch", "center_crop", "pad"}:
             normalized_tile_fit_mode = "stretch"
+        normalized_blend_mode = str(blend_mode or "core_feather").strip()
+        if normalized_blend_mode not in {"core_feather", "ttp_seam"}:
+            normalized_blend_mode = "core_feather"
 
         output = torch.zeros((frame_count, target_h, target_w, 3), dtype=torch.float32)
         weights = torch.zeros((frame_count, target_h, target_w, 1), dtype=torch.float32)
@@ -5803,7 +5864,14 @@ class SCAIL2TileCompositeVideo:
                 fit_mode=normalized_tile_fit_mode,
                 mode="bilinear",
             )
-            mask = _tile_weight_mask(crop_h, crop_w, [x0, y0, x1, y1], core_bbox, int(feather_px)).view(1, crop_h, crop_w, 1)
+            mask = _tile_weight_mask(
+                crop_h,
+                crop_w,
+                [x0, y0, x1, y1],
+                core_bbox,
+                int(feather_px),
+                normalized_blend_mode,
+            ).view(1, crop_h, crop_w, 1)
             mask = mask.repeat(frame_count, 1, 1, 1).contiguous()
             if base_target is not None:
                 target_patch = base_target[:, y0:y1, x0:x1, :]
@@ -5828,6 +5896,7 @@ class SCAIL2TileCompositeVideo:
                     "target_composite_scale": tile.get("target_composite_scale"),
                     "tile_to_target_scale": tile.get("tile_to_target_scale"),
                     "actual_tile_to_target_scale": tile.get("actual_tile_to_target_scale"),
+                    "blend_mode": normalized_blend_mode,
                     "input_shape": _shape(video),
                     "fitted_shape": _shape(fitted),
                 }
@@ -5848,7 +5917,7 @@ class SCAIL2TileCompositeVideo:
             "used_frame_count": int(frame_count),
             "frame_mismatch_mode": normalized_frame_mismatch_mode,
             "feather_px": int(feather_px),
-            "tile_weight_mode": "core_feather_overlap_context",
+            "tile_weight_mode": normalized_blend_mode,
             "tile_fit_mode": normalized_tile_fit_mode,
             "color_correction": bool(color_correction and base_target is not None),
             "paste_events": paste_events,
@@ -6193,6 +6262,7 @@ def _run_tiled_long_video(
     image_resize_mode: str,
     mask_resize_mode: str,
     composite_feather_px: int,
+    composite_blend_mode: str,
     tile_fit_mode: str,
     frame_mismatch_mode: str,
     composite_color_correction: bool,
@@ -6343,6 +6413,7 @@ def _run_tiled_long_video(
         str(tile_fit_mode),
         str(frame_mismatch_mode),
         bool(composite_color_correction),
+        str(composite_blend_mode),
         base_video=pose_video if bool(composite_color_correction) else None,
         **composite_kwargs,
     )
@@ -6357,6 +6428,7 @@ def _run_tiled_long_video(
         "tile_seed_mode": str(tile_seed_mode),
         "seed_start": int(seed),
         "max_tile_pixels": int(max_tile_pixels),
+        "composite_blend_mode": str(composite_blend_mode),
         "internal_sam": internal_sam_summary,
         "preflight_warnings": preflight_warnings,
         "actual_tile_output_warnings": actual_manifest.get("actual_tile_output_warnings", []),
@@ -6413,6 +6485,7 @@ class SCAIL2TiledLongVideo:
                 "composite_color_correction": ("BOOLEAN", {"default": False}),
                 "tile_seed_mode": (["offset_by_tile", "same_seed"], {"default": "offset_by_tile"}),
                 "cache_mode": (["disk", "off"], {"default": "disk"}),
+                "composite_blend_mode": (["core_feather", "ttp_seam"], {"default": "core_feather"}),
             },
             "optional": optional,
             "hidden": {
@@ -6462,6 +6535,7 @@ class SCAIL2TiledLongVideo:
         composite_color_correction: bool = False,
         tile_seed_mode: str = "offset_by_tile",
         cache_mode: str = "disk",
+        composite_blend_mode: str = "core_feather",
         pose_video_mask: Optional[torch.Tensor] = None,
         prompt=None,
         unique_id=None,
@@ -6495,6 +6569,7 @@ class SCAIL2TiledLongVideo:
             image_resize_mode=str(image_resize_mode),
             mask_resize_mode=str(mask_resize_mode),
             composite_feather_px=int(composite_feather_px),
+            composite_blend_mode=str(composite_blend_mode),
             tile_fit_mode=str(tile_fit_mode),
             frame_mismatch_mode=str(frame_mismatch_mode),
             composite_color_correction=bool(composite_color_correction),
@@ -6566,6 +6641,7 @@ class SCAIL2TiledLongVideoWithSAM:
                 "composite_color_correction": ("BOOLEAN", {"default": False}),
                 "tile_seed_mode": (["offset_by_tile", "same_seed"], {"default": "offset_by_tile"}),
                 "cache_mode": (["disk", "off"], {"default": "disk"}),
+                "composite_blend_mode": (["core_feather", "ttp_seam"], {"default": "core_feather"}),
             },
             "optional": optional,
             "hidden": {
@@ -6621,6 +6697,7 @@ class SCAIL2TiledLongVideoWithSAM:
         composite_color_correction: bool = False,
         tile_seed_mode: str = "offset_by_tile",
         cache_mode: str = "disk",
+        composite_blend_mode: str = "core_feather",
         sam_model=None,
         sam_conditioning=None,
         prompt=None,
@@ -6655,6 +6732,7 @@ class SCAIL2TiledLongVideoWithSAM:
             image_resize_mode=str(image_resize_mode),
             mask_resize_mode=str(mask_resize_mode),
             composite_feather_px=int(composite_feather_px),
+            composite_blend_mode=str(composite_blend_mode),
             tile_fit_mode=str(tile_fit_mode),
             frame_mismatch_mode=str(frame_mismatch_mode),
             composite_color_correction=bool(composite_color_correction),
