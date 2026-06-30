@@ -342,6 +342,21 @@ def _normalize_overlap(value: int, max_chunk_frames: int) -> int:
     return min(_floor_to_4n_plus_1(requested), 33, int(max_chunk_frames) - 4)
 
 
+def _free_tail_window_target_length(
+    raw_length: int,
+    max_chunk_frames: int,
+    remaining: int,
+) -> Optional[int]:
+    raw_length = max(1, int(raw_length))
+    max_chunk_frames = min(81, _ceil_to_4n_plus_1(max(17, int(max_chunk_frames))))
+    target_length = _ceil_to_4n_plus_1(raw_length + 4)
+    if target_length < 17 and int(remaining) > 1:
+        target_length = 17
+    if int(target_length) > int(max_chunk_frames):
+        return None
+    return int(target_length)
+
+
 def _parse_plan_input(segment_plan: str) -> list[dict[str, Any]]:
     text = str(segment_plan or "").strip()
     if not text:
@@ -4095,11 +4110,16 @@ class SCAIL2ScheduledLongVideo:
                 forced_pre_tail_split = False
                 if free_tail_window and is_final_segment and wanted_keep >= remaining and remaining > 1:
                     projected_raw_length = int(wanted_keep) if not has_previous else int(wanted_keep) + int(actual_overlap)
-                    projected_length = _ceil_to_4n_plus_1(projected_raw_length)
-                    if projected_length < 17 and remaining > 1:
-                        projected_length = 17
-                    projected_length = min(int(projected_length), int(max_chunk_frames))
-                    projected_tail_frames = max(0, int(projected_length) - int(projected_raw_length))
+                    projected_tail_length = _free_tail_window_target_length(
+                        projected_raw_length,
+                        max_chunk_frames,
+                        remaining,
+                    )
+                    projected_tail_frames = (
+                        0
+                        if projected_tail_length is None
+                        else max(0, int(projected_tail_length) - int(projected_raw_length))
+                    )
                     if projected_tail_frames <= 0:
                         preferred_tail_keep = int(actual_overlap) if actual_overlap > 0 else (int(overlap) if overlap > 0 else 5)
                         tail_real_keep = min(int(remaining) - 1, max(1, int(preferred_tail_keep)))
@@ -4118,8 +4138,10 @@ class SCAIL2ScheduledLongVideo:
                     raise RuntimeError("overlap_frames leaves no room for new frames.")
                 raw_length = wanted_keep if not has_previous else wanted_keep + actual_overlap
                 is_final_output_chunk = bool(free_tail_window) and is_final_segment and int(wanted_keep) >= int(remaining)
-                if is_final_output_chunk and int(length) < int(max_chunk_frames):
-                    length = int(max_chunk_frames)
+                if is_final_output_chunk:
+                    free_tail_length = _free_tail_window_target_length(raw_length, max_chunk_frames, remaining)
+                    if free_tail_length is not None and int(free_tail_length) > int(length):
+                        length = int(free_tail_length)
                 tail_window_padding_frames = max(0, int(length) - int(raw_length))
                 tail_window_applied = bool(is_final_output_chunk and tail_window_padding_frames > 0)
                 video_frame_offset = int(produced)

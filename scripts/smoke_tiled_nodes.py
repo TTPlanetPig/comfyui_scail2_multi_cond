@@ -77,7 +77,11 @@ def main() -> None:
     assert_true("blend_mode" in composite_required, "tile composite should expose blend_mode")
     assert_true("composite_blend_mode" in tiled_required, "tiled long video should expose composite_blend_mode")
     assert_true(list(composite_required)[-1] == "blend_mode", "new tile composite widgets should append after existing widgets")
-    assert_true(list(tiled_required)[-1] == "composite_blend_mode", "new tiled long video widgets should append after existing widgets")
+    assert_true(list(tiled_required)[-1] == "free_tail_window", "free_tail_window should stay last in tiled widgets")
+    assert_true(
+        list(tiled_required).index("composite_blend_mode") < list(tiled_required).index("free_tail_window"),
+        "composite_blend_mode should stay before free_tail_window",
+    )
 
     assert_true(nodes._tile_seed(123, 1, "same_seed") == 123, "same_seed changed tile 1")
     assert_true(nodes._tile_seed(123, 7, "same_seed") == 123, "same_seed changed tile 7")
@@ -100,6 +104,22 @@ def main() -> None:
     assert_true(
         target_info["resolution_basis"] == "output_width_preserve_aspect",
         "single-width target should use width as aspect-preserving basis",
+    )
+    clipped_segments = nodes._parse_plan(
+        '[{"frames": 100, "reference": 1, "prompt": "test", "negative": ""}]',
+        pose_frame_count=49,
+        max_frames=0,
+    )
+    assert_true(sum(int(segment["frames"]) for segment in clipped_segments) == 49, "plan should clip to video length")
+    clipped_chunks = nodes._build_chunk_plan(clipped_segments, 81, 5)
+    assert_true(len(clipped_chunks) == 1, "49 clipped frames should fit in one base chunk")
+    assert_true(
+        nodes._free_tail_window_target_length(49, 81, 49) == 53,
+        "49-frame free tail should add one latent step, not fill the whole 81-frame window",
+    )
+    assert_true(
+        nodes._free_tail_window_target_length(81, 81, 81) is None,
+        "full 81-frame windows should report no room for a free tail",
     )
     source_region = [246, 432, 548, 960]
     assert_true(
