@@ -43,6 +43,14 @@ def main() -> None:
         ndim = 4
         shape = (4, 960, 548, 3)
 
+    class FakeDoubleImage(sys.modules["torch"].Tensor):
+        ndim = 4
+        shape = (1, 1920, 1096, 3)
+
+    class FakeHalfMask(sys.modules["torch"].Tensor):
+        ndim = 4
+        shape = (1, 480, 274, 3)
+
     assert_true("SCAIL2TiledLongVideo" in nodes.NODE_CLASS_MAPPINGS, "missing tiled long video node")
     assert_true(
         "SCAIL2TiledLongVideoWithSAM" in nodes.NODE_CLASS_MAPPINGS,
@@ -86,6 +94,19 @@ def main() -> None:
     assert_true(
         target_info["resolution_basis"] == "output_width_preserve_aspect",
         "single-width target should use width as aspect-preserving basis",
+    )
+    source_region = [246, 432, 548, 960]
+    assert_true(
+        nodes._tile_tensor_crop_bbox(source_region, [548, 960], FakeVideo()) == source_region,
+        "same-size tile input should use the manifest source bbox exactly",
+    )
+    assert_true(
+        nodes._tile_tensor_crop_bbox(source_region, [548, 960], FakeDoubleImage()) == [492, 864, 1096, 1920],
+        "double-size tile input should receive the same source region scaled to its own pixels",
+    )
+    assert_true(
+        nodes._tile_tensor_crop_bbox(source_region, [548, 960], FakeHalfMask()) == [123, 216, 274, 480],
+        "half-size tile mask should receive the same source region scaled to its own pixels",
     )
 
     two_by_two = nodes._build_2x2_tile_manifest(

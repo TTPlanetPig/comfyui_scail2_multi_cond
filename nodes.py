@@ -3267,6 +3267,11 @@ def _scaled_bbox_for_image(source_bbox: list[int], source_size: list[int], image
     ]
 
 
+def _tile_tensor_crop_bbox(source_bbox: list[int], source_size: list[int], image: torch.Tensor) -> list[int]:
+    bbox = _scaled_bbox_for_image(source_bbox, source_size, image)
+    return list(_clamp_bbox(tuple(int(value) for value in bbox), int(image.shape[2]), int(image.shape[1])))
+
+
 def _blank_image_like_tile(tile_video: torch.Tensor, frames: int = 1) -> torch.Tensor:
     return torch.zeros(
         (max(1, int(frames)), int(tile_video.shape[1]), int(tile_video.shape[2]), int(tile_video.shape[-1])),
@@ -5534,23 +5539,27 @@ class SCAIL2TileExtractor:
         tile = tiles[index]
         target_w, target_h = [int(value) for value in tile["tile_generate_size"]]
         source_bbox = [int(value) for value in tile["source_crop_bbox"]]
+        source_size = manifest.get("source_size", [int(source_video.shape[2]), int(source_video.shape[1])])
+        pose_bbox = _tile_tensor_crop_bbox(source_bbox, source_size, source_video)
         tile_pose_video = _crop_resize_image_tensor(
             source_video,
-            source_bbox,
+            pose_bbox,
             target_h,
             target_w,
             mode=str(image_resize_mode),
         )
 
         if pose_video_mask is not None:
+            pose_mask_bbox = _tile_tensor_crop_bbox(source_bbox, source_size, pose_video_mask)
             tile_pose_mask = _crop_resize_image_tensor(
                 pose_video_mask,
-                source_bbox,
+                pose_mask_bbox,
                 target_h,
                 target_w,
                 mode=str(mask_resize_mode),
             )
         else:
+            pose_mask_bbox = None
             tile_pose_mask = torch.zeros_like(tile_pose_video)
 
         active_reference_count = max(1, min(MAX_REFERENCES, int(reference_count)))
@@ -5558,18 +5567,18 @@ class SCAIL2TileExtractor:
         tile_reference_masks: list[torch.Tensor] = []
         reference_summary: list[dict[str, Any]] = []
         blank = _blank_image_like_tile(tile_pose_video, frames=1)
-        source_size = manifest.get("source_size", [int(source_video.shape[2]), int(source_video.shape[1])])
         for ref_index in range(1, MAX_REFERENCES + 1):
             reference = kwargs.get(f"reference_{ref_index}")
             reference_mask = kwargs.get(f"reference_{ref_index}_mask")
             if reference is not None and ref_index <= active_reference_count:
-                ref_bbox = _scaled_bbox_for_image(source_bbox, source_size, reference)
+                ref_bbox = _tile_tensor_crop_bbox(source_bbox, source_size, reference)
                 tile_ref = _crop_resize_image_tensor(reference[:1], ref_bbox, target_h, target_w, mode=str(image_resize_mode))
                 reference_summary.append(
                     {
                         "reference": int(ref_index),
                         "status": "ok",
                         "source_shape": _shape(reference),
+                        "source_region_bbox": source_bbox,
                         "source_crop_bbox": ref_bbox,
                         "tile_shape": _shape(tile_ref),
                     }
@@ -5578,8 +5587,10 @@ class SCAIL2TileExtractor:
                 tile_ref = blank.clone()
                 reference_summary.append({"reference": int(ref_index), "status": "missing_or_inactive"})
             if reference_mask is not None and ref_index <= active_reference_count:
-                mask_bbox = _scaled_bbox_for_image(source_bbox, source_size, reference_mask)
+                mask_bbox = _tile_tensor_crop_bbox(source_bbox, source_size, reference_mask)
                 tile_mask = _crop_resize_image_tensor(reference_mask[:1], mask_bbox, target_h, target_w, mode=str(mask_resize_mode))
+                reference_summary[-1]["mask_source_crop_bbox"] = mask_bbox
+                reference_summary[-1]["tile_mask_shape"] = _shape(tile_mask)
             else:
                 tile_mask = torch.zeros_like(tile_ref)
             tile_references.append(tile_ref.contiguous())
@@ -5590,8 +5601,12 @@ class SCAIL2TileExtractor:
             "tile_index": int(tile_index),
             "tile": tile,
             "source_video_shape": _shape(source_video),
+            "source_region_bbox": source_bbox,
+            "pose_video_source_crop_bbox": pose_bbox,
+            "pose_video_mask_source_crop_bbox": pose_mask_bbox,
             "tile_pose_video_shape": _shape(tile_pose_video),
             "tile_pose_video_mask_shape": _shape(tile_pose_mask),
+            "tile_crop_contract": "same source_region_bbox scaled per input tensor, then resized to tile_generate_size",
             "reference_count": int(active_reference_count),
             "references": reference_summary,
             "image_resize_mode": str(image_resize_mode),
@@ -6075,9 +6090,11 @@ def _extract_tiled_long_video_inputs(
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, Any]]:
     source_bbox = [int(value) for value in tile["source_crop_bbox"]]
     target_w, target_h = [int(value) for value in tile["tile_generate_size"]]
+    source_size = manifest.get("source_size", [int(pose_video.shape[2]), int(pose_video.shape[1])])
+    pose_bbox = _tile_tensor_crop_bbox(source_bbox, source_size, pose_video)
     tile_pose_video = _crop_resize_image_tensor(
         pose_video,
-        source_bbox,
+        pose_bbox,
         int(target_h),
         int(target_w),
         mode=str(image_resize_mode),
@@ -6086,27 +6103,31 @@ def _extract_tiled_long_video_inputs(
     extraction_summary: dict[str, Any] = {
         "tile_number": int(tile.get("tile_number", int(tile.get("index", 0)) + 1)),
         "source_crop_bbox": source_bbox,
+        "source_region_bbox": source_bbox,
+        "pose_video_source_crop_bbox": pose_bbox,
         "tile_pose_video_shape": _shape(tile_pose_video),
+        "tile_crop_contract": "same source_region_bbox scaled per input tensor, then resized to tile_generate_size",
         "references": [],
     }
 
     if include_masks and pose_video_mask is not None:
+        pose_mask_bbox = _tile_tensor_crop_bbox(source_bbox, source_size, pose_video_mask)
         tile_pose_video_mask = _crop_resize_image_tensor(
             pose_video_mask,
-            source_bbox,
+            pose_mask_bbox,
             int(target_h),
             int(target_w),
             mode=str(mask_resize_mode),
         )
         tile_kwargs["pose_video_mask"] = tile_pose_video_mask
+        extraction_summary["pose_video_mask_source_crop_bbox"] = pose_mask_bbox
         extraction_summary["tile_pose_video_mask_shape"] = _shape(tile_pose_video_mask)
 
-    source_size = manifest.get("source_size", [int(pose_video.shape[2]), int(pose_video.shape[1])])
     active_reference_count = max(1, min(MAX_REFERENCES, int(reference_count)))
     for index in range(1, active_reference_count + 1):
         reference = references.get(index)
         if reference is not None:
-            ref_bbox = _scaled_bbox_for_image(source_bbox, source_size, reference)
+            ref_bbox = _tile_tensor_crop_bbox(source_bbox, source_size, reference)
             tile_reference = _crop_resize_image_tensor(
                 reference,
                 ref_bbox,
@@ -6118,6 +6139,7 @@ def _extract_tiled_long_video_inputs(
             ref_summary = {
                 "reference": int(index),
                 "source_shape": _shape(reference),
+                "source_region_bbox": source_bbox,
                 "source_crop_bbox": ref_bbox,
                 "tile_shape": _shape(tile_reference),
             }
@@ -6126,7 +6148,7 @@ def _extract_tiled_long_video_inputs(
 
         if include_masks and index in reference_masks:
             reference_mask = reference_masks[index]
-            mask_bbox = _scaled_bbox_for_image(source_bbox, source_size, reference_mask)
+            mask_bbox = _tile_tensor_crop_bbox(source_bbox, source_size, reference_mask)
             tile_reference_mask = _crop_resize_image_tensor(
                 reference_mask,
                 mask_bbox,
