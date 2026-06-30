@@ -114,10 +114,11 @@ full-body paste position, `crop_manifest.frames[].mask_bbox` records the mask
 bbox used for crop placement, and `crop_manifest.frames[].detected_mask_bbox`
 records the direct detected bbox when that frame had mask pixels. For full-body
 9:16 videos, start with `crop_padding_ratio` around `0.35` to `0.5`.
-Keep `square_align` at `32` for SCAIL-2 face-detail passes. The crop node keeps
-the square side on that alignment even near the frame edge; for example, on a
-720-wide source the largest aligned crop is 704, so the second SCAIL pass can
-use the crop resolution exactly instead of silently flooring it from 720 to 704.
+Keep `square_align` on 32-pixel steps for SCAIL-2 face-detail passes. The node
+normalizes legacy smaller values up to a 32-multiple and keeps the square side
+on that alignment even near the frame edge; for example, on a 720-wide source
+the largest aligned crop is 704, so the second SCAIL pass can use the crop
+resolution exactly instead of silently flooring it from 720 to 704.
 `mask_component_mode` defaults to `largest`, which keeps only the largest
 connected mask region per frame before bbox calculation, so small body fragments
 do not expand the crop canvas. Use `all` only when you need to inspect the raw
@@ -154,11 +155,14 @@ first selected crop frame while preserving as much original reference resolution
 as possible.
 
 `SCAIL-2 Align Reference Face To Crop` uses a face detector to compare the first
-selected crop frame with the high-resolution reference image. It then builds a
-new reference image whose aspect ratio matches the crop frame and whose face
-position/face width matches the crop frame. The node does not shrink the
-reference pixels to the crop resolution. It crops the reference at original
-pixel density. By default, `window_fit_mode=shift_inside_reference` moves the
+selected crop frame with the high-resolution reference image. It first normalizes
+the target crop frame to the actual SCAIL generation geometry, whose width and
+height are floored to 32-pixel multiples, then builds a new reference image whose
+aspect ratio and face layout match that generation geometry. The node does not
+shrink the reference pixels to the crop resolution. It crops the reference at
+original pixel density, snapping the crop window to the exact reduced aspect
+ratio of the SCAIL target so the native SCAIL center-resize step does not add an
+extra center crop. By default, `window_fit_mode=shift_inside_reference` moves the
 computed crop window back inside the reference image when that window can fit,
 so a large enough reference image will not get artificial padding. Padding is
 used only when the requested window is larger than the available reference
@@ -256,8 +260,9 @@ This is the backend contract for a richer rectangle editor:
 
 Every tile records per-edge overlap as `overlap_edges_px_source`;
 `tile_generate_size` is snapped to `tile_align` using `resolution_snap_mode`
-(`nearest`, `ceil`, or `floor`). This lets hand-drawn tiles have different
-aspect ratios while keeping the repaint sizes on model-friendly 32-pixel steps.
+(`nearest`, `ceil`, or `floor`). `tile_align` is normalized to a 32-multiple, so
+hand-drawn tiles can have different aspect ratios while every repaint size stays
+valid for SCAIL/Wan's 32-pixel geometry.
 
 Run the manual planner once to load preview frames into the editor. After it
 executes, the front-end panel shows a video frame preview plus a frame slider;

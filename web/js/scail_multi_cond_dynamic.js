@@ -40,7 +40,7 @@ const SCAIL_WIDGET_TOOLTIPS = new Map([
     ["output_height", "Requested final output height. Some builders adjust it to preserve aspect ratio and alignment."],
     ["scale_factor", "Fallback upscale multiplier when output width or height is not explicitly set."],
     ["overlap_ratio", "Tile overlap ratio applied only where tiles touch neighboring tiles."],
-    ["tile_align", "Pixel alignment step for tile boxes and generated tile sizes."],
+    ["tile_align", "Pixel alignment for tile boxes and generated tile sizes. SCAIL requires 32-pixel multiples; values are normalized to 32 steps."],
     ["resolution_snap_mode", "Controls how target output resolution is snapped to alignment constraints."],
     ["feather_px", "Blend feather width in output pixels for tile or face compositing."],
     ["composite_feather_px", "Blend feather width used when tiled long video composites generated tile videos."],
@@ -74,7 +74,7 @@ const SCAIL_WIDGET_TOOLTIPS = new Map([
     ["save_location", "Where viewer output images are saved."],
     ["display_group", "Which keyframe group the matrix viewer displays."],
     ["crop_padding_ratio", "Relative padding around the tracked head crop."],
-    ["square_align", "Pixel alignment for square face crops."],
+    ["square_align", "Pixel alignment for square face crops. Keep this on 32-pixel steps so the face crop matches SCAIL generation geometry."],
     ["temporal_smoothing", "Amount of smoothing applied to tracked crop motion."],
     ["mask_expand_px", "Pixels to expand masks before blur or compositing."],
     ["mask_blur_px", "Pixels used to blur mask edges."],
@@ -939,7 +939,8 @@ function manualTileMinRatio(node) {
 
 function manualTileAlign(node) {
     const widget = widgetByName(node, "tile_align");
-    return Math.max(1, Math.min(256, Math.round(Number(widget?.value ?? 32))));
+    const requested = Math.max(32, Math.min(256, Math.round(Number(widget?.value ?? 32))));
+    return Math.max(32, Math.min(256, Math.ceil(requested / 32) * 32));
 }
 
 function manualTileSnapThreshold(node, axis) {

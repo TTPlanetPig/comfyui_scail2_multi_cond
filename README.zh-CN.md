@@ -182,7 +182,7 @@ SCAIL-2 Scheduled Long Video / Internal SAM
 - `crop_mode = center_follow`：从第一帧确定固定尺寸，后续跟随脸部中心移动。
 - `crop_mode = fixed_canvas`：统计整段脸部运动范围，生成一个固定机位的最小正方形画框。二次脸部细化通常更推荐这个模式。
 - `crop_padding_ratio`：脸部区域外扩比例，常用 `0.35` 到 `0.5`。
-- `square_align`：正方形边长对齐倍数，建议 `32`，适配 SCAIL2 生成分辨率。
+- `square_align`：正方形边长对齐倍数，按 `32` 像素步进，节点会把旧 workflow 里的更小值自动规范到 32 倍数，适配 SCAIL2 生成分辨率。
 - `mask_expand_px` / `mask_blur_px`：用于 crop mask 的轻微扩张和柔化。
 
 `face_crop_video` 是裁出的视频，`crop_masks` 是裁出区域里的原始脸部 mask，`crop_manifest` 记录每帧贴回全身视频的位置。
@@ -198,9 +198,13 @@ SCAIL-2 Scheduled Long Video / Internal SAM
 1. 读取 `face_crop_video` 的第一帧。
 2. 检测第一帧里的人脸位置和宽度。
 3. 检测高清参考图里的人脸位置和宽度。
-4. 按 crop 视频的比例重新裁切参考图。
+4. 先按 SCAIL 实际生成尺寸规范 crop 帧几何，再按这个比例重新裁切参考图。
 5. 让参考图里的人脸位置和大小尽量对齐 crop 第一帧。
-6. 保持参考图原始像素清晰度；默认 `window_fit_mode=shift_inside_reference` 会在裁切窗口放得进参考图时先把窗口平移回图内，只有窗口本身比参考图还大时才按 `padding_mode` 补边。
+6. 保持参考图原始像素清晰度；参考图不会被缩到 crop 分辨率，而是只裁切到和 SCAIL 目标尺寸完全一致的比例。默认 `window_fit_mode=shift_inside_reference` 会在裁切窗口放得进参考图时先把窗口平移回图内，只有窗口本身比参考图还大时才按 `padding_mode` 补边。
+
+SCAIL 的实际生成尺寸按 32 像素对齐。例如 `face_crop_video` 如果是 `1280x708`，
+后续 SCAIL 实际使用的是 `1280x704`。Align Reference 会用 `1280:704` 这个比例裁切
+高清参考图，避免原生 SCAIL 内部 `center` resize/crop 再额外切掉几像素导致脸部位移。
 
 如果你需要完全保留旧逻辑的严格相对位置，可以把 `window_fit_mode` 改成 `strict_alignment`。这个模式下只要严格计算出的窗口越界，就会按 `padding_mode` 补边。
 
@@ -267,6 +271,9 @@ stitch_mask_expand_px 减小
 `output_width` / `output_height`，节点不会拉伸原始视频比例，而是按源视频比例
 自动修正最终目标尺寸。例如源视频是 `548x960`，目标填 `1080x1920` 时，
 manifest 会解析为 `1096x1920`，并在 `target_size_adjustment` 里记录请求值和实际值。
+tile 的 `tile_align` 会被规范到 32 像素步进，`tile_generate_size` 必须能被 32 整除；
+如果手写或旧 manifest 里出现 `1280x708` 这类尺寸，Tiled Long Video 会直接拒绝，
+避免 SCAIL 内部实际跑成 `1280x704` 后再造成拼合或参考裁切误差。
 
 `SCAIL-2 Tiled Long Video` 是自动生产节点。连接第一阶段的 `pose_video`、
 `tile_manifest`、原始 `segment_plan`、模型输入，以及和普通长视频节点相同的

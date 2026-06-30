@@ -16,6 +16,7 @@ CATEGORY = "SCAIL-2/Scheduled"
 MAX_REFERENCES = 8
 MAX_TILES = 8
 DEFAULT_MAX_TILE_PIXELS = 1280 * 720
+SCAIL_RESOLUTION_ALIGN = 32
 FREE_TAIL_WINDOW_MAX_FRAMES = 64
 LONG_VIDEO_STATUS_EVENT = "scail2_long_video_status"
 DEFAULT_PLAN = """# frames | reference | prompt | negative | boundary_overlap
@@ -1004,9 +1005,84 @@ def _save_keyframe_matrix_images(
 def _infer_generation_size(pose_video: torch.Tensor) -> tuple[int, int]:
     if not isinstance(pose_video, torch.Tensor) or pose_video.ndim != 4:
         raise ValueError("pose_video must be a ComfyUI IMAGE tensor.")
-    height = max(32, (int(pose_video.shape[1]) // 32) * 32)
-    width = max(32, (int(pose_video.shape[2]) // 32) * 32)
+    height = _scail_floor_size(int(pose_video.shape[1]))
+    width = _scail_floor_size(int(pose_video.shape[2]))
     return width, height
+
+
+def _scail_floor_size(value: int) -> int:
+    return max(SCAIL_RESOLUTION_ALIGN, (max(1, int(value)) // SCAIL_RESOLUTION_ALIGN) * SCAIL_RESOLUTION_ALIGN)
+
+
+def _normalize_scail_resolution_align(value: int) -> int:
+    requested = max(1, int(value or SCAIL_RESOLUTION_ALIGN))
+    return max(SCAIL_RESOLUTION_ALIGN, int(math.ceil(requested / SCAIL_RESOLUTION_ALIGN) * SCAIL_RESOLUTION_ALIGN))
+
+
+def _aspect_units(width: int, height: int) -> tuple[int, int]:
+    width = max(1, int(width))
+    height = max(1, int(height))
+    divisor = max(1, math.gcd(width, height))
+    return width // divisor, height // divisor
+
+
+def _match_size_to_aspect_grid(width: int, height: int, target_w: int, target_h: int) -> tuple[int, int, dict[str, Any]]:
+    width = max(1, int(width))
+    height = max(1, int(height))
+    unit_w, unit_h = _aspect_units(int(target_w), int(target_h))
+    seed = max(1, int(round(((width / unit_w) + (height / unit_h)) * 0.5)))
+    candidates: list[tuple[float, int, int, int]] = []
+    for scale in range(max(1, seed - 4), seed + 5):
+        candidate_w = int(unit_w * scale)
+        candidate_h = int(unit_h * scale)
+        error = abs(candidate_w - width) / max(1, width) + abs(candidate_h - height) / max(1, height)
+        area_delta = abs((candidate_w * candidate_h) - (width * height)) / max(1, width * height)
+        candidates.append((float(error + area_delta * 0.1), int(candidate_w), int(candidate_h), int(scale)))
+    _score, matched_w, matched_h, matched_scale = min(candidates, key=lambda item: (item[0], abs(item[1] * item[2] - width * height)))
+    return matched_w, matched_h, {
+        "source_size": [int(width), int(height)],
+        "target_aspect_size": [int(target_w), int(target_h)],
+        "aspect_units": [int(unit_w), int(unit_h)],
+        "aspect_scale": int(matched_scale),
+        "matched_size": [int(matched_w), int(matched_h)],
+        "aspect_exact": bool(int(matched_w) * int(target_h) == int(matched_h) * int(target_w)),
+    }
+
+
+def _resize_rgb_uint8_center_crop(image_rgb: Any, target_w: int, target_h: int) -> tuple[Any, dict[str, Any]]:
+    import numpy as np
+    from PIL import Image
+
+    value = np.asarray(image_rgb)
+    source_h, source_w = int(value.shape[0]), int(value.shape[1])
+    target_w = max(1, int(target_w))
+    target_h = max(1, int(target_h))
+    if source_w == target_w and source_h == target_h:
+        return value[:, :, :3].copy(), {
+            "resized": False,
+            "source_size": [int(source_w), int(source_h)],
+            "target_size": [int(target_w), int(target_h)],
+            "resized_size": [int(source_w), int(source_h)],
+            "crop_xyxy": [0, 0, int(target_w), int(target_h)],
+        }
+    scale = max(float(target_w) / max(1, source_w), float(target_h) / max(1, source_h))
+    resized_w = max(target_w, int(round(source_w * scale)))
+    resized_h = max(target_h, int(round(source_h * scale)))
+    pil = Image.fromarray(value[:, :, :3].astype(np.uint8))
+    resampling = getattr(Image, "Resampling", Image).BICUBIC
+    resized = pil.resize((int(resized_w), int(resized_h)), resampling)
+    resized_rgb = np.asarray(resized, dtype=np.uint8)
+    x0 = max(0, (int(resized_w) - int(target_w)) // 2)
+    y0 = max(0, (int(resized_h) - int(target_h)) // 2)
+    output = resized_rgb[y0 : y0 + target_h, x0 : x0 + target_w, :3].copy()
+    return output, {
+        "resized": True,
+        "source_size": [int(source_w), int(source_h)],
+        "target_size": [int(target_w), int(target_h)],
+        "resized_size": [int(resized_w), int(resized_h)],
+        "crop_xyxy": [int(x0), int(y0), int(x0 + target_w), int(y0 + target_h)],
+        "scale": float(scale),
+    }
 
 
 def _first_image(value: torch.Tensor, name: str) -> torch.Tensor:
@@ -2953,7 +3029,7 @@ def _build_2x2_tile_manifest(
     target_w = max(cols, int(target_w))
     target_h = max(rows, int(target_h))
     overlap_ratio = max(0.0, min(0.45, float(overlap_ratio)))
-    tile_align = max(1, int(tile_align))
+    tile_align = _normalize_scail_resolution_align(int(tile_align))
     normalized_snap_mode = str(resolution_snap_mode or "nearest").strip()
     if normalized_snap_mode not in {"nearest", "ceil", "floor"}:
         normalized_snap_mode = "nearest"
@@ -3118,7 +3194,7 @@ def _build_rect_tile_manifest(
     target_w = max(1, int(target_w))
     target_h = max(1, int(target_h))
     overlap_ratio = max(0.0, min(0.45, float(overlap_ratio)))
-    tile_align = max(1, int(tile_align))
+    tile_align = _normalize_scail_resolution_align(int(tile_align))
     normalized_snap_mode = str(resolution_snap_mode or "nearest").strip()
     if normalized_snap_mode not in {"nearest", "ceil", "floor"}:
         normalized_snap_mode = "nearest"
@@ -4969,7 +5045,7 @@ class SCAIL2HeadTrackCrop:
             "required": {
                 "full_body_video": ("IMAGE",),
                 "crop_padding_ratio": ("FLOAT", {"default": 0.45, "min": 0.0, "max": 3.0, "step": 0.05}),
-                "square_align": ("INT", {"default": 32, "min": 1, "max": 256, "step": 1}),
+                "square_align": ("INT", {"default": 32, "min": 32, "max": 256, "step": 32}),
                 "temporal_smoothing": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 0.98, "step": 0.05}),
                 "mask_expand_px": ("INT", {"default": 8, "min": 0, "max": 128, "step": 1}),
                 "mask_blur_px": ("INT", {"default": 4, "min": 0, "max": 64, "step": 1}),
@@ -5018,6 +5094,8 @@ class SCAIL2HeadTrackCrop:
     ):
         if not isinstance(full_body_video, torch.Tensor) or full_body_video.ndim != 4:
             raise ValueError("full_body_video must be a ComfyUI IMAGE tensor.")
+        requested_square_align = int(square_align)
+        square_align = _normalize_scail_resolution_align(int(square_align))
         video = full_body_video.detach().cpu().float().clamp(0, 1).contiguous()
         frame_count, height, width, _channels = video.shape
         mask_source = {"source": "head_masks"}
@@ -5117,7 +5195,9 @@ class SCAIL2HeadTrackCrop:
             "crop_mode": normalized_crop_mode,
             "crop_padding_ratio": float(crop_padding_ratio),
             "square_align": int(square_align),
-            "crop_size_aligned": bool(int(fixed_crop_size) % max(1, int(square_align)) == 0),
+            "requested_square_align": int(requested_square_align),
+            "scail_resolution_align": int(SCAIL_RESOLUTION_ALIGN),
+            "crop_size_aligned": bool(int(fixed_crop_size) % int(SCAIL_RESOLUTION_ALIGN) == 0),
             "fixed_crop_size": int(fixed_crop_size),
             "fixed_crop_anchor_frame": fixed_crop_anchor_frame,
             "canvas_source_bbox": [int(value) for value in canvas_source_bbox],
@@ -5205,9 +5285,12 @@ class SCAIL2AlignReferenceFaceToCrop:
         mediapipe_min_detection_confidence: float = 0.5,
         window_fit_mode: str = "shift_inside_reference",
     ):
-        target_rgb = _image_batch_frame_to_rgb_uint8(face_crop_video, int(target_frame_index), "face_crop_video")
+        raw_target_rgb = _image_batch_frame_to_rgb_uint8(face_crop_video, int(target_frame_index), "face_crop_video")
+        scail_w, scail_h = _infer_generation_size(face_crop_video)
+        target_rgb, target_geometry = _resize_rgb_uint8_center_crop(raw_target_rgb, int(scail_w), int(scail_h))
         reference_rgb = _image_batch_frame_to_rgb_uint8(reference_image, 0, "reference_image")
         target_h, target_w = int(target_rgb.shape[0]), int(target_rgb.shape[1])
+        raw_target_h, raw_target_w = int(raw_target_rgb.shape[0]), int(raw_target_rgb.shape[1])
         ref_h, ref_w = int(reference_rgb.shape[0]), int(reference_rgb.shape[1])
         if target_h <= 0 or target_w <= 0 or ref_h <= 0 or ref_w <= 0:
             raise ValueError("face_crop_video and reference_image must contain non-empty images.")
@@ -5242,6 +5325,13 @@ class SCAIL2AlignReferenceFaceToCrop:
             canvas_h = int(round(float(canvas_w) / max(1e-6, target_aspect)))
         canvas_w = max(1, canvas_w)
         canvas_h = max(1, canvas_h)
+        pre_aspect_canvas_size = [int(canvas_w), int(canvas_h)]
+        canvas_w, canvas_h, aspect_match_info = _match_size_to_aspect_grid(
+            int(canvas_w),
+            int(canvas_h),
+            int(target_w),
+            int(target_h),
+        )
 
         target_relative_center_x = float(target_info["center"][0]) / max(1.0, float(target_w)) + float(x_offset_ratio)
         target_relative_center_y = float(target_info["center"][1]) / max(1.0, float(target_h)) + float(y_offset_ratio)
@@ -5290,14 +5380,23 @@ class SCAIL2AlignReferenceFaceToCrop:
             float(ref_bbox[3]) - float(actual_window_y0),
         ]
         summary = {
-            "method": "face_detector_bbox_ratio_crop_fit_no_resize",
+            "method": "face_detector_bbox_ratio_crop_fit_scail_aspect_no_resize",
             "face_detector": detector_info,
             "insightface": detector_info if detector_info.get("backend_used") == "insightface" else None,
             "target_frame_index": int(max(0, min(int(face_crop_video.shape[0]) - 1, int(target_frame_index)))),
-            "target_crop_shape": [1, int(target_h), int(target_w), 3],
+            "target_crop_shape": [1, int(raw_target_h), int(raw_target_w), 3],
+            "target_generation_shape": [1, int(target_h), int(target_w), 3],
+            "target_geometry_normalization": target_geometry,
             "reference_shape": [1, int(ref_h), int(ref_w), 3],
             "aligned_reference_shape": _shape(aligned_reference),
             "reference_pixels_resized": False,
+            "reference_window_aspect_matched_to_generation": bool(aspect_match_info["aspect_exact"]),
+            "pre_aspect_canvas_size": pre_aspect_canvas_size,
+            "aspect_match": aspect_match_info,
+            "scail_reference_resize_contract": (
+                "SCAIL resizes/crops reference_image to target_generation_shape internally; "
+                "this node only crops reference pixels to the same aspect first."
+            ),
             "output_aspect": float(canvas_w / max(1, canvas_h)),
             "target_aspect": float(target_aspect),
             "face_scale": float(scale),
@@ -5312,7 +5411,7 @@ class SCAIL2AlignReferenceFaceToCrop:
             "reference_face_size_px": float(reference_size),
             "window_fit_mode": str(window_info.get("fit_mode", window_fit_mode)),
             "reference_window": window_info,
-            "debug_preview": "left is target crop frame, right is aligned reference resized only for visual comparison",
+            "debug_preview": "left is target frame normalized to SCAIL generation geometry, right is aligned reference resized only for visual comparison",
             "connect_to": "Use aligned_reference_image as the face-detail pass reference_N input.",
         }
         return (aligned_reference.contiguous().clamp(0, 1), debug_preview, json.dumps(summary, indent=2))
@@ -5507,7 +5606,7 @@ class SCAIL2TilePlanBuilder:
                 "output_height": ("INT", {"default": 0, "min": 0, "max": 8192, "step": 1}),
                 "scale_factor": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 8.0, "step": 0.05}),
                 "overlap_ratio": ("FLOAT", {"default": 0.10, "min": 0.0, "max": 0.45, "step": 0.01}),
-                "tile_align": ("INT", {"default": 32, "min": 1, "max": 256, "step": 1}),
+                "tile_align": ("INT", {"default": 32, "min": 32, "max": 256, "step": 32}),
                 "resolution_snap_mode": (["nearest", "ceil", "floor"], {"default": "nearest"}),
                 "feather_px": ("INT", {"default": 48, "min": 0, "max": 512, "step": 1}),
                 "min_tile_ratio": ("FLOAT", {"default": 0.30, "min": 0.05, "max": 0.45, "step": 0.01}),
@@ -5566,7 +5665,8 @@ class SCAIL2TilePlanBuilder:
         target_w = max(cols, int(target_w))
         target_h = max(rows, int(target_h))
         overlap_ratio = max(0.0, min(0.45, float(overlap_ratio)))
-        tile_align = max(1, int(tile_align))
+        requested_tile_align = int(tile_align)
+        tile_align = _normalize_scail_resolution_align(int(tile_align))
         scale_x = target_w / max(1, int(source_w))
         scale_y = target_h / max(1, int(source_h))
         protected_region = None
@@ -5631,6 +5731,8 @@ class SCAIL2TilePlanBuilder:
             {
                 "scale_factor": float(scale_x),
                 "target_size_adjustment": target_size_adjustment,
+                "requested_tile_align": int(requested_tile_align),
+                "scail_resolution_align": int(SCAIL_RESOLUTION_ALIGN),
                 "min_tile_ratio": float(min_tile_ratio),
                 "protected_region": protected_region,
                 "protected_owner_tile": protected_owner_tile,
@@ -5671,7 +5773,7 @@ class SCAIL2ManualTilePlanBuilder:
                 "output_height": ("INT", {"default": 0, "min": 0, "max": 8192, "step": 1}),
                 "scale_factor": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 8.0, "step": 0.05}),
                 "overlap_ratio": ("FLOAT", {"default": 0.10, "min": 0.0, "max": 0.45, "step": 0.01}),
-                "tile_align": ("INT", {"default": 32, "min": 1, "max": 256, "step": 1}),
+                "tile_align": ("INT", {"default": 32, "min": 32, "max": 256, "step": 32}),
                 "resolution_snap_mode": (["nearest", "ceil", "floor"], {"default": "nearest"}),
                 "feather_px": ("INT", {"default": 48, "min": 0, "max": 512, "step": 1}),
                 "min_tile_ratio": ("FLOAT", {"default": 0.20, "min": 0.05, "max": 0.45, "step": 0.01}),
@@ -5716,6 +5818,8 @@ class SCAIL2ManualTilePlanBuilder:
     ):
         if not isinstance(source_video, torch.Tensor) or source_video.ndim != 4:
             raise ValueError("source_video must be a ComfyUI IMAGE tensor.")
+        requested_tile_align = int(tile_align)
+        tile_align = _normalize_scail_resolution_align(int(tile_align))
         _frames, source_h, source_w, _channels = source_video.shape
         target_w, target_h, target_size_adjustment = _resolve_tile_target_size(
             int(source_w),
@@ -5758,6 +5862,8 @@ class SCAIL2ManualTilePlanBuilder:
             resolution_snap_mode=str(resolution_snap_mode),
             extra={
                 "target_size_adjustment": target_size_adjustment,
+                "requested_tile_align": int(requested_tile_align),
+                "scail_resolution_align": int(SCAIL_RESOLUTION_ALIGN),
                 "manual_layout": {
                     **normalized_layout,
                     "min_tile_ratio": float(max(0.01, min(0.45, float(min_tile_ratio)))),
@@ -6263,12 +6369,15 @@ def _validate_tiled_long_video_manifest(
     max_pixels = max(0, int(max_tile_pixels))
     warnings: list[str] = []
     oversized: list[str] = []
+    non_aligned: list[str] = []
     for tile in tiles:
         tile_number = int(tile.get("tile_number", int(tile.get("index", 0)) + 1))
         generate_size = tile.get("tile_generate_size")
         if not isinstance(generate_size, list) or len(generate_size) != 2:
             raise ValueError(f"tile {tile_number} is missing tile_generate_size.")
         generate_w, generate_h = [max(1, int(value)) for value in generate_size]
+        if generate_w % SCAIL_RESOLUTION_ALIGN != 0 or generate_h % SCAIL_RESOLUTION_ALIGN != 0:
+            non_aligned.append(f"tile {tile_number} planned {generate_w}x{generate_h}")
         pixels = int(generate_w * generate_h)
         if max_pixels > 0 and pixels > max_pixels:
             message = f"tile {tile_number} planned {generate_w}x{generate_h} has {pixels} pixels"
@@ -6276,6 +6385,12 @@ def _validate_tiled_long_video_manifest(
                 oversized.append(message)
             else:
                 warnings.append(message)
+    if non_aligned:
+        raise ValueError(
+            f"Tiled long video requires every tile_generate_size to be divisible by {SCAIL_RESOLUTION_ALIGN}: "
+            + "; ".join(non_aligned)
+            + ". Rebuild the tile manifest with tile_align=32 or another 32-multiple."
+        )
     if oversized:
         raise ValueError(
             f"Tiled long video rejected tile(s) over max_tile_pixels={max_pixels}: "
