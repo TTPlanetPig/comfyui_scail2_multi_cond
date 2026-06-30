@@ -1027,6 +1027,34 @@ def _resize_image_tensor_like(image: torch.Tensor, target: torch.Tensor, *, mode
     return resized.to(dtype=target.dtype).contiguous()
 
 
+def _free_tail_window_input_spec() -> tuple[str, dict[str, Any]]:
+    return (
+        "BOOLEAN",
+        {
+            "default": False,
+            "tooltip": (
+                "Fill the final sampling window with blank, unreferenced tail frames, "
+                "then discard those tail frames from the returned outputs."
+            ),
+        },
+    )
+
+
+def _pad_image_sequence_tail_with_zeros(sequence: torch.Tensor, frame_count: int) -> torch.Tensor:
+    if not isinstance(sequence, torch.Tensor) or sequence.ndim != 4:
+        raise ValueError("sequence must be a ComfyUI IMAGE tensor.")
+    wanted = max(0, int(frame_count))
+    current = int(sequence.shape[0])
+    if current >= wanted:
+        return sequence[:wanted].detach().contiguous()
+    padding = torch.zeros(
+        (wanted - current, int(sequence.shape[1]), int(sequence.shape[2]), int(sequence.shape[3])),
+        dtype=sequence.dtype,
+        device=sequence.device,
+    )
+    return torch.cat((sequence.detach(), padding), dim=0).contiguous()
+
+
 def _fit_image_to_size(
     image: torch.Tensor,
     target_h: int,
@@ -3767,6 +3795,7 @@ class SCAIL2ScheduledLongVideo:
                 "reference_count": ("INT", {"default": 2, "min": 1, "max": MAX_REFERENCES, "step": 1}),
                 "color_correction": ("BOOLEAN", {"default": True}),
                 "cache_mode": (["disk", "off"], {"default": "disk"}),
+                "free_tail_window": _free_tail_window_input_spec(),
             },
             "optional": optional,
             "hidden": {
@@ -3803,6 +3832,7 @@ class SCAIL2ScheduledLongVideo:
         reference_count: int,
         color_correction: bool,
         cache_mode: str = "disk",
+        free_tail_window: bool = False,
         pose_video_mask=None,
         prompt=None,
         unique_id=None,
@@ -3810,6 +3840,7 @@ class SCAIL2ScheduledLongVideo:
     ):
         if not isinstance(pose_video, torch.Tensor) or pose_video.ndim != 4:
             raise ValueError("pose_video must be a ComfyUI IMAGE tensor.")
+        free_tail_window = bool(free_tail_window)
 
         call_cache_key = _stable_fingerprint(
             {
@@ -3831,6 +3862,7 @@ class SCAIL2ScheduledLongVideo:
                 "overlap_frames": int(overlap_frames),
                 "reference_count": int(reference_count),
                 "color_correction": bool(color_correction),
+                "free_tail_window": bool(free_tail_window),
                 "pose_video_mask": _tensor_fingerprint(pose_video_mask),
                 "dynamic_inputs": _cache_marker(kwargs),
             }
@@ -3953,11 +3985,21 @@ class SCAIL2ScheduledLongVideo:
         chunk_index = 0
         chunk_summaries: list[dict[str, Any]] = []
         last_segment_reference = None
+        free_tail_window_summary: dict[str, Any] = {
+            "enabled": bool(free_tail_window),
+            "applied": False,
+            "strategy": "blank_conditioning_tail_in_final_window",
+            "forced_pre_tail_split": False,
+            "conditioning_tail_frames": 0,
+            "decoded_tail_frames_discarded": 0,
+            "events": [],
+        }
 
-        for segment in segments:
+        for segment_position, segment in enumerate(segments):
             remaining = int(segment["frames"])
             segment_kept = 0
             segment_reference = int(segment["reference"])
+            is_final_segment = segment_position == len(segments) - 1
             is_reference_change_segment = (
                 last_segment_reference is not None and segment_reference != int(last_segment_reference)
             )
@@ -3985,6 +4027,21 @@ class SCAIL2ScheduledLongVideo:
                 wanted_keep = min(remaining, max_keep)
                 if wanted_keep <= 0:
                     raise RuntimeError("Internal planner produced an empty chunk.")
+                forced_pre_tail_split = False
+                if free_tail_window and is_final_segment and wanted_keep >= remaining and remaining > 1:
+                    projected_raw_length = int(wanted_keep) if not has_previous else int(wanted_keep) + int(actual_overlap)
+                    projected_length = _ceil_to_4n_plus_1(projected_raw_length)
+                    if projected_length < 17 and remaining > 1:
+                        projected_length = 17
+                    projected_length = min(int(projected_length), int(max_chunk_frames))
+                    projected_tail_frames = max(0, int(projected_length) - int(projected_raw_length))
+                    if projected_tail_frames <= 0:
+                        preferred_tail_keep = int(actual_overlap) if actual_overlap > 0 else (int(overlap) if overlap > 0 else 5)
+                        tail_real_keep = min(int(remaining) - 1, max(1, int(preferred_tail_keep)))
+                        if tail_real_keep > 0 and int(remaining) - int(tail_real_keep) > 0:
+                            wanted_keep = int(remaining) - int(tail_real_keep)
+                            forced_pre_tail_split = True
+                            free_tail_window_summary["forced_pre_tail_split"] = True
                 raw_length = wanted_keep if not has_previous else wanted_keep + actual_overlap
                 length = _ceil_to_4n_plus_1(raw_length)
                 if length < 17 and remaining > 1:
@@ -3994,6 +4051,12 @@ class SCAIL2ScheduledLongVideo:
                     wanted_keep = length if not has_previous else length - actual_overlap
                 if wanted_keep <= 0:
                     raise RuntimeError("overlap_frames leaves no room for new frames.")
+                raw_length = wanted_keep if not has_previous else wanted_keep + actual_overlap
+                is_final_output_chunk = bool(free_tail_window) and is_final_segment and int(wanted_keep) >= int(remaining)
+                if is_final_output_chunk and int(length) < int(max_chunk_frames):
+                    length = int(max_chunk_frames)
+                tail_window_padding_frames = max(0, int(length) - int(raw_length))
+                tail_window_applied = bool(is_final_output_chunk and tail_window_padding_frames > 0)
                 video_frame_offset = int(produced)
                 internal_window_offset = max(0, int(produced) - int(actual_overlap))
                 print(
@@ -4001,13 +4064,28 @@ class SCAIL2ScheduledLongVideo:
                     f"chunk={chunk_index} segment={segment['index']} ref={segment['reference']} "
                     f"gen={length} discard={'pending'} keep_target={wanted_keep} "
                     f"offset_input={video_frame_offset} internal_window_offset={internal_window_offset} "
-                    f"produced_before={produced}"
+                    f"produced_before={produced} free_tail={tail_window_applied}"
                 )
                 previous_frames_for_scail = (
                     previous_frames[-actual_overlap:].contiguous()
                     if previous_frames is not None and actual_overlap > 0
                     else None
                 )
+                scail_pose_video = pose_video
+                scail_pose_video_mask = pose_video_mask
+                tail_conditioning_frames = 0
+                if tail_window_applied:
+                    required_conditioning_frames = int(video_frame_offset) + int(length)
+                    scail_pose_video = _pad_image_sequence_tail_with_zeros(
+                        pose_video[:planned_frames],
+                        required_conditioning_frames,
+                    )
+                    tail_conditioning_frames = max(0, int(required_conditioning_frames) - int(planned_frames))
+                    if pose_video_mask is not None:
+                        scail_pose_video_mask = _pad_image_sequence_tail_with_zeros(
+                            pose_video_mask[:planned_frames],
+                            required_conditioning_frames,
+                        )
 
                 scail_out = _node_result(
                     WanSCAILToVideo.execute(
@@ -4026,8 +4104,8 @@ class SCAIL2ScheduledLongVideo:
                         replacement_mode=replacement_mode,
                         reference_image=ref_info["reference_image"],
                         clip_vision_output=ref_info["clip_vision_output"],
-                        pose_video=pose_video,
-                        pose_video_mask=pose_video_mask,
+                        pose_video=scail_pose_video,
+                        pose_video_mask=scail_pose_video_mask,
                         reference_image_mask=ref_info["reference_image_mask"],
                         previous_frames=previous_frames_for_scail,
                     )
@@ -4065,7 +4143,8 @@ class SCAIL2ScheduledLongVideo:
 
                 stitched.append(kept.detach().cpu().contiguous())
                 if replacement_mode:
-                    pose_mask_window = pose_video_mask[
+                    pose_mask_source = scail_pose_video_mask if tail_window_applied and scail_pose_video_mask is not None else pose_video_mask
+                    pose_mask_window = pose_mask_source[
                         video_frame_offset : video_frame_offset + int(decoded.shape[0])
                     ].detach().cpu().contiguous()
                     kept_pose_mask = pose_mask_window[discard_head : discard_head + wanted_keep].contiguous()
@@ -4086,6 +4165,21 @@ class SCAIL2ScheduledLongVideo:
                 produced += int(kept.shape[0])
                 segment_kept += int(kept.shape[0])
                 remaining -= int(kept.shape[0])
+                decoded_tail_frames = max(0, int(decoded.shape[0]) - int(discard_head) - int(kept.shape[0]))
+                if tail_window_applied:
+                    free_tail_event = {
+                        "chunk_index": int(chunk_index),
+                        "segment_index": int(segment["index"]),
+                        "generate_length": int(length),
+                        "raw_conditioned_length": int(raw_length),
+                        "kept_frames": int(kept.shape[0]),
+                        "conditioning_tail_frames": int(tail_conditioning_frames),
+                        "decoded_tail_frames_discarded": int(decoded_tail_frames),
+                    }
+                    free_tail_window_summary["applied"] = True
+                    free_tail_window_summary["conditioning_tail_frames"] += int(tail_conditioning_frames)
+                    free_tail_window_summary["decoded_tail_frames_discarded"] += int(decoded_tail_frames)
+                    free_tail_window_summary["events"].append(free_tail_event)
                 if overlap > 0:
                     previous_frames = torch.cat(stitched, dim=0)[-overlap:].contiguous()
                 else:
@@ -4104,10 +4198,17 @@ class SCAIL2ScheduledLongVideo:
                         "video_frame_offset": int(video_frame_offset),
                         "internal_window_offset": int(internal_window_offset),
                         "output_start": int(produced - kept.shape[0]),
+                        "output_end": int(produced),
                         "generate_length": int(length),
                         "discard_head": int(discard_head),
                         "kept_frames": int(kept.shape[0]),
                         "produced_total": int(produced),
+                        "free_tail_window": {
+                            "forced_pre_tail_split": bool(forced_pre_tail_split),
+                            "applied": bool(tail_window_applied),
+                            "conditioning_tail_frames": int(tail_conditioning_frames),
+                            "decoded_tail_frames_discarded": int(decoded_tail_frames),
+                        },
                         "color_correction": color_summary,
                     }
                 )
@@ -4128,6 +4229,13 @@ class SCAIL2ScheduledLongVideo:
             used_reference_mask_timeline = torch.cat(stitched_reference_masks, dim=0).contiguous().clamp(0, 1)
         else:
             used_reference_mask_timeline = torch.zeros_like(frames)
+        output_frames_before_tail_trim = int(frames.shape[0])
+        if int(frames.shape[0]) > int(planned_frames):
+            frames = frames[:planned_frames].contiguous()
+            used_pose_video_mask = used_pose_video_mask[:planned_frames].contiguous()
+            used_reference_mask_timeline = used_reference_mask_timeline[:planned_frames].contiguous()
+        free_tail_window_summary["output_frames_before_trim"] = int(output_frames_before_tail_trim)
+        free_tail_window_summary["output_frames"] = int(frames.shape[0])
         summary = {
             "mode": mode,
             "width": int(width),
@@ -4140,6 +4248,7 @@ class SCAIL2ScheduledLongVideo:
             "reference_count": int(active_reference_count),
             "cfg": float(cfg),
             "seed_start": int(seed),
+            "free_tail_window": free_tail_window_summary,
             "segments": segments,
             "planned_chunks": planned_chunks,
             "references_used": used_refs,
@@ -4218,6 +4327,7 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
                 "sam_max_objects": ("INT", {"default": 2, "min": 1, "max": 16, "step": 1}),
                 "sam_detect_interval": ("INT", {"default": 2, "min": 1, "max": 999, "step": 1}),
                 "cache_mode": (["disk", "off"], {"default": "disk"}),
+                "free_tail_window": _free_tail_window_input_spec(),
             },
             "optional": optional,
             "hidden": {
@@ -4250,6 +4360,7 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
         reference_count: int,
         color_correction: bool,
         cache_mode: str = "disk",
+        free_tail_window: bool = False,
         object_indices: str = "",
         reference_object_indices: str = "",
         sort_by: str = "left_to_right",
@@ -4304,6 +4415,7 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
                 "overlap_frames": int(overlap_frames),
                 "reference_count": int(reference_count),
                 "color_correction": bool(color_correction),
+                "free_tail_window": bool(free_tail_window),
                 "object_indices": object_indices,
                 "reference_object_indices": reference_object_indices,
                 "sort_by": sort_by,
@@ -4356,6 +4468,7 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
                 reference_count,
                 color_correction,
                 cache_mode="off",
+                free_tail_window=bool(free_tail_window),
                 prompt=prompt,
                 unique_id=unique_id,
                 **generate_kwargs,
@@ -4458,6 +4571,7 @@ class SCAIL2ScheduledLongVideoWithSAM(SCAIL2ScheduledLongVideo):
             reference_count,
             color_correction,
             cache_mode="off",
+            free_tail_window=bool(free_tail_window),
             prompt=prompt,
             unique_id=unique_id,
             **generate_kwargs,
@@ -6267,6 +6381,7 @@ def _run_tiled_long_video(
     frame_mismatch_mode: str,
     composite_color_correction: bool,
     tile_seed_mode: str,
+    free_tail_window: bool,
     pose_video_mask: Optional[torch.Tensor],
     sam_options: Optional[dict[str, Any]],
     prompt=None,
@@ -6368,6 +6483,7 @@ def _run_tiled_long_video(
                 reference_count,
                 color_correction,
                 cache_mode=str(cache_mode),
+                free_tail_window=bool(free_tail_window),
                 prompt=prompt,
                 unique_id=child_unique_id,
                 **tile_kwargs,
@@ -6427,6 +6543,7 @@ def _run_tiled_long_video(
         "used_refs": used_refs,
         "tile_seed_mode": str(tile_seed_mode),
         "seed_start": int(seed),
+        "free_tail_window": bool(free_tail_window),
         "max_tile_pixels": int(max_tile_pixels),
         "composite_blend_mode": str(composite_blend_mode),
         "internal_sam": internal_sam_summary,
@@ -6486,6 +6603,7 @@ class SCAIL2TiledLongVideo:
                 "tile_seed_mode": (["offset_by_tile", "same_seed"], {"default": "offset_by_tile"}),
                 "cache_mode": (["disk", "off"], {"default": "disk"}),
                 "composite_blend_mode": (["core_feather", "ttp_seam"], {"default": "core_feather"}),
+                "free_tail_window": _free_tail_window_input_spec(),
             },
             "optional": optional,
             "hidden": {
@@ -6536,6 +6654,7 @@ class SCAIL2TiledLongVideo:
         tile_seed_mode: str = "offset_by_tile",
         cache_mode: str = "disk",
         composite_blend_mode: str = "core_feather",
+        free_tail_window: bool = False,
         pose_video_mask: Optional[torch.Tensor] = None,
         prompt=None,
         unique_id=None,
@@ -6574,6 +6693,7 @@ class SCAIL2TiledLongVideo:
             frame_mismatch_mode=str(frame_mismatch_mode),
             composite_color_correction=bool(composite_color_correction),
             tile_seed_mode=str(tile_seed_mode),
+            free_tail_window=bool(free_tail_window),
             pose_video_mask=pose_video_mask,
             sam_options=None,
             prompt=prompt,
@@ -6642,6 +6762,7 @@ class SCAIL2TiledLongVideoWithSAM:
                 "tile_seed_mode": (["offset_by_tile", "same_seed"], {"default": "offset_by_tile"}),
                 "cache_mode": (["disk", "off"], {"default": "disk"}),
                 "composite_blend_mode": (["core_feather", "ttp_seam"], {"default": "core_feather"}),
+                "free_tail_window": _free_tail_window_input_spec(),
             },
             "optional": optional,
             "hidden": {
@@ -6698,6 +6819,7 @@ class SCAIL2TiledLongVideoWithSAM:
         tile_seed_mode: str = "offset_by_tile",
         cache_mode: str = "disk",
         composite_blend_mode: str = "core_feather",
+        free_tail_window: bool = False,
         sam_model=None,
         sam_conditioning=None,
         prompt=None,
@@ -6737,6 +6859,7 @@ class SCAIL2TiledLongVideoWithSAM:
             frame_mismatch_mode=str(frame_mismatch_mode),
             composite_color_correction=bool(composite_color_correction),
             tile_seed_mode=str(tile_seed_mode),
+            free_tail_window=bool(free_tail_window),
             pose_video_mask=None,
             sam_options={
                 "sam_model": sam_model,
