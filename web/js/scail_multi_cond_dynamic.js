@@ -1103,6 +1103,19 @@ function renderManualTileEditor(node) {
             y: clampNumber((event.clientY - rect.top) / Math.max(1, rect.height), 0, 1),
         };
     };
+    const tileContainsPoint = (tile, point) => (
+        point.x >= tile.x0 - 1e-6 &&
+        point.x <= tile.x1 + 1e-6 &&
+        point.y >= tile.y0 - 1e-6 &&
+        point.y <= tile.y1 + 1e-6
+    );
+    const tileResizeHit = (tile, point) => {
+        const rect = stage.getBoundingClientRect();
+        const padX = Math.max(0.01, 18 / Math.max(1, rect.width));
+        const padY = Math.max(0.01, 18 / Math.max(1, rect.height));
+        return point.x >= tile.x1 - padX && point.x <= tile.x1 + padX &&
+            point.y >= tile.y1 - padY && point.y <= tile.y1 + padY;
+    };
     const setRegionTileStyle = (element, tile) => {
         if (!element) {
             return;
@@ -1116,13 +1129,28 @@ function renderManualTileEditor(node) {
         .map((_tile, index) => index)
         .filter((index) => index !== selectedIndex);
     tileRenderOrder.push(selectedIndex);
+    const regionElements = new Map();
+    const resolvePointerTileIndex = (point, fallbackIndex) => {
+        const hits = tileRenderOrder.filter((index) => tileContainsPoint(tiles[index], point));
+        if (hits.includes(selectedIndex)) {
+            return selectedIndex;
+        }
+        if (Number.isInteger(fallbackIndex) && hits.includes(fallbackIndex)) {
+            return fallbackIndex;
+        }
+        return hits.length ? hits[hits.length - 1] : fallbackIndex;
+    };
 
-    const beginTileDrag = (event, tileIndex, mode, regionElement) => {
+    const beginTileDrag = (event, requestedTileIndex, mode, regionElement) => {
         event.preventDefault();
         event.stopPropagation();
+        const pointerTileIndex = resolvePointerTileIndex(pointFromEvent(event), requestedTileIndex);
+        const tileIndex = Math.max(0, Math.min(tiles.length - 1, Number(pointerTileIndex ?? requestedTileIndex ?? 0)));
+        const activeRegionElement = regionElements.get(tileIndex) ?? regionElement;
+        const dragMode = tileResizeHit(tiles[tileIndex], pointFromEvent(event)) ? "resize" : mode;
         node.scailManualTileSelectedIndex = tileIndex;
-        if (regionElement) {
-            regionElement.style.zIndex = "40";
+        if (activeRegionElement) {
+            activeRegionElement.style.zIndex = "120";
         }
         const target = event.currentTarget;
         target.setPointerCapture?.(event.pointerId);
@@ -1137,7 +1165,7 @@ function renderManualTileEditor(node) {
             const dy = point.y - startPoint.y;
             const nextTiles = startTiles.map((tile) => ({ ...tile }));
             let nextTile;
-            if (mode === "resize") {
+            if (dragMode === "resize") {
                 nextTile = {
                     ...startTile,
                     x1: startTile.x1 + dx,
@@ -1162,7 +1190,7 @@ function renderManualTileEditor(node) {
             nextTiles[tileIndex] = normalizeManualTileRect(node, nextTile);
             node.scailManualTileFillMessage = "";
             writeManualTileLayout(node, nextTiles, tileIndex);
-            setRegionTileStyle(regionElement, nextTiles[tileIndex]);
+            setRegionTileStyle(activeRegionElement, nextTiles[tileIndex]);
             scheduleCanvas(node);
         };
         const end = (endEvent) => {
@@ -1200,10 +1228,11 @@ function renderManualTileEditor(node) {
             "font-weight:800",
             "letter-spacing:0",
             "box-shadow:" + (selected ? "0 0 0 1px rgba(15,23,42,.85),0 0 16px rgba(14,165,233,.55)" : "none"),
-            "z-index:" + (selected ? "30" : String(10 + index)),
+            "z-index:" + (selected ? "100" : String(10 + index)),
             "cursor:move",
             "user-select:none",
         ].join(";");
+        regionElements.set(index, region);
         region.addEventListener("pointerdown", (event) => beginTileDrag(event, index, "move", region));
         const handle = document.createElement("div");
         handle.title = "Resize tile " + (index + 1);
@@ -1252,6 +1281,20 @@ function renderManualTileEditor(node) {
     note.style.cssText = "opacity:.72;min-width:180px;";
     const actions = document.createElement("div");
     actions.style.cssText = "display:flex;gap:6px;align-items:center;flex-wrap:wrap;";
+    const tileSelector = document.createElement("div");
+    tileSelector.style.cssText = "display:flex;gap:3px;align-items:center;flex-wrap:wrap;";
+    for (const [index] of tiles.entries()) {
+        const selectorButton = createManualTileButton("T" + (index + 1), () => {
+            node.scailManualTileSelectedIndex = index;
+            renderManualTileEditor(node);
+        });
+        if (index === selectedIndex) {
+            selectorButton.style.background = "#38bdf8";
+            selectorButton.style.borderColor = "#7dd3fc";
+            selectorButton.style.color = "#082f49";
+        }
+        tileSelector.append(selectorButton);
+    }
     const add = createManualTileButton("Add tile", () => {
         const base = tiles[selectedIndex] ?? { x0: 0.25, y0: 0.25, x1: 0.75, y1: 0.75 };
         const offset = Math.min(0.12, 0.03 * tiles.length);
@@ -1300,7 +1343,7 @@ function renderManualTileEditor(node) {
         node.scailManualTileFillMessage = "";
         setManualTileLayout(node, 0.5, 0.5);
     });
-    actions.append(add, remove, fillGaps, reset);
+    actions.append(tileSelector, add, remove, fillGaps, reset);
     controls.append(note, actions);
 
     const status = document.createElement("div");

@@ -57,8 +57,11 @@ assert(/snapManualTileMove/.test(source), "manual tile editor should snap moved 
 assert(/snapManualTileResize/.test(source), "manual tile editor should snap resized tiles");
 assert(/const tileRenderOrder = tiles/.test(manualEditorSource), "manual tile editor should compute a render order");
 assert(/tileRenderOrder\.push\(selectedIndex\)/.test(manualEditorSource), "selected manual tile should render last");
-assert(/z-index:" \+ \(selected \? "30"/.test(manualEditorSource), "selected manual tile should have the highest z-index");
-assert(/regionElement\.style\.zIndex = "40"/.test(manualEditorSource), "dragged manual tile should stay above other tiles");
+assert(/const resolvePointerTileIndex/.test(manualEditorSource), "manual tile editor should hit-test overlapping tiles");
+assert(/hits\.includes\(selectedIndex\)/.test(manualEditorSource), "selected overlapping tile should receive pointer interaction first");
+assert(/const tileSelector = document\.createElement\("div"\)/.test(manualEditorSource), "manual tile editor should expose direct tile selectors");
+assert(/z-index:" \+ \(selected \? "100"/.test(manualEditorSource), "selected manual tile should have the highest z-index");
+assert(/activeRegionElement\.style\.zIndex = "120"/.test(manualEditorSource), "dragged manual tile should stay above other tiles");
 assert(/MANUAL_TILE_LAYOUT_STORAGE_PREFIX/.test(source), "manual tile layouts should have a storage namespace");
 assert(/function readStoredManualTileLayout/.test(source), "manual tile editor should read persisted layouts");
 assert(/function storeManualTileLayout/.test(source), "manual tile editor should store persisted layouts");
