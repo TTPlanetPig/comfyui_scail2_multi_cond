@@ -53,5 +53,9 @@ assert(/Uncovered area/.test(manualEditorSource), "manual tile editor should sho
 assert(/Fill gaps/.test(manualEditorSource), "manual tile editor should expose Fill gaps action");
 assert(/snapManualTileMove/.test(source), "manual tile editor should snap moved tiles");
 assert(/snapManualTileResize/.test(source), "manual tile editor should snap resized tiles");
+assert(/const tileRenderOrder = tiles/.test(manualEditorSource), "manual tile editor should compute a render order");
+assert(/tileRenderOrder\.push\(selectedIndex\)/.test(manualEditorSource), "selected manual tile should render last");
+assert(/z-index:" \+ \(selected \? "30"/.test(manualEditorSource), "selected manual tile should have the highest z-index");
+assert(/regionElement\.style\.zIndex = "40"/.test(manualEditorSource), "dragged manual tile should stay above other tiles");
 
 console.log("smoke_manual_tile_editor: ok");

@@ -1041,11 +1041,18 @@ function renderManualTileEditor(node) {
         element.style.width = Math.max(0.1, (tile.x1 - tile.x0) * 100) + "%";
         element.style.height = Math.max(0.1, (tile.y1 - tile.y0) * 100) + "%";
     };
+    const tileRenderOrder = tiles
+        .map((_tile, index) => index)
+        .filter((index) => index !== selectedIndex);
+    tileRenderOrder.push(selectedIndex);
 
     const beginTileDrag = (event, tileIndex, mode, regionElement) => {
         event.preventDefault();
         event.stopPropagation();
         node.scailManualTileSelectedIndex = tileIndex;
+        if (regionElement) {
+            regionElement.style.zIndex = "40";
+        }
         const target = event.currentTarget;
         target.setPointerCapture?.(event.pointerId);
         const startPoint = pointFromEvent(event);
@@ -1100,7 +1107,8 @@ function renderManualTileEditor(node) {
         apply(event);
     };
 
-    for (const [index, tile] of tiles.entries()) {
+    for (const index of tileRenderOrder) {
+        const tile = tiles[index];
         const selected = index === selectedIndex;
         const region = document.createElement("div");
         region.textContent = String(index + 1);
@@ -1121,6 +1129,7 @@ function renderManualTileEditor(node) {
             "font-weight:800",
             "letter-spacing:0",
             "box-shadow:" + (selected ? "0 0 0 1px rgba(15,23,42,.85),0 0 16px rgba(14,165,233,.55)" : "none"),
+            "z-index:" + (selected ? "30" : String(10 + index)),
             "cursor:move",
             "user-select:none",
         ].join(";");
