@@ -620,6 +620,37 @@ function manualTileAspect(node) {
     return 960 / 548;
 }
 
+function manualTileAspectRatioCss(node) {
+    const sourceSize = manualTileSourceSize(node);
+    if (sourceSize) {
+        return `${Math.max(1, Math.round(sourceSize.width))} / ${Math.max(1, Math.round(sourceSize.height))}`;
+    }
+    const outputWidth = Number(widgetByName(node, "output_width")?.value ?? 0);
+    const outputHeight = Number(widgetByName(node, "output_height")?.value ?? 0);
+    if (outputWidth > 0 && outputHeight > 0) {
+        return `${Math.max(1, Math.round(outputWidth))} / ${Math.max(1, Math.round(outputHeight))}`;
+    }
+    return "548 / 960";
+}
+
+function manualTilePreviewItems(node) {
+    const preview = node.scailManualTilePreview ?? { items: [] };
+    return Array.isArray(preview.items) ? preview.items : [];
+}
+
+function manualTileEditorInnerWidth(node) {
+    return Math.max(280, Math.round(Number(node.size?.[0] ?? 460) - 18));
+}
+
+function manualTileStageHeight(node) {
+    return Math.max(180, Math.round(manualTileEditorInnerWidth(node) * manualTileAspect(node)));
+}
+
+function manualTileEditorHeight(node) {
+    const hasFrameSlider = manualTilePreviewItems(node).length > 1;
+    return manualTileStageHeight(node) + (hasFrameSlider ? 154 : 124);
+}
+
 function normalizeManualTileAxis(start, end, dimension, minRatio, align) {
     const usePixels = Number(dimension) > 1;
     let first = clampNumber(start, 0, 1);
@@ -1083,7 +1114,7 @@ function ensureManualTileEditor(node) {
         });
         widget.computeSize = () => [
             Math.max(460, node.size?.[0] ?? 460),
-            Math.max(320, Number(node.scailManualTileEditorHeight ?? 320)),
+            Math.max(320, manualTileEditorHeight(node)),
         ];
     } else {
         node.addWidget("text", "manual_tile_editor", "Manual Tile Editor", () => {}, { serialize: false });
@@ -1109,9 +1140,7 @@ function renderManualTileEditor(node) {
     writeManualTileLayout(node, tiles, selectedIndex);
     node.scailManualTileSelectedIndex = selectedIndex;
 
-    const aspect = manualTileAspect(node);
-    const preview = node.scailManualTilePreview ?? { items: [] };
-    const previewItems = Array.isArray(preview.items) ? preview.items : [];
+    const previewItems = manualTilePreviewItems(node);
     const previewIndex = Math.max(
         0,
         Math.min(previewItems.length - 1, Number(node.scailManualTilePreviewIndex ?? 0))
@@ -1122,8 +1151,8 @@ function renderManualTileEditor(node) {
     const selectedPixelRect = manualTilePixelRect(node, tiles[selectedIndex]);
     const align = manualTileAlign(node);
     const coverage = analyzeManualTileCoverage(tiles);
-    const stageHeight = Math.max(180, Math.min(420, Math.round(260 * aspect)));
-    const editorHeight = stageHeight + (previewItems.length > 1 ? 150 : 118);
+    const stageHeight = manualTileStageHeight(node);
+    const editorHeight = manualTileEditorHeight(node);
     node.scailManualTileEditorHeight = editorHeight;
 
     container.replaceChildren();
@@ -1141,9 +1170,11 @@ function renderManualTileEditor(node) {
     header.append(title, value);
 
     const stage = document.createElement("div");
+    let previewImageElement = null;
     stage.style.cssText = [
         "position:relative",
-        "height:" + stageHeight + "px",
+        "width:100%",
+        "aspect-ratio:" + manualTileAspectRatioCss(node),
         "border:1px solid rgba(226,232,240,.45)",
         "border-radius:6px",
         "overflow:hidden",
@@ -1167,6 +1198,7 @@ function renderManualTileEditor(node) {
             "pointer-events:none",
         ].join(";");
         stage.append(image);
+        previewImageElement = image;
     } else {
         const empty = document.createElement("div");
         empty.textContent = "Run this node once to load preview frames.";
@@ -1378,12 +1410,13 @@ function renderManualTileEditor(node) {
     });
 
     const controls = document.createElement("div");
-    controls.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:8px;flex-wrap:wrap;";
-    const note = document.createElement("div");
-    note.textContent = previewItem
-        ? `Preview ${previewIndex + 1}/${previewItems.length}: ${previewItem.label ?? `frame ${previewItem.frame_1_based ?? ""}`}`
+    controls.style.cssText = "display:flex;flex-direction:column;align-items:stretch;gap:8px;margin-top:8px;";
+    const previewLabel = (item, index) => item
+        ? `Preview ${index + 1}/${previewItems.length}: ${item.label ?? `frame ${item.frame_1_based ?? ""}`}`
         : "Drag rectangles. The Python node adds overlap and final aligned repaint sizes.";
-    note.style.cssText = "opacity:.72;min-width:180px;";
+    const note = document.createElement("div");
+    note.textContent = previewLabel(previewItem, previewIndex);
+    note.style.cssText = "opacity:.72;min-width:180px;overflow-wrap:anywhere;";
     const actions = document.createElement("div");
     actions.style.cssText = "display:flex;gap:6px;align-items:center;flex-wrap:wrap;";
     const tileSelector = document.createElement("div");
@@ -1477,8 +1510,13 @@ function renderManualTileEditor(node) {
         slider.value = String(previewIndex);
         slider.style.cssText = "width:100%;";
         slider.oninput = () => {
-            node.scailManualTilePreviewIndex = Number(slider.value);
-            renderManualTileEditor(node);
+            const nextIndex = Math.max(0, Math.min(previewItems.length - 1, Number(slider.value)));
+            node.scailManualTilePreviewIndex = nextIndex;
+            const nextItem = previewItems[nextIndex];
+            if (previewImageElement && nextItem) {
+                previewImageElement.src = matrixImageUrl(nextItem);
+            }
+            note.textContent = previewLabel(nextItem, nextIndex);
         };
         frameControl.append(label, slider);
         container.append(header, stage, controls, status, frameControl);

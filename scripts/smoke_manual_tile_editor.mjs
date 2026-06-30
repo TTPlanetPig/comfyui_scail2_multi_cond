@@ -35,10 +35,20 @@ const dragSource = sliceWithin(
     "const end = (endEvent) =>",
     beginDragIndex
 );
+const sliderSource = sliceWithin(
+    manualEditorSource,
+    "slider.oninput = () =>",
+    "frameControl.append",
+    beginDragIndex
+);
 
 assert(
     !/renderManualTileEditor\(node\)/.test(dragSource),
     "manual tile drag must not rebuild the editor during pointermove"
+);
+assert(
+    !/renderManualTileEditor\(node\)/.test(sliderSource),
+    "manual tile frame slider must not rebuild the editor during drag"
 );
 assert(
     !/container\.scrollHeight/.test(manualEditorSource),
@@ -62,6 +72,12 @@ assert(/hits\.includes\(selectedIndex\)/.test(manualEditorSource), "selected ove
 assert(/const tileSelector = document\.createElement\("div"\)/.test(manualEditorSource), "manual tile editor should expose direct tile selectors");
 assert(/z-index:" \+ \(selected \? "100"/.test(manualEditorSource), "selected manual tile should have the highest z-index");
 assert(/activeRegionElement\.style\.zIndex = "120"/.test(manualEditorSource), "dragged manual tile should stay above other tiles");
+assert(/function manualTileAspectRatioCss/.test(source), "manual tile editor should preserve source aspect ratio");
+assert(/function manualTileStageHeight/.test(source), "manual tile editor should compute stage height from node width");
+assert(/manualTileEditorHeight\(node\)/.test(manualEditorSource), "manual tile DOM widget should compute dynamic height");
+assert(/"aspect-ratio:" \+ manualTileAspectRatioCss\(node\)/.test(manualEditorSource), "manual tile stage should use CSS aspect-ratio");
+assert(!/"height:" \+ stageHeight/.test(manualEditorSource), "manual tile stage must not use fixed height that distorts on resize");
+assert(/previewImageElement\.src = matrixImageUrl\(nextItem\)/.test(sliderSource), "manual tile frame slider should update the preview image directly");
 assert(/MANUAL_TILE_LAYOUT_STORAGE_PREFIX/.test(source), "manual tile layouts should have a storage namespace");
 assert(/function readStoredManualTileLayout/.test(source), "manual tile editor should read persisted layouts");
 assert(/function storeManualTileLayout/.test(source), "manual tile editor should store persisted layouts");
