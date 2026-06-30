@@ -581,6 +581,72 @@ function normalizeManualTileRect(node, raw) {
     return { x0, y0, x1, y1 };
 }
 
+const MANUAL_TILE_LAYOUT_STORAGE_PREFIX = "scail_manual_tile_layout";
+
+function manualTileStorageNodeId(node) {
+    return String(node?.id ?? node?.title ?? "node");
+}
+
+function manualTileStorageSizeKey(node) {
+    const sourceSize = manualTileSourceSize(node);
+    const sizeKey = sourceSize
+        ? `${Math.round(sourceSize.width)}x${Math.round(sourceSize.height)}`
+        : "unknown";
+    return `${MANUAL_TILE_LAYOUT_STORAGE_PREFIX}:${manualTileStorageNodeId(node)}:${sizeKey}`;
+}
+
+function manualTileStorageLatestKey(node) {
+    return `${MANUAL_TILE_LAYOUT_STORAGE_PREFIX}:${manualTileStorageNodeId(node)}:latest`;
+}
+
+function normalizeStoredManualTileLayout(node, value) {
+    if (!Array.isArray(value?.tiles) || !value.tiles.length) {
+        return null;
+    }
+    return {
+        tiles: value.tiles.slice(0, MAX_TILES).map((tile) => normalizeManualTileRect(node, tile)),
+    };
+}
+
+function readStoredManualTileLayout(node) {
+    try {
+        const keys = Array.from(new Set([
+            manualTileStorageSizeKey(node),
+            manualTileStorageLatestKey(node),
+        ]));
+        for (const key of keys) {
+            const raw = globalThis.localStorage?.getItem(key);
+            if (!raw) {
+                continue;
+            }
+            const layout = normalizeStoredManualTileLayout(node, JSON.parse(raw));
+            if (layout) {
+                return layout;
+            }
+        }
+    } catch {
+        return null;
+    }
+    return null;
+}
+
+function storeManualTileLayout(node, layout) {
+    const normalized = normalizeStoredManualTileLayout(node, layout);
+    if (!normalized) {
+        return;
+    }
+    const sourceSize = manualTileSourceSize(node);
+    const payload = {
+        ...normalized,
+        source_size: sourceSize ? [Math.round(sourceSize.width), Math.round(sourceSize.height)] : null,
+    };
+    try {
+        const serialized = JSON.stringify(payload);
+        globalThis.localStorage?.setItem(manualTileStorageSizeKey(node), serialized);
+        globalThis.localStorage?.setItem(manualTileStorageLatestKey(node), serialized);
+    } catch {}
+}
+
 function manualTilesFromSplit(node, splitX = 0.5, splitY = 0.5) {
     const minRatio = manualTileMinRatio(node);
     const x = Math.max(minRatio, Math.min(1 - minRatio, Number(splitX)));
@@ -763,6 +829,10 @@ function parseManualTileLayout(node) {
             tiles: value.tiles.slice(0, MAX_TILES).map((tile) => normalizeManualTileRect(node, tile)),
         };
     }
+    const storedLayout = readStoredManualTileLayout(node);
+    if (storedLayout) {
+        return storedLayout;
+    }
     const splitX = Math.max(0.01, Math.min(0.99, Number(value.split_x ?? 0.5)));
     const splitY = Math.max(0.01, Math.min(0.99, Number(value.split_y ?? 0.5)));
     return {
@@ -830,6 +900,7 @@ function writeManualTileLayout(node, tiles, selectedIndex = 0) {
         0,
         Math.min(layout.tiles.length - 1, Number(selectedIndex ?? 0))
     );
+    storeManualTileLayout(node, layout);
 }
 
 function setManualTileTiles(node, tiles, selectedIndex = 0) {

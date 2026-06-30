@@ -25,6 +25,8 @@ function sliceWithin(haystack, startText, endText, from = 0) {
 }
 
 const manualEditorSource = sliceBetween("function ensureManualTileEditor", "app.registerExtension");
+const parseLayoutSource = sliceBetween("function parseManualTileLayout", "function normalizeManualTilePreview");
+const writeLayoutSource = sliceBetween("function writeManualTileLayout", "function setManualTileTiles");
 const beginDragIndex = manualEditorSource.indexOf("const beginTileDrag");
 assert(beginDragIndex >= 0, "missing manual tile drag handler");
 const dragSource = sliceWithin(
@@ -57,5 +59,14 @@ assert(/const tileRenderOrder = tiles/.test(manualEditorSource), "manual tile ed
 assert(/tileRenderOrder\.push\(selectedIndex\)/.test(manualEditorSource), "selected manual tile should render last");
 assert(/z-index:" \+ \(selected \? "30"/.test(manualEditorSource), "selected manual tile should have the highest z-index");
 assert(/regionElement\.style\.zIndex = "40"/.test(manualEditorSource), "dragged manual tile should stay above other tiles");
+assert(/MANUAL_TILE_LAYOUT_STORAGE_PREFIX/.test(source), "manual tile layouts should have a storage namespace");
+assert(/function readStoredManualTileLayout/.test(source), "manual tile editor should read persisted layouts");
+assert(/function storeManualTileLayout/.test(source), "manual tile editor should store persisted layouts");
+assert(/readStoredManualTileLayout\(node\)/.test(parseLayoutSource), "manual tile parsing should restore persisted layouts before defaults");
+assert(
+    parseLayoutSource.indexOf("readStoredManualTileLayout(node)") < parseLayoutSource.indexOf("manualTilesFromSplit"),
+    "manual tile parsing should try persisted layouts before rebuilding a default split"
+);
+assert(/storeManualTileLayout\(node, layout\)/.test(writeLayoutSource), "manual tile writes should persist the latest layout");
 
 console.log("smoke_manual_tile_editor: ok");
