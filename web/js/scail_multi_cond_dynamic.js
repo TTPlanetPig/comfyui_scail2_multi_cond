@@ -14,6 +14,7 @@ const LONG_VIDEO_NODE_TYPES = new Set([
     "SCAIL2TiledLongVideo",
     "SCAIL2TiledLongVideoWithSAM",
 ]);
+const SCAIL_FREE_TAIL_MAX_FRAMES = 64;
 const SCAIL_WIDGET_TOOLTIPS = new Map([
     ["segment_count", "Number of plan segments to expose in this builder."],
     ["segment_plan", "Frame plan used by the long-video scheduler. Each row selects frames, reference, prompt, negative prompt, and optional boundary overlap."],
@@ -118,6 +119,343 @@ const SCAIL_WIDGET_TOOLTIPS = new Map([
     ["stitch_offset_x_px", "Horizontal paste-back offset in pixels."],
     ["stitch_offset_y_px", "Vertical paste-back offset in pixels."],
 ]);
+
+const SCAIL_LONG_VIDEO_WIDGETS = [
+    "segment_plan",
+    "seed",
+    "cfg",
+    "mode",
+    "max_frames",
+    "max_chunk_frames",
+    "overlap_frames",
+    "reference_count",
+    "color_correction",
+    "cache_mode",
+];
+const SCAIL_SAM_WIDGETS = [
+    "object_indices",
+    "reference_object_indices",
+    "sort_by",
+    "sam_detection_threshold",
+    "sam_max_objects",
+    "sam_detect_interval",
+];
+const SCAIL_TILE_WIDGETS = [
+    "max_tile_pixels",
+    "enforce_tile_pixel_limit",
+    "expected_size_mismatch_mode",
+    "aspect_mismatch_mode",
+    "aspect_tolerance",
+    "image_resize_mode",
+    "mask_resize_mode",
+    "composite_feather_px",
+    "tile_fit_mode",
+    "frame_mismatch_mode",
+    "composite_color_correction",
+    "tile_seed_mode",
+    "cache_mode",
+];
+const SCAIL_REFERENCE_PACK_WIDGETS = [
+    "segment_plan",
+    "output_width",
+    "output_height",
+    "scale_factor",
+    "max_frames",
+    "reference_frame_mode",
+    "resize_mode",
+    "post_upscale_resize_mode",
+    "content_alignment_policy",
+    "max_content_shift_px",
+    "content_alignment_device",
+];
+const SCAIL_TILE_TAIL_24 = ["composite_blend_mode", "free_tail_window"];
+const SCAIL_TILE_TAIL_27 = ["composite_blend_mode", "seam_alignment", "max_seam_shift_px", "seam_alignment_frames", "free_tail_window"];
+const SCAIL_TILE_TAIL_28 = [
+    "composite_blend_mode",
+    "seam_alignment",
+    "seam_alignment_apply_mode",
+    "max_seam_shift_px",
+    "seam_alignment_frames",
+    "free_tail_window",
+];
+const SCAIL_TILE_TAIL_29 = [
+    "composite_blend_mode",
+    "seam_alignment",
+    "seam_alignment_apply_mode",
+    "seam_alignment_device",
+    "max_seam_shift_px",
+    "seam_alignment_frames",
+    "free_tail_window",
+];
+const SCAIL_TILE_TAIL_CURRENT = [...SCAIL_TILE_TAIL_29, "junction_mode"];
+
+function scailTiledWidgetOrder(samWidgets, tail) {
+    return [
+        ...SCAIL_LONG_VIDEO_WIDGETS.slice(0, 9),
+        ...samWidgets,
+        ...SCAIL_TILE_WIDGETS,
+        ...tail,
+    ];
+}
+
+const SCAIL_WIDGET_ORDER_HISTORY = new Map([
+    [
+        "SCAIL2ScheduledLongVideo",
+        [
+            SCAIL_LONG_VIDEO_WIDGETS,
+            [...SCAIL_LONG_VIDEO_WIDGETS, "free_tail_window"],
+        ],
+    ],
+    [
+        "SCAIL2ScheduledLongVideoWithSAM",
+        [
+            [...SCAIL_LONG_VIDEO_WIDGETS.slice(0, 9), ...SCAIL_SAM_WIDGETS, "cache_mode"],
+            [...SCAIL_LONG_VIDEO_WIDGETS.slice(0, 9), ...SCAIL_SAM_WIDGETS, "cache_mode", "free_tail_window"],
+        ],
+    ],
+    [
+        "SCAIL2TiledLongVideo",
+        [
+            scailTiledWidgetOrder([], []),
+            scailTiledWidgetOrder([], SCAIL_TILE_TAIL_24),
+            scailTiledWidgetOrder([], SCAIL_TILE_TAIL_27),
+            scailTiledWidgetOrder([], SCAIL_TILE_TAIL_28),
+            scailTiledWidgetOrder([], SCAIL_TILE_TAIL_29),
+            scailTiledWidgetOrder([], SCAIL_TILE_TAIL_CURRENT),
+        ],
+    ],
+    [
+        "SCAIL2TiledLongVideoWithSAM",
+        [
+            scailTiledWidgetOrder(SCAIL_SAM_WIDGETS, []),
+            scailTiledWidgetOrder(SCAIL_SAM_WIDGETS, SCAIL_TILE_TAIL_24),
+            scailTiledWidgetOrder(SCAIL_SAM_WIDGETS, SCAIL_TILE_TAIL_27),
+            scailTiledWidgetOrder(SCAIL_SAM_WIDGETS, SCAIL_TILE_TAIL_28),
+            scailTiledWidgetOrder(SCAIL_SAM_WIDGETS, SCAIL_TILE_TAIL_29),
+            scailTiledWidgetOrder(SCAIL_SAM_WIDGETS, SCAIL_TILE_TAIL_CURRENT),
+        ],
+    ],
+    [
+        "SCAIL2PlanReferencePackBuilder",
+        [
+            SCAIL_REFERENCE_PACK_WIDGETS,
+            [...SCAIL_REFERENCE_PACK_WIDGETS, "pack_mode"],
+        ],
+    ],
+]);
+
+const SCAIL_WIDGET_ENUM_VALUES = new Map([
+    ["mode", new Set(["replacement", "animation"])],
+    ["cache_mode", new Set(["disk", "off"])],
+    ["sort_by", new Set(["none", "left_to_right", "area"])],
+    ["expected_size_mismatch_mode", new Set(["warn", "error", "ignore"])],
+    ["aspect_mismatch_mode", new Set(["warn", "error", "ignore"])],
+    ["image_resize_mode", new Set(["bilinear", "bicubic", "nearest"])],
+    ["mask_resize_mode", new Set(["nearest", "bilinear"])],
+    ["tile_fit_mode", new Set(["stretch", "center_crop", "pad"])],
+    ["frame_mismatch_mode", new Set(["trim_to_shortest", "error"])],
+    ["tile_seed_mode", new Set(["offset_by_tile", "same_seed"])],
+    ["composite_blend_mode", new Set(["core_feather", "ttp_seam"])],
+    ["seam_alignment_apply_mode", new Set(["shifted_canvas_crop", "fixed_crop"])],
+    ["seam_alignment_device", new Set(["auto", "cpu", "cuda", "mps"])],
+    ["junction_mode", new Set(["weighted_average", "top2_normalized"])],
+    ["reference_frame_mode", new Set(["segment_start", "segment_middle", "segment_end"])],
+    ["resize_mode", new Set(["bicubic", "bilinear", "nearest", "upscale_model"])],
+    ["post_upscale_resize_mode", new Set(["bicubic", "bilinear", "nearest"])],
+    ["content_alignment_policy", new Set(["error", "warn", "off"])],
+    ["content_alignment_device", new Set(["auto", "cpu", "cuda", "mps"])],
+    ["pack_mode", new Set(["per_reference", "per_segment"])],
+]);
+
+const SCAIL_WIDGET_DEFAULTS = new Map([
+    ["mode", "replacement"],
+    ["cache_mode", "disk"],
+    ["sort_by", "left_to_right"],
+    ["expected_size_mismatch_mode", "warn"],
+    ["aspect_mismatch_mode", "warn"],
+    ["image_resize_mode", "bilinear"],
+    ["mask_resize_mode", "nearest"],
+    ["tile_fit_mode", "stretch"],
+    ["frame_mismatch_mode", "trim_to_shortest"],
+    ["tile_seed_mode", "offset_by_tile"],
+    ["composite_blend_mode", "core_feather"],
+    ["seam_alignment_apply_mode", "shifted_canvas_crop"],
+    ["seam_alignment_device", "auto"],
+    ["junction_mode", "weighted_average"],
+    ["reference_frame_mode", "segment_start"],
+    ["resize_mode", "bicubic"],
+    ["post_upscale_resize_mode", "bicubic"],
+    ["content_alignment_policy", "error"],
+    ["content_alignment_device", "auto"],
+    ["pack_mode", "per_reference"],
+    ["free_tail_window", 0],
+    ["max_seam_shift_px", 4],
+    ["seam_alignment_frames", 9],
+]);
+
+function scailSerializableWidgets(node) {
+    return (node.widgets ?? []).filter((widget) => {
+        const name = String(widget?.name ?? "");
+        return (
+            name &&
+            widget?.serialize !== false &&
+            widget?.type !== "button" &&
+            !name.startsWith("scail_") &&
+            name !== "manual_tile_editor" &&
+            name !== "keyframe_matrix"
+        );
+    });
+}
+
+function scailWidgetOrderMatches(left, right) {
+    return left.length === right.length && left.every((name, index) => name === right[index]);
+}
+
+function scailNormalizeIntWidget(name, value, fallback) {
+    const number = Number(value);
+    if (!Number.isFinite(number)) {
+        return fallback;
+    }
+    if (name === "free_tail_window") {
+        const rounded = Math.round(number / 4) * 4;
+        return Math.max(0, Math.min(SCAIL_FREE_TAIL_MAX_FRAMES, rounded));
+    }
+    if (name === "max_seam_shift_px") {
+        return Math.max(0, Math.min(32, Math.round(number)));
+    }
+    if (name === "seam_alignment_frames") {
+        return Math.max(1, Math.min(33, Math.round(number)));
+    }
+    return Math.round(number);
+}
+
+function scailNormalizeWidgetValue(name, value, currentValue) {
+    const enumValues = SCAIL_WIDGET_ENUM_VALUES.get(name);
+    if (enumValues) {
+        const text = String(value ?? "");
+        if (enumValues.has(text)) {
+            return text;
+        }
+        const currentText = String(currentValue ?? "");
+        if (enumValues.has(currentText)) {
+            return currentText;
+        }
+        return SCAIL_WIDGET_DEFAULTS.get(name);
+    }
+    if (["free_tail_window", "max_seam_shift_px", "seam_alignment_frames"].includes(name)) {
+        return scailNormalizeIntWidget(name, value, SCAIL_WIDGET_DEFAULTS.get(name) ?? 0);
+    }
+    return value;
+}
+
+function scailApplyWidgetValuesByName(node, savedNames, savedValues) {
+    const valuesByName = new Map();
+    for (let index = 0; index < Math.min(savedNames.length, savedValues.length); index += 1) {
+        valuesByName.set(savedNames[index], savedValues[index]);
+    }
+    for (const widget of scailSerializableWidgets(node)) {
+        if (!valuesByName.has(widget.name)) {
+            continue;
+        }
+        widget.value = scailNormalizeWidgetValue(widget.name, valuesByName.get(widget.name), widget.value);
+    }
+}
+
+function scailSyncWidgetValues(node) {
+    node.widgets_values = scailSerializableWidgets(node).map((widget) => widget.value);
+}
+
+function scailRepairShiftedTiledWidgets(node) {
+    const widgets = new Map(scailSerializableWidgets(node).map((widget) => [widget.name, widget]));
+    const applyWidget = widgets.get("seam_alignment_apply_mode");
+    const deviceWidget = widgets.get("seam_alignment_device");
+    const maxShiftWidget = widgets.get("max_seam_shift_px");
+    const framesWidget = widgets.get("seam_alignment_frames");
+    const freeTailWidget = widgets.get("free_tail_window");
+    if (!applyWidget || !deviceWidget || !maxShiftWidget || !framesWidget || !freeTailWidget) {
+        return false;
+    }
+    const validApply = SCAIL_WIDGET_ENUM_VALUES.get("seam_alignment_apply_mode").has(String(applyWidget.value));
+    const validDevice = SCAIL_WIDGET_ENUM_VALUES.get("seam_alignment_device").has(String(deviceWidget.value));
+    let changed = false;
+    if (!validDevice) {
+        if (validApply) {
+            const shiftedMax = deviceWidget.value;
+            const shiftedFrames = maxShiftWidget.value;
+            const shiftedTail = framesWidget.value;
+            deviceWidget.value = "auto";
+            maxShiftWidget.value = scailNormalizeIntWidget("max_seam_shift_px", shiftedMax, 4);
+            framesWidget.value = scailNormalizeIntWidget("seam_alignment_frames", shiftedFrames, 9);
+            freeTailWidget.value = scailNormalizeIntWidget("free_tail_window", shiftedTail, 0);
+        } else {
+            const shiftedMax = applyWidget.value;
+            const shiftedFrames = deviceWidget.value;
+            const shiftedTail = maxShiftWidget.value;
+            applyWidget.value = "shifted_canvas_crop";
+            deviceWidget.value = "auto";
+            maxShiftWidget.value = scailNormalizeIntWidget("max_seam_shift_px", shiftedMax, 4);
+            framesWidget.value = scailNormalizeIntWidget("seam_alignment_frames", shiftedFrames, 9);
+            freeTailWidget.value = scailNormalizeIntWidget("free_tail_window", shiftedTail, 0);
+        }
+        changed = true;
+    } else if (!validApply) {
+        applyWidget.value = "shifted_canvas_crop";
+        changed = true;
+    }
+    const normalizedTail = scailNormalizeIntWidget("free_tail_window", freeTailWidget.value, 0);
+    if (normalizedTail !== freeTailWidget.value) {
+        freeTailWidget.value = normalizedTail;
+        changed = true;
+    }
+    const junctionWidget = widgets.get("junction_mode");
+    const validJunction = junctionWidget
+        ? SCAIL_WIDGET_ENUM_VALUES.get("junction_mode").has(String(junctionWidget.value))
+        : true;
+    if (junctionWidget && !validJunction) {
+        junctionWidget.value = "weighted_average";
+        changed = true;
+    }
+    return changed;
+}
+
+function migrateScailWidgetValues(node, nodeName, serialized) {
+    const histories = SCAIL_WIDGET_ORDER_HISTORY.get(nodeName);
+    if (!histories?.length) {
+        return;
+    }
+    const widgets = scailSerializableWidgets(node);
+    const currentNames = widgets.map((widget) => widget.name);
+    const savedValues = Array.isArray(serialized?.widgets_values)
+        ? serialized.widgets_values.slice()
+        : Array.isArray(node.widgets_values)
+            ? node.widgets_values.slice()
+            : null;
+    let changed = false;
+    if (savedValues) {
+        const savedNames = histories.find((order) => order.length === savedValues.length);
+        if (savedNames && !scailWidgetOrderMatches(savedNames, currentNames)) {
+            scailApplyWidgetValuesByName(node, savedNames, savedValues);
+            changed = true;
+            console.info(
+                `[SCAIL Multi Cond] migrated ${nodeName} widget values from ${savedNames.length} legacy slots to ${currentNames.length} current slots.`
+            );
+        }
+    }
+    if (nodeName === "SCAIL2TiledLongVideo" || nodeName === "SCAIL2TiledLongVideoWithSAM") {
+        changed = scailRepairShiftedTiledWidgets(node) || changed;
+    }
+    for (const widget of widgets) {
+        const normalized = scailNormalizeWidgetValue(widget.name, widget.value, widget.value);
+        if (normalized !== widget.value) {
+            widget.value = normalized;
+            changed = true;
+        }
+    }
+    if (changed) {
+        scailSyncWidgetValues(node);
+        scheduleCanvas(node);
+    }
+}
 
 function widgetByName(node, name) {
     return node.widgets?.find((widget) => widget.name === name);
@@ -1909,6 +2247,7 @@ app.registerExtension({
             nodeType.prototype.onConfigure = function () {
                 originalOnConfigure?.apply(this, arguments);
                 this.scailNodeName = nodeData.name;
+                migrateScailWidgetValues(this, nodeData.name, arguments[0]);
                 requestAnimationFrame(() => installScailWidgetTooltips(this));
             };
         }
