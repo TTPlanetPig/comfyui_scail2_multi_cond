@@ -559,6 +559,37 @@ and `SCAIL-2 Multi Reference Colored Mask` to prepare `pose_video_mask` and
 
 The package itself does not depend on KJNodes. A workflow may still require KJNodes if it uses unrelated KJNodes nodes such as resize helpers.
 
+## Long Video Disk Cache
+
+Long-video nodes expose `cache_mode`:
+
+- `disk`: reuse the previous matching result for the same node instance;
+- `off`: always recompute inside the node.
+
+Disk cache files are stored under the ComfyUI output directory:
+
+```text
+output/scail2_cache/long_video/
+```
+
+Each node instance keeps one slot, but copied nodes, old workflows, and tiled
+child nodes use different `unique_id` directories. To prevent old slots from
+accumulating indefinitely, cache reads and writes prune the whole SCAIL-2
+long-video cache directory with an LRU policy.
+
+Default limits:
+
+```text
+SCAIL2_DISK_CACHE_MAX_ENTRIES = 24
+SCAIL2_DISK_CACHE_MAX_GB = 30
+SCAIL2_DISK_CACHE_MAX_AGE_DAYS = 14
+```
+
+Set these environment variables before starting ComfyUI to tune the policy.
+Use `0` to disable a specific limit. `SCAIL2_DISK_CACHE_MAX_BYTES` can be set
+for an exact byte cap and takes priority over `SCAIL2_DISK_CACHE_MAX_GB`. The
+cache slot that was just loaded or saved is protected from pruning.
+
 ## Developer Smoke Test
 
 Run this after changing tile or tiled long-video node wiring:

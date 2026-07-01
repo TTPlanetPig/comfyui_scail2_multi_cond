@@ -302,13 +302,26 @@ tile 的 `tile_align` 会被规范到 32 像素步进，`tile_generate_size` 必
 
 - 如果输入语义一致，节点会直接读取上一次磁盘缓存，跳过内部采样。
 - 如果输入语义变化，会重新推理并覆盖旧缓存。
-- 每个节点实例只保留一组缓存，不需要手动清理多版本缓存。
+- 每个节点实例只保留一组缓存，但不同工作流、复制出来的节点、tiled 子节点会产生不同 `unique_id` 目录。
+- 读取或写入磁盘缓存时会自动按 LRU 清理整个 SCAIL-2 长视频缓存目录。
 
 缓存位置在 ComfyUI 输出目录下：
 
 ```text
 output/scail2_cache/long_video/
 ```
+
+默认清理策略：
+
+```text
+SCAIL2_DISK_CACHE_MAX_ENTRIES = 24
+SCAIL2_DISK_CACHE_MAX_GB = 30
+SCAIL2_DISK_CACHE_MAX_AGE_DAYS = 14
+```
+
+可以在启动 ComfyUI 前用环境变量调整。设置为 `0` 表示关闭对应限制。
+如果想按字节精确限制容量，可以设置 `SCAIL2_DISK_CACHE_MAX_BYTES`，它会优先于 `SCAIL2_DISK_CACHE_MAX_GB`。
+当前刚命中或刚保存的缓存槽会被保护，避免大视频刚生成完就被清掉。
 
 注意：这个磁盘缓存能避免节点内部重复采样，但不能强制 ComfyUI 核心调度器完全不调用节点函数。如果 ComfyUI 的运行时 output cache 被释放，节点仍可能被调用；此时磁盘缓存会尽量快速返回结果。
 

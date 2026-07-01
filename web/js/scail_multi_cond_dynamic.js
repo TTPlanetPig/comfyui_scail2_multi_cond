@@ -27,7 +27,7 @@ const SCAIL_WIDGET_TOOLTIPS = new Map([
     ["cfg", "Classifier-free guidance scale passed to sampling."],
     ["mode", "replacement uses pose/reference masks; animation skips replacement masks and only uses motion/reference conditioning."],
     ["color_correction", "Match chunk color against previous context after overlap removal."],
-    ["cache_mode", "disk reuses the last matching node result when inputs fingerprint the same; off always recomputes."],
+    ["cache_mode", "disk reuses the last matching node result and auto-prunes old SCAIL cache slots; off always recomputes."],
     ["free_tail_window", "Blank final conditioning frames to append and discard. 0 disables; 4 adds one latent step, 8 adds two, etc."],
     ["object_indices", "Comma-separated tracked object indices from the driving video. Empty keeps all objects after sorting."],
     ["reference_object_indices", "Comma-separated tracked object indices from the reference image. Empty keeps all reference objects."],

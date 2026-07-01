@@ -6,6 +6,7 @@ import inspect
 import json
 import math
 import os
+import shutil
 import time
 from typing import Any, Optional
 
@@ -18,6 +19,9 @@ MAX_TILES = 8
 DEFAULT_MAX_TILE_PIXELS = 1280 * 720
 SCAIL_RESOLUTION_ALIGN = 32
 FREE_TAIL_WINDOW_MAX_FRAMES = 64
+DEFAULT_DISK_CACHE_MAX_ENTRIES = 24
+DEFAULT_DISK_CACHE_MAX_GB = 30.0
+DEFAULT_DISK_CACHE_MAX_AGE_DAYS = 14.0
 LONG_VIDEO_STATUS_EVENT = "scail2_long_video_status"
 DEFAULT_PLAN = """# frames | reference | prompt | negative | boundary_overlap
 49 | 1 | first segment prompt | | 5
@@ -186,6 +190,164 @@ def _single_slot_cache_paths(node_name: str, unique_id: Any) -> tuple[str, str, 
     return cache_dir, os.path.join(cache_dir, "cache.pt"), os.path.join(cache_dir, "meta.json")
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except Exception:
+        return float(default)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(float(os.environ.get(name, default)))
+    except Exception:
+        return int(default)
+
+
+def _disk_cache_prune_config() -> dict[str, Any]:
+    max_entries = max(0, _env_int("SCAIL2_DISK_CACHE_MAX_ENTRIES", DEFAULT_DISK_CACHE_MAX_ENTRIES))
+    max_age_days = max(0.0, _env_float("SCAIL2_DISK_CACHE_MAX_AGE_DAYS", DEFAULT_DISK_CACHE_MAX_AGE_DAYS))
+    if "SCAIL2_DISK_CACHE_MAX_BYTES" in os.environ:
+        max_bytes = max(0, _env_int("SCAIL2_DISK_CACHE_MAX_BYTES", 0))
+    else:
+        max_gb = max(0.0, _env_float("SCAIL2_DISK_CACHE_MAX_GB", DEFAULT_DISK_CACHE_MAX_GB))
+        max_bytes = int(max_gb * 1024 * 1024 * 1024)
+    return {
+        "max_entries": int(max_entries),
+        "max_bytes": int(max_bytes),
+        "max_age_seconds": float(max_age_days * 86400.0),
+    }
+
+
+def _directory_size_bytes(path: str) -> int:
+    total = 0
+    for dirpath, _dirnames, filenames in os.walk(path):
+        for filename in filenames:
+            file_path = os.path.join(dirpath, filename)
+            try:
+                total += int(os.path.getsize(file_path))
+            except OSError:
+                pass
+    return int(total)
+
+
+def _disk_cache_entries(root: str) -> list[dict[str, Any]]:
+    if not os.path.isdir(root):
+        return []
+    entries: list[dict[str, Any]] = []
+    for dirpath, _dirnames, filenames in os.walk(root):
+        if "cache.pt" not in filenames:
+            continue
+        cache_path = os.path.join(dirpath, "cache.pt")
+        try:
+            mtime = float(os.path.getmtime(cache_path))
+        except OSError:
+            continue
+        entries.append(
+            {
+                "dir": os.path.abspath(dirpath),
+                "cache_path": os.path.abspath(cache_path),
+                "mtime": float(mtime),
+                "size": int(_directory_size_bytes(dirpath)),
+            }
+        )
+    return entries
+
+
+def _remove_empty_cache_parents(path: str, root: str) -> None:
+    root_abs = os.path.abspath(root)
+    parent = os.path.abspath(os.path.dirname(path))
+    while parent != root_abs and parent.startswith(root_abs + os.sep):
+        try:
+            os.rmdir(parent)
+        except OSError:
+            break
+        parent = os.path.dirname(parent)
+
+
+def _prune_scail2_disk_cache(keep_cache_path: Optional[str] = None) -> dict[str, Any]:
+    root = _scail2_cache_root()
+    config = _disk_cache_prune_config()
+    max_entries = int(config["max_entries"])
+    max_bytes = int(config["max_bytes"])
+    max_age_seconds = float(config["max_age_seconds"])
+    entries = _disk_cache_entries(root)
+    if not entries:
+        return {"enabled": True, "deleted": 0, "remaining": 0, **config}
+
+    keep_dir = os.path.abspath(os.path.dirname(keep_cache_path)) if keep_cache_path else None
+    now = time.time()
+    entries_by_newest = sorted(entries, key=lambda item: float(item["mtime"]), reverse=True)
+    delete_dirs: set[str] = set()
+
+    if max_age_seconds > 0:
+        for entry in entries_by_newest:
+            if keep_dir is not None and entry["dir"] == keep_dir:
+                continue
+            if now - float(entry["mtime"]) > max_age_seconds:
+                delete_dirs.add(str(entry["dir"]))
+
+    if max_entries > 0:
+        kept_count = 0
+        for entry in entries_by_newest:
+            entry_dir = str(entry["dir"])
+            if entry_dir in delete_dirs:
+                continue
+            if keep_dir is not None and entry_dir == keep_dir:
+                kept_count += 1
+                continue
+            kept_count += 1
+            if kept_count > max_entries:
+                delete_dirs.add(entry_dir)
+
+    if max_bytes > 0:
+        remaining = [entry for entry in entries_by_newest if str(entry["dir"]) not in delete_dirs]
+        total_bytes = sum(int(entry["size"]) for entry in remaining)
+        for entry in sorted(remaining, key=lambda item: float(item["mtime"])):
+            if total_bytes <= max_bytes:
+                break
+            entry_dir = str(entry["dir"])
+            if keep_dir is not None and entry_dir == keep_dir:
+                continue
+            delete_dirs.add(entry_dir)
+            total_bytes -= int(entry["size"])
+
+    deleted = 0
+    deleted_bytes = 0
+    for entry in entries:
+        entry_dir = str(entry["dir"])
+        if entry_dir not in delete_dirs:
+            continue
+        try:
+            deleted_bytes += int(entry["size"])
+            shutil.rmtree(entry_dir)
+            _remove_empty_cache_parents(entry_dir, root)
+            deleted += 1
+        except Exception as exc:
+            print(f"[SCAIL2DiskCache] cache prune failed for {entry_dir}; reason={exc}")
+
+    if deleted:
+        print(
+            "[SCAIL2DiskCache] pruned "
+            f"{deleted} cache slot(s), freed approximately {deleted_bytes / (1024 * 1024):.1f} MiB."
+        )
+    remaining_entries = max(0, len(entries) - deleted)
+    return {
+        "enabled": True,
+        "deleted": int(deleted),
+        "deleted_bytes": int(deleted_bytes),
+        "remaining": int(remaining_entries),
+        **config,
+    }
+
+
+def _safe_prune_scail2_disk_cache(keep_cache_path: Optional[str] = None) -> None:
+    try:
+        _prune_scail2_disk_cache(keep_cache_path)
+    except Exception as exc:
+        print(f"[SCAIL2DiskCache] cache prune failed; continuing. reason={exc}")
+
+
 def _torch_load_cpu(path: str) -> Any:
     try:
         return torch.load(path, map_location="cpu", weights_only=False)
@@ -216,6 +378,7 @@ def _load_single_slot_disk_cache(node_name: str, unique_id: Any, cache_key: str)
                 os.utime(meta_path, (now, now))
         except Exception:
             pass
+        _safe_prune_scail2_disk_cache(cache_path)
         return (
             frames.detach().cpu().contiguous(),
             pose_mask.detach().cpu().contiguous(),
@@ -260,6 +423,7 @@ def _save_single_slot_disk_cache(node_name: str, unique_id: Any, cache_key: str,
         }
         with open(meta_path, "w", encoding="utf-8") as handle:
             json.dump(meta, handle, indent=2, sort_keys=True)
+        _safe_prune_scail2_disk_cache(cache_path)
     except Exception as exc:
         print(f"[SCAIL2DiskCache] cache write failed; continuing without disk cache. reason={exc}")
 
