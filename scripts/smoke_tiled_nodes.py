@@ -81,19 +81,25 @@ def main() -> None:
         composite_required["seam_alignment_apply_mode"][1]["default"] == "shifted_canvas_crop",
         "seam alignment should default to shifted-canvas crop",
     )
+    assert_true(composite_required["seam_alignment_device"][1]["default"] == "auto", "seam alignment should default to auto device")
     assert_true(composite_required["max_seam_shift_px"][1]["default"] == 4, "unexpected max_seam_shift_px default")
     assert_true(composite_required["seam_alignment_frames"][1]["default"] == 9, "unexpected seam_alignment_frames default")
     assert_true("composite_blend_mode" in tiled_required, "tiled long video should expose composite_blend_mode")
     assert_true("seam_alignment" in tiled_required, "tiled long video should expose seam_alignment")
     assert_true("seam_alignment_apply_mode" in tiled_required, "tiled long video should expose seam_alignment_apply_mode")
+    assert_true("seam_alignment_device" in tiled_required, "tiled long video should expose seam_alignment_device")
     assert_true("seam_alignment" in tiled_sam_required, "internal SAM tiled long video should expose seam_alignment")
     assert_true(
         "seam_alignment_apply_mode" in tiled_sam_required,
         "internal SAM tiled long video should expose seam_alignment_apply_mode",
     )
     assert_true(
+        "seam_alignment_device" in tiled_sam_required,
+        "internal SAM tiled long video should expose seam_alignment_device",
+    )
+    assert_true(
         list(composite_required)[-4:]
-        == ["seam_alignment", "seam_alignment_apply_mode", "max_seam_shift_px", "seam_alignment_frames"],
+        == ["seam_alignment_apply_mode", "seam_alignment_device", "max_seam_shift_px", "seam_alignment_frames"],
         "tile composite seam widgets should append last",
     )
     assert_true(list(tiled_required)[-1] == "free_tail_window", "free_tail_window should stay last in tiled widgets")
@@ -384,9 +390,14 @@ def main() -> None:
     crop_source = inspect.getsource(nodes._covered_viewport_crop_bbox)
     assert_true("largest_fully_covered_rectangle" in crop_source, "shifted canvas crop should remove uncovered black borders")
     assert_true("cropped_uncovered_pixels" in crop_source, "shifted canvas crop should report remaining uncovered pixels")
+    estimate_source = inspect.getsource(nodes._estimate_overlap_shift)
+    score_source = inspect.getsource(nodes._score_overlap_shift_samples)
+    assert_true("_resolve_seam_alignment_device" in estimate_source, "seam alignment should choose CPU/GPU device")
+    assert_true("torch.stack(score_tensors)" in score_source, "seam alignment should avoid per-candidate CPU sync")
     orchestrator_source = inspect.getsource(nodes._run_tiled_long_video)
     assert_true("seam_alignment" in orchestrator_source, "tiled orchestrator should pass seam alignment options")
     assert_true("seam_alignment_apply_mode" in orchestrator_source, "tiled orchestrator should pass seam apply mode")
+    assert_true("seam_alignment_device" in orchestrator_source, "tiled orchestrator should pass seam device")
 
     print("smoke_tiled_nodes: ok")
 

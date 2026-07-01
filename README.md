@@ -361,8 +361,9 @@ applies that offset before blending. The default
 `seam_alignment_apply_mode=shifted_canvas_crop` moves tile paste boxes on an
 expanded canvas and then crops the covered original viewport without resizing;
 the output may be a few pixels smaller than `tile_manifest.target_size`.
-`max_seam_shift_px` caps the correction; start with `4` and raise only when the
-seam is visibly displaced. Keep
+`seam_alignment_device=auto` tries CUDA first, then MPS, then CPU, and falls
+back to CPU if the requested device is unavailable. `max_seam_shift_px` caps the
+correction; start with `4` and raise only when the seam is visibly displaced. Keep
 `tile_fit_mode` at `stretch` for the default extractor output. If tile videos differ in length,
 `trim_to_shortest` drops only trailing mismatched frames; use `error` when
 debugging workflow alignment.

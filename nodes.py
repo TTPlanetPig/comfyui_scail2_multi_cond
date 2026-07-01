@@ -3732,37 +3732,69 @@ def _luma_gradient_weight(left: torch.Tensor, right: torch.Tensor) -> torch.Tens
     return (gradient(left_luma) + gradient(right_luma)).clamp_min(1e-4)
 
 
-def _estimate_overlap_shift(
-    left: torch.Tensor,
-    right: torch.Tensor,
-    *,
-    max_shift_px: int,
-    frame_indices: list[int],
-) -> dict[str, Any]:
-    max_shift = max(0, int(max_shift_px))
-    if max_shift <= 0:
-        return {"status": "disabled", "shift": [0, 0], "confidence": 0.0}
-    if int(left.shape[1]) < 4 or int(left.shape[2]) < 4:
-        return {"status": "skipped_too_small", "shift": [0, 0], "confidence": 0.0}
-    frames = [index for index in frame_indices if 0 <= int(index) < int(left.shape[0]) and int(index) < int(right.shape[0])]
-    if not frames:
-        return {"status": "skipped_no_frames", "shift": [0, 0], "confidence": 0.0}
-    left_sample = left[frames].detach().cpu().float().clamp(0, 1)
-    right_sample = right[frames].detach().cpu().float().clamp(0, 1)
-    texture = float(_luma_gradient_weight(left_sample, right_sample).mean().item())
-    if texture < 0.002:
-        return {"status": "skipped_low_texture", "shift": [0, 0], "confidence": 0.0, "texture": float(texture)}
+def _resolve_seam_alignment_device(requested_device: str) -> tuple[str, dict[str, Any]]:
+    requested = str(requested_device or "auto").strip().lower()
+    if requested not in {"auto", "cpu", "cuda", "mps"}:
+        requested = "auto"
 
-    scored: list[tuple[float, int, int]] = []
+    def available(name: str) -> bool:
+        try:
+            if name == "cuda":
+                return bool(torch.cuda.is_available())
+            if name == "mps":
+                return bool(getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available())
+        except Exception:
+            return False
+        return name == "cpu"
+
+    if requested == "auto":
+        if available("cuda"):
+            selected = "cuda"
+        elif available("mps"):
+            selected = "mps"
+        else:
+            selected = "cpu"
+    elif available(requested):
+        selected = requested
+    else:
+        selected = "cpu"
+
+    return selected, {
+        "requested": requested,
+        "selected": selected,
+        "fallback": bool(requested != "auto" and requested != selected),
+    }
+
+
+def _score_overlap_shift_samples(
+    left_sample: torch.Tensor,
+    right_sample: torch.Tensor,
+    *,
+    max_shift: int,
+    frames: list[int],
+    device_info: dict[str, Any],
+) -> dict[str, Any]:
+    texture = float(_luma_gradient_weight(left_sample, right_sample).mean().detach().cpu().item())
+    if texture < 0.002:
+        return {
+            "status": "skipped_low_texture",
+            "shift": [0, 0],
+            "confidence": 0.0,
+            "texture": float(texture),
+            "alignment_device": device_info,
+        }
+
+    score_tensors: list[torch.Tensor] = []
+    candidate_shifts: list[tuple[int, int]] = []
     height = int(left_sample.shape[1])
     width = int(left_sample.shape[2])
-    for dy in range(-max_shift, max_shift + 1):
+    for dy in range(-int(max_shift), int(max_shift) + 1):
         y0_left = max(0, dy)
         y0_right = max(0, -dy)
         h = height - abs(dy)
         if h < 4:
             continue
-        for dx in range(-max_shift, max_shift + 1):
+        for dx in range(-int(max_shift), int(max_shift) + 1):
             x0_left = max(0, dx)
             x0_right = max(0, -dx)
             w = width - abs(dx)
@@ -3772,13 +3804,28 @@ def _estimate_overlap_shift(
             right_patch = right_sample[:, y0_right : y0_right + h, x0_right : x0_right + w, :]
             weight = _luma_gradient_weight(left_patch, right_patch)
             diff = (left_patch - right_patch).abs().mean(dim=-1, keepdim=True)
-            score = float((diff * weight).sum().item() / max(1e-6, float(weight.sum().item())))
-            scored.append((score, int(dx), int(dy)))
-    if not scored:
-        return {"status": "skipped_no_candidates", "shift": [0, 0], "confidence": 0.0, "texture": float(texture)}
-    scored.sort(key=lambda item: (item[0], abs(item[1]) + abs(item[2])))
-    best_score, best_dx, best_dy = scored[0]
-    second_score = scored[1][0] if len(scored) > 1 else best_score
+            score_tensors.append((diff * weight).sum() / weight.sum().clamp_min(1e-6))
+            candidate_shifts.append((int(dx), int(dy)))
+    if not score_tensors:
+        return {
+            "status": "skipped_no_candidates",
+            "shift": [0, 0],
+            "confidence": 0.0,
+            "texture": float(texture),
+            "alignment_device": device_info,
+        }
+    scores_cpu = torch.stack(score_tensors).detach().cpu()
+    ranked_indices = sorted(
+        range(len(candidate_shifts)),
+        key=lambda index: (
+            float(scores_cpu[index]),
+            abs(candidate_shifts[index][0]) + abs(candidate_shifts[index][1]),
+        ),
+    )
+    best_index = int(ranked_indices[0])
+    best_score = float(scores_cpu[best_index])
+    second_score = float(scores_cpu[int(ranked_indices[1])]) if len(ranked_indices) > 1 else float(best_score)
+    best_dx, best_dy = candidate_shifts[best_index]
     margin = max(0.0, float(second_score - best_score))
     confidence = float(max(0.0, min(1.0, margin / max(1e-6, float(best_score)))))
     return {
@@ -3788,9 +3835,65 @@ def _estimate_overlap_shift(
         "best_score": float(best_score),
         "second_score": float(second_score),
         "texture": float(texture),
+        "alignment_device": device_info,
         "sampled_frames": [int(index) for index in frames],
-        "candidate_count": int(len(scored)),
+        "candidate_count": int(len(score_tensors)),
     }
+
+
+def _estimate_overlap_shift(
+    left: torch.Tensor,
+    right: torch.Tensor,
+    *,
+    max_shift_px: int,
+    frame_indices: list[int],
+    alignment_device: str,
+) -> dict[str, Any]:
+    max_shift = max(0, int(max_shift_px))
+    if max_shift <= 0:
+        return {"status": "disabled", "shift": [0, 0], "confidence": 0.0}
+    if int(left.shape[1]) < 4 or int(left.shape[2]) < 4:
+        return {"status": "skipped_too_small", "shift": [0, 0], "confidence": 0.0}
+    frames = [index for index in frame_indices if 0 <= int(index) < int(left.shape[0]) and int(index) < int(right.shape[0])]
+    if not frames:
+        return {"status": "skipped_no_frames", "shift": [0, 0], "confidence": 0.0}
+    device_name, device_info = _resolve_seam_alignment_device(str(alignment_device))
+    try:
+        left_sample = left[frames].detach().to(device=device_name, dtype=torch.float32).clamp(0, 1)
+        right_sample = right[frames].detach().to(device=device_name, dtype=torch.float32).clamp(0, 1)
+    except Exception as exc:
+        device_info = {
+            **device_info,
+            "selected": "cpu",
+            "fallback": True,
+            "fallback_reason": str(exc),
+        }
+        left_sample = left[frames].detach().cpu().float().clamp(0, 1)
+        right_sample = right[frames].detach().cpu().float().clamp(0, 1)
+    try:
+        return _score_overlap_shift_samples(
+            left_sample,
+            right_sample,
+            max_shift=int(max_shift),
+            frames=frames,
+            device_info=device_info,
+        )
+    except Exception as exc:
+        if str(device_info.get("selected")) == "cpu":
+            raise
+        fallback_info = {
+            **device_info,
+            "selected": "cpu",
+            "fallback": True,
+            "fallback_reason": str(exc),
+        }
+        return _score_overlap_shift_samples(
+            left[frames].detach().cpu().float().clamp(0, 1),
+            right[frames].detach().cpu().float().clamp(0, 1),
+            max_shift=int(max_shift),
+            frames=frames,
+            device_info=fallback_info,
+        )
 
 
 def _intersect_bboxes(a: list[int], b: list[int]) -> Optional[list[int]]:
@@ -3808,6 +3911,7 @@ def _estimate_tile_seam_offsets(
     frame_count: int,
     max_shift_px: int,
     seam_alignment_frames: int,
+    alignment_device: str,
 ) -> dict[str, Any]:
     max_shift = max(0, int(max_shift_px))
     offsets = {index: [0, 0] for index in range(len(prepared_tiles))}
@@ -3815,6 +3919,7 @@ def _estimate_tile_seam_offsets(
         return {
             "enabled": bool(max_shift > 0),
             "max_shift_px": int(max_shift),
+            "alignment_device_request": str(alignment_device or "auto"),
             "sampled_frames": [],
             "tile_offsets": {
                 str(int(tile.get("tile_number", index + 1))): [0, 0]
@@ -3856,6 +3961,7 @@ def _estimate_tile_seam_offsets(
                 right_patch,
                 max_shift_px=int(max_shift),
                 frame_indices=frame_indices,
+                alignment_device=str(alignment_device),
             )
             pair_info = {
                 "tile_a": int(left_tile["tile_number"]),
@@ -3927,6 +4033,7 @@ def _estimate_tile_seam_offsets(
             for index in range(len(prepared_tiles))
         },
         "global_offset_normalization_xy": [int(normalize_x), int(normalize_y)],
+        "alignment_device_request": str(alignment_device or "auto"),
         "pairs": pairs,
         "warnings": warnings,
     }
@@ -6667,6 +6774,7 @@ class SCAIL2TileCompositeVideo:
                 "blend_mode": (["core_feather", "ttp_seam"], {"default": "core_feather"}),
                 "seam_alignment": ("BOOLEAN", {"default": False}),
                 "seam_alignment_apply_mode": (["shifted_canvas_crop", "fixed_crop"], {"default": "shifted_canvas_crop"}),
+                "seam_alignment_device": (["auto", "cpu", "cuda", "mps"], {"default": "auto"}),
                 "max_seam_shift_px": ("INT", {"default": 4, "min": 0, "max": 32, "step": 1}),
                 "seam_alignment_frames": ("INT", {"default": 9, "min": 1, "max": 33, "step": 1}),
             },
@@ -6697,6 +6805,7 @@ class SCAIL2TileCompositeVideo:
         blend_mode: str = "core_feather",
         seam_alignment: bool = False,
         seam_alignment_apply_mode: str = "shifted_canvas_crop",
+        seam_alignment_device: str = "auto",
         max_seam_shift_px: int = 4,
         seam_alignment_frames: int = 9,
         base_video: Optional[torch.Tensor] = None,
@@ -6779,6 +6888,7 @@ class SCAIL2TileCompositeVideo:
         seam_alignment_summary = {
             "enabled": False,
             "max_shift_px": int(normalized_max_seam_shift_px),
+            "alignment_device_request": str(seam_alignment_device or "auto"),
             "sampled_frames": [],
             "tile_offsets": {str(int(item["tile_number"])): [0, 0] for item in prepared_tiles},
             "pairs": [],
@@ -6790,6 +6900,7 @@ class SCAIL2TileCompositeVideo:
                 int(frame_count),
                 int(normalized_max_seam_shift_px),
                 int(normalized_seam_alignment_frames),
+                str(seam_alignment_device),
             )
 
         shifted_canvas_summary: Optional[dict[str, Any]] = None
@@ -7353,6 +7464,7 @@ def _run_tiled_long_video(
     free_tail_window: int,
     seam_alignment: bool,
     seam_alignment_apply_mode: str,
+    seam_alignment_device: str,
     max_seam_shift_px: int,
     seam_alignment_frames: int,
     pose_video_mask: Optional[torch.Tensor],
@@ -7552,6 +7664,7 @@ def _run_tiled_long_video(
         str(composite_blend_mode),
         bool(seam_alignment),
         str(seam_alignment_apply_mode),
+        str(seam_alignment_device),
         int(max_seam_shift_px),
         int(seam_alignment_frames),
         base_video=pose_video if bool(composite_color_correction) else None,
@@ -7573,6 +7686,7 @@ def _run_tiled_long_video(
         "seam_alignment": {
             "enabled": bool(seam_alignment),
             "apply_mode": str(seam_alignment_apply_mode),
+            "device": str(seam_alignment_device),
             "max_seam_shift_px": int(max_seam_shift_px),
             "seam_alignment_frames": int(seam_alignment_frames),
         },
@@ -7636,6 +7750,7 @@ class SCAIL2TiledLongVideo:
                 "composite_blend_mode": (["core_feather", "ttp_seam"], {"default": "core_feather"}),
                 "seam_alignment": ("BOOLEAN", {"default": False}),
                 "seam_alignment_apply_mode": (["shifted_canvas_crop", "fixed_crop"], {"default": "shifted_canvas_crop"}),
+                "seam_alignment_device": (["auto", "cpu", "cuda", "mps"], {"default": "auto"}),
                 "max_seam_shift_px": ("INT", {"default": 4, "min": 0, "max": 32, "step": 1}),
                 "seam_alignment_frames": ("INT", {"default": 9, "min": 1, "max": 33, "step": 1}),
                 "free_tail_window": _free_tail_window_input_spec(),
@@ -7691,6 +7806,7 @@ class SCAIL2TiledLongVideo:
         composite_blend_mode: str = "core_feather",
         seam_alignment: bool = False,
         seam_alignment_apply_mode: str = "shifted_canvas_crop",
+        seam_alignment_device: str = "auto",
         max_seam_shift_px: int = 4,
         seam_alignment_frames: int = 9,
         free_tail_window: int = 0,
@@ -7735,6 +7851,7 @@ class SCAIL2TiledLongVideo:
             free_tail_window=int(free_tail_window),
             seam_alignment=bool(seam_alignment),
             seam_alignment_apply_mode=str(seam_alignment_apply_mode),
+            seam_alignment_device=str(seam_alignment_device),
             max_seam_shift_px=int(max_seam_shift_px),
             seam_alignment_frames=int(seam_alignment_frames),
             pose_video_mask=pose_video_mask,
@@ -7807,6 +7924,7 @@ class SCAIL2TiledLongVideoWithSAM:
                 "composite_blend_mode": (["core_feather", "ttp_seam"], {"default": "core_feather"}),
                 "seam_alignment": ("BOOLEAN", {"default": False}),
                 "seam_alignment_apply_mode": (["shifted_canvas_crop", "fixed_crop"], {"default": "shifted_canvas_crop"}),
+                "seam_alignment_device": (["auto", "cpu", "cuda", "mps"], {"default": "auto"}),
                 "max_seam_shift_px": ("INT", {"default": 4, "min": 0, "max": 32, "step": 1}),
                 "seam_alignment_frames": ("INT", {"default": 9, "min": 1, "max": 33, "step": 1}),
                 "free_tail_window": _free_tail_window_input_spec(),
@@ -7868,6 +7986,7 @@ class SCAIL2TiledLongVideoWithSAM:
         composite_blend_mode: str = "core_feather",
         seam_alignment: bool = False,
         seam_alignment_apply_mode: str = "shifted_canvas_crop",
+        seam_alignment_device: str = "auto",
         max_seam_shift_px: int = 4,
         seam_alignment_frames: int = 9,
         free_tail_window: int = 0,
@@ -7913,6 +8032,7 @@ class SCAIL2TiledLongVideoWithSAM:
             free_tail_window=int(free_tail_window),
             seam_alignment=bool(seam_alignment),
             seam_alignment_apply_mode=str(seam_alignment_apply_mode),
+            seam_alignment_device=str(seam_alignment_device),
             max_seam_shift_px=int(max_seam_shift_px),
             seam_alignment_frames=int(seam_alignment_frames),
             pose_video_mask=None,

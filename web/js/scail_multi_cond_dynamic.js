@@ -62,6 +62,7 @@ const SCAIL_WIDGET_TOOLTIPS = new Map([
     ["blend_mode", "Tile composite blend method."],
     ["seam_alignment", "Analyze tile overlap across sampled frames and apply one stable whole-tile offset before compositing."],
     ["seam_alignment_apply_mode", "shifted_canvas_crop moves tile paste boxes and globally crops the final canvas; fixed_crop shifts inside each tile crop."],
+    ["seam_alignment_device", "Device used for seam offset scoring. auto prefers CUDA, then MPS, then CPU, with CPU fallback if unavailable."],
     ["max_seam_shift_px", "Maximum integer-pixel correction allowed for automatic seam alignment."],
     ["seam_alignment_frames", "Number of frames sampled across the timeline when estimating seam alignment."],
     ["layout_json", "Manual tile layout written by the visual editor. Keep this connected through the builder output."],

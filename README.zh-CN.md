@@ -291,7 +291,8 @@ tile 的 `tile_align` 会被规范到 32 像素步进，`tile_generate_size` 必
 它会从时间线上抽样多帧，只分析相邻 tile 的重叠带，估计每块 tile 一个稳定的整数像素偏移，
 再在拼合前应用。默认 `seam_alignment_apply_mode=shifted_canvas_crop` 会移动 tile 的贴回画框，
 在扩展画布上合成，然后对原始 viewport 的有效覆盖区域做全局裁剪，不会缩放回原尺寸；
-因此输出可能比 `tile_manifest.target_size` 小几像素。`max_seam_shift_px` 控制允许的最大修正，
+因此输出可能比 `tile_manifest.target_size` 小几像素。`seam_alignment_device=auto` 会优先尝试
+CUDA，其次 MPS，最后 CPU；如果请求的设备不可用，会自动回退 CPU。`max_seam_shift_px` 控制允许的最大修正，
 建议先用默认 `4`，只有接缝明显错位时再调高。
 
 如果你想单独调试每一块，再使用 `SCAIL-2 Tile Extractor` 手动导出每块视频，
