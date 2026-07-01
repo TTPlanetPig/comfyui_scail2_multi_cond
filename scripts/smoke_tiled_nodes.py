@@ -74,13 +74,27 @@ def main() -> None:
     assert_true({"sam_model", "sam_conditioning"} <= set(internal_optional), "internal SAM inputs missing")
     composite_required = nodes.SCAIL2TileCompositeVideo.INPUT_TYPES()["required"]
     tiled_required = nodes.SCAIL2TiledLongVideo.INPUT_TYPES()["required"]
+    tiled_sam_required = nodes.SCAIL2TiledLongVideoWithSAM.INPUT_TYPES()["required"]
     assert_true("blend_mode" in composite_required, "tile composite should expose blend_mode")
+    assert_true("seam_alignment" in composite_required, "tile composite should expose seam_alignment")
+    assert_true(composite_required["max_seam_shift_px"][1]["default"] == 4, "unexpected max_seam_shift_px default")
+    assert_true(composite_required["seam_alignment_frames"][1]["default"] == 9, "unexpected seam_alignment_frames default")
     assert_true("composite_blend_mode" in tiled_required, "tiled long video should expose composite_blend_mode")
-    assert_true(list(composite_required)[-1] == "blend_mode", "new tile composite widgets should append after existing widgets")
+    assert_true("seam_alignment" in tiled_required, "tiled long video should expose seam_alignment")
+    assert_true("seam_alignment" in tiled_sam_required, "internal SAM tiled long video should expose seam_alignment")
+    assert_true(list(composite_required)[-3:] == ["seam_alignment", "max_seam_shift_px", "seam_alignment_frames"], "tile composite seam widgets should append last")
     assert_true(list(tiled_required)[-1] == "free_tail_window", "free_tail_window should stay last in tiled widgets")
     assert_true(
         list(tiled_required).index("composite_blend_mode") < list(tiled_required).index("free_tail_window"),
         "composite_blend_mode should stay before free_tail_window",
+    )
+    assert_true(
+        list(tiled_required).index("seam_alignment") < list(tiled_required).index("free_tail_window"),
+        "seam_alignment should stay before free_tail_window",
+    )
+    assert_true(
+        list(tiled_sam_required).index("seam_alignment") < list(tiled_sam_required).index("free_tail_window"),
+        "internal SAM seam_alignment should stay before free_tail_window",
     )
     free_tail_spec = tiled_required["free_tail_window"]
     assert_true(free_tail_spec[0] == "INT", "free_tail_window should be a numeric tail-frame control")
@@ -348,6 +362,11 @@ def main() -> None:
     assert_true("expand_px=feather_px" not in tile_weight_source, "tile composite should not expand core across the whole overlap")
     assert_true("core_feather" in tile_weight_source, "tile composite should keep the original core feather mode")
     assert_true("ttp_seam" in tile_weight_source, "tile composite should expose the TTP-style seam feather mode")
+    composite_source = inspect.getsource(nodes.SCAIL2TileCompositeVideo.composite)
+    assert_true("_estimate_tile_seam_offsets" in composite_source, "tile composite should run temporal seam alignment")
+    assert_true("_shift_image_batch_integer" in composite_source, "tile composite should apply seam offsets before paste")
+    orchestrator_source = inspect.getsource(nodes._run_tiled_long_video)
+    assert_true("seam_alignment" in orchestrator_source, "tiled orchestrator should pass seam alignment options")
 
     print("smoke_tiled_nodes: ok")
 

@@ -3687,6 +3687,229 @@ def _tile_weight_mask(
     return _tile_weight_mask_core_feather(height, width, crop_bbox, core_bbox, feather_px)
 
 
+def _shift_image_batch_integer(image: torch.Tensor, dx: int, dy: int) -> torch.Tensor:
+    if int(dx) == 0 and int(dy) == 0:
+        return image.contiguous()
+    import torch.nn.functional as F
+
+    frames, height, width, channels = image.shape
+    shift_x = int(dx)
+    shift_y = int(dy)
+    left = max(0, shift_x)
+    right = max(0, -shift_x)
+    top = max(0, shift_y)
+    bottom = max(0, -shift_y)
+    padded = F.pad(
+        image.detach().float().movedim(-1, 1),
+        (left, right, top, bottom),
+        mode="replicate",
+    )
+    x0 = max(0, -shift_x)
+    y0 = max(0, -shift_y)
+    shifted = padded[:, :, y0 : y0 + int(height), x0 : x0 + int(width)].movedim(1, -1)
+    return shifted.to(dtype=image.dtype).reshape(int(frames), int(height), int(width), int(channels)).contiguous()
+
+
+def _sample_frame_indices(frame_count: int, sample_count: int) -> list[int]:
+    frame_count = max(1, int(frame_count))
+    sample_count = max(1, min(int(sample_count), frame_count))
+    if sample_count == 1:
+        return [0]
+    return [int(round(index * (frame_count - 1) / (sample_count - 1))) for index in range(sample_count)]
+
+
+def _luma_gradient_weight(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+    left_luma = left.mean(dim=-1, keepdim=True)
+    right_luma = right.mean(dim=-1, keepdim=True)
+
+    def gradient(value: torch.Tensor) -> torch.Tensor:
+        grad_x = torch.zeros_like(value)
+        grad_y = torch.zeros_like(value)
+        grad_x[:, :, 1:, :] = (value[:, :, 1:, :] - value[:, :, :-1, :]).abs()
+        grad_y[:, 1:, :, :] = (value[:, 1:, :, :] - value[:, :-1, :, :]).abs()
+        return grad_x + grad_y
+
+    return (gradient(left_luma) + gradient(right_luma)).clamp_min(1e-4)
+
+
+def _estimate_overlap_shift(
+    left: torch.Tensor,
+    right: torch.Tensor,
+    *,
+    max_shift_px: int,
+    frame_indices: list[int],
+) -> dict[str, Any]:
+    max_shift = max(0, int(max_shift_px))
+    if max_shift <= 0:
+        return {"status": "disabled", "shift": [0, 0], "confidence": 0.0}
+    if int(left.shape[1]) < 4 or int(left.shape[2]) < 4:
+        return {"status": "skipped_too_small", "shift": [0, 0], "confidence": 0.0}
+    frames = [index for index in frame_indices if 0 <= int(index) < int(left.shape[0]) and int(index) < int(right.shape[0])]
+    if not frames:
+        return {"status": "skipped_no_frames", "shift": [0, 0], "confidence": 0.0}
+    left_sample = left[frames].detach().cpu().float().clamp(0, 1)
+    right_sample = right[frames].detach().cpu().float().clamp(0, 1)
+    texture = float(_luma_gradient_weight(left_sample, right_sample).mean().item())
+    if texture < 0.002:
+        return {"status": "skipped_low_texture", "shift": [0, 0], "confidence": 0.0, "texture": float(texture)}
+
+    scored: list[tuple[float, int, int]] = []
+    height = int(left_sample.shape[1])
+    width = int(left_sample.shape[2])
+    for dy in range(-max_shift, max_shift + 1):
+        y0_left = max(0, dy)
+        y0_right = max(0, -dy)
+        h = height - abs(dy)
+        if h < 4:
+            continue
+        for dx in range(-max_shift, max_shift + 1):
+            x0_left = max(0, dx)
+            x0_right = max(0, -dx)
+            w = width - abs(dx)
+            if w < 4:
+                continue
+            left_patch = left_sample[:, y0_left : y0_left + h, x0_left : x0_left + w, :]
+            right_patch = right_sample[:, y0_right : y0_right + h, x0_right : x0_right + w, :]
+            weight = _luma_gradient_weight(left_patch, right_patch)
+            diff = (left_patch - right_patch).abs().mean(dim=-1, keepdim=True)
+            score = float((diff * weight).sum().item() / max(1e-6, float(weight.sum().item())))
+            scored.append((score, int(dx), int(dy)))
+    if not scored:
+        return {"status": "skipped_no_candidates", "shift": [0, 0], "confidence": 0.0, "texture": float(texture)}
+    scored.sort(key=lambda item: (item[0], abs(item[1]) + abs(item[2])))
+    best_score, best_dx, best_dy = scored[0]
+    second_score = scored[1][0] if len(scored) > 1 else best_score
+    margin = max(0.0, float(second_score - best_score))
+    confidence = float(max(0.0, min(1.0, margin / max(1e-6, float(best_score)))))
+    return {
+        "status": "ok",
+        "shift": [int(best_dx), int(best_dy)],
+        "confidence": confidence,
+        "best_score": float(best_score),
+        "second_score": float(second_score),
+        "texture": float(texture),
+        "sampled_frames": [int(index) for index in frames],
+        "candidate_count": int(len(scored)),
+    }
+
+
+def _intersect_bboxes(a: list[int], b: list[int]) -> Optional[list[int]]:
+    x0 = max(int(a[0]), int(b[0]))
+    y0 = max(int(a[1]), int(b[1]))
+    x1 = min(int(a[2]), int(b[2]))
+    y1 = min(int(a[3]), int(b[3]))
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return [int(x0), int(y0), int(x1), int(y1)]
+
+
+def _estimate_tile_seam_offsets(
+    prepared_tiles: list[dict[str, Any]],
+    frame_count: int,
+    max_shift_px: int,
+    seam_alignment_frames: int,
+) -> dict[str, Any]:
+    max_shift = max(0, int(max_shift_px))
+    offsets = {index: [0, 0] for index in range(len(prepared_tiles))}
+    if max_shift <= 0 or len(prepared_tiles) <= 1:
+        return {
+            "enabled": bool(max_shift > 0),
+            "max_shift_px": int(max_shift),
+            "sampled_frames": [],
+            "tile_offsets": {
+                str(int(tile.get("tile_number", index + 1))): [0, 0]
+                for index, tile in enumerate(prepared_tiles)
+            },
+            "pairs": [],
+            "warnings": [],
+        }
+    frame_indices = _sample_frame_indices(int(frame_count), int(seam_alignment_frames))
+    pairs: list[dict[str, Any]] = []
+    adjacency: dict[int, list[tuple[int, list[int], int]]] = {index: [] for index in range(len(prepared_tiles))}
+    warnings: list[str] = []
+    for left_index in range(len(prepared_tiles)):
+        for right_index in range(left_index + 1, len(prepared_tiles)):
+            left_tile = prepared_tiles[left_index]
+            right_tile = prepared_tiles[right_index]
+            overlap = _intersect_bboxes(left_tile["target_crop_bbox"], right_tile["target_crop_bbox"])
+            if overlap is None:
+                continue
+            ox0, oy0, ox1, oy1 = overlap
+            if (ox1 - ox0) < 4 or (oy1 - oy0) < 4:
+                continue
+            left_bbox = left_tile["target_crop_bbox"]
+            right_bbox = right_tile["target_crop_bbox"]
+            left_patch = left_tile["fitted"][
+                :,
+                oy0 - left_bbox[1] : oy1 - left_bbox[1],
+                ox0 - left_bbox[0] : ox1 - left_bbox[0],
+                :,
+            ]
+            right_patch = right_tile["fitted"][
+                :,
+                oy0 - right_bbox[1] : oy1 - right_bbox[1],
+                ox0 - right_bbox[0] : ox1 - right_bbox[0],
+                :,
+            ]
+            estimate = _estimate_overlap_shift(
+                left_patch,
+                right_patch,
+                max_shift_px=int(max_shift),
+                frame_indices=frame_indices,
+            )
+            pair_info = {
+                "tile_a": int(left_tile["tile_number"]),
+                "tile_b": int(right_tile["tile_number"]),
+                "overlap_bbox": [int(value) for value in overlap],
+                "overlap_size": [int(ox1 - ox0), int(oy1 - oy0)],
+                **estimate,
+            }
+            pairs.append(pair_info)
+            if estimate.get("status") == "ok":
+                shift = [int(value) for value in estimate.get("shift", [0, 0])]
+                adjacency[left_index].append((right_index, shift, len(pairs) - 1))
+                adjacency[right_index].append((left_index, [-shift[0], -shift[1]], len(pairs) - 1))
+
+    visited = {0}
+    queue = [0]
+    while queue:
+        current = queue.pop(0)
+        current_offset = offsets[current]
+        for neighbor, relative_shift, pair_index in adjacency.get(current, []):
+            proposed = [
+                max(-max_shift, min(max_shift, int(current_offset[0] + relative_shift[0]))),
+                max(-max_shift, min(max_shift, int(current_offset[1] + relative_shift[1]))),
+            ]
+            if neighbor in visited:
+                existing = offsets[neighbor]
+                if [int(existing[0]), int(existing[1])] != proposed:
+                    warning = (
+                        f"conflicting seam offset for tile {prepared_tiles[neighbor]['tile_number']}: "
+                        f"existing={existing}, proposed={proposed}, pair={pair_index}"
+                    )
+                    warnings.append(warning)
+                continue
+            offsets[neighbor] = proposed
+            visited.add(neighbor)
+            queue.append(neighbor)
+
+    for index in range(len(prepared_tiles)):
+        if index not in visited:
+            warnings.append(f"tile {prepared_tiles[index]['tile_number']} has no valid seam alignment path; kept at [0, 0]")
+
+    return {
+        "enabled": True,
+        "max_shift_px": int(max_shift),
+        "sampled_frames": [int(index) for index in frame_indices],
+        "tile_offsets": {
+            str(int(prepared_tiles[index]["tile_number"])): [int(value) for value in offsets[index]]
+            for index in range(len(prepared_tiles))
+        },
+        "pairs": pairs,
+        "warnings": warnings,
+    }
+
+
 class SCAIL2SegmentPlanner:
     @classmethod
     def INPUT_TYPES(cls):
@@ -6335,6 +6558,9 @@ class SCAIL2TileCompositeVideo:
                 "frame_mismatch_mode": (["trim_to_shortest", "error"], {"default": "trim_to_shortest"}),
                 "color_correction": ("BOOLEAN", {"default": False}),
                 "blend_mode": (["core_feather", "ttp_seam"], {"default": "core_feather"}),
+                "seam_alignment": ("BOOLEAN", {"default": False}),
+                "max_seam_shift_px": ("INT", {"default": 4, "min": 0, "max": 32, "step": 1}),
+                "seam_alignment_frames": ("INT", {"default": 9, "min": 1, "max": 33, "step": 1}),
             },
             "optional": optional,
         }
@@ -6361,6 +6587,9 @@ class SCAIL2TileCompositeVideo:
         frame_mismatch_mode: str = "trim_to_shortest",
         color_correction: bool = False,
         blend_mode: str = "core_feather",
+        seam_alignment: bool = False,
+        max_seam_shift_px: int = 4,
+        seam_alignment_frames: int = 9,
         base_video: Optional[torch.Tensor] = None,
         **kwargs,
     ):
@@ -6408,7 +6637,7 @@ class SCAIL2TileCompositeVideo:
                 mode="bilinear",
             )[:, :, :, :3].contiguous()
 
-        paste_events: list[dict[str, Any]] = []
+        prepared_tiles: list[dict[str, Any]] = []
         for tile, video in zip(tiles, tile_videos):
             crop_bbox = [int(value) for value in tile["target_crop_bbox"]]
             core_bbox = [int(value) for value in tile["target_core_bbox"]]
@@ -6422,6 +6651,52 @@ class SCAIL2TileCompositeVideo:
                 fit_mode=normalized_tile_fit_mode,
                 mode="bilinear",
             )
+            prepared_tiles.append(
+                {
+                    "tile": tile,
+                    "video": video,
+                    "tile_number": int(tile.get("tile_number", len(prepared_tiles) + 1)),
+                    "target_crop_bbox": [int(x0), int(y0), int(x1), int(y1)],
+                    "target_core_bbox": core_bbox,
+                    "fitted": fitted,
+                }
+            )
+
+        normalized_max_seam_shift_px = max(0, min(32, int(max_seam_shift_px)))
+        normalized_seam_alignment_frames = max(1, min(33, int(seam_alignment_frames)))
+        seam_alignment_summary = {
+            "enabled": False,
+            "max_shift_px": int(normalized_max_seam_shift_px),
+            "sampled_frames": [],
+            "tile_offsets": {str(int(item["tile_number"])): [0, 0] for item in prepared_tiles},
+            "pairs": [],
+            "warnings": [],
+        }
+        if bool(seam_alignment) and normalized_max_seam_shift_px > 0:
+            seam_alignment_summary = _estimate_tile_seam_offsets(
+                prepared_tiles,
+                int(frame_count),
+                int(normalized_max_seam_shift_px),
+                int(normalized_seam_alignment_frames),
+            )
+
+        paste_events: list[dict[str, Any]] = []
+        for prepared in prepared_tiles:
+            tile = prepared["tile"]
+            video = prepared["video"]
+            core_bbox = prepared["target_core_bbox"]
+            x0, y0, x1, y1 = prepared["target_crop_bbox"]
+            crop_w = max(1, x1 - x0)
+            crop_h = max(1, y1 - y0)
+            fitted = prepared["fitted"]
+            tile_number = int(prepared["tile_number"])
+            offset_xy = [0, 0]
+            if bool(seam_alignment_summary.get("enabled")):
+                offset_xy = [
+                    int(value)
+                    for value in seam_alignment_summary.get("tile_offsets", {}).get(str(tile_number), [0, 0])
+                ]
+                fitted = _shift_image_batch_integer(fitted, int(offset_xy[0]), int(offset_xy[1]))
             mask = _tile_weight_mask(
                 crop_h,
                 crop_w,
@@ -6438,7 +6713,7 @@ class SCAIL2TileCompositeVideo:
             weights[:, y0:y1, x0:x1, :] += mask
             paste_events.append(
                 {
-                    "tile_number": int(tile.get("tile_number", len(paste_events) + 1)),
+                    "tile_number": int(tile_number),
                     "target_crop_bbox": [int(x0), int(y0), int(x1), int(y1)],
                     "target_core_bbox": core_bbox,
                     "local_core_bbox_in_crop": [
@@ -6455,6 +6730,7 @@ class SCAIL2TileCompositeVideo:
                     "tile_to_target_scale": tile.get("tile_to_target_scale"),
                     "actual_tile_to_target_scale": tile.get("actual_tile_to_target_scale"),
                     "blend_mode": normalized_blend_mode,
+                    "seam_alignment_offset_xy": [int(value) for value in offset_xy],
                     "input_shape": _shape(video),
                     "fitted_shape": _shape(fitted),
                 }
@@ -6478,6 +6754,7 @@ class SCAIL2TileCompositeVideo:
             "tile_weight_mode": normalized_blend_mode,
             "tile_fit_mode": normalized_tile_fit_mode,
             "color_correction": bool(color_correction and base_target is not None),
+            "seam_alignment": seam_alignment_summary,
             "paste_events": paste_events,
             "recommended_face_detail_next_step": (
                 "Connect frames to SCAIL-2 Head Track Crop, run a face-detail SCAIL pass on the crop, "
@@ -6856,6 +7133,9 @@ def _run_tiled_long_video(
     composite_color_correction: bool,
     tile_seed_mode: str,
     free_tail_window: int,
+    seam_alignment: bool,
+    max_seam_shift_px: int,
+    seam_alignment_frames: int,
     pose_video_mask: Optional[torch.Tensor],
     sam_options: Optional[dict[str, Any]],
     prompt=None,
@@ -7051,6 +7331,9 @@ def _run_tiled_long_video(
         str(frame_mismatch_mode),
         bool(composite_color_correction),
         str(composite_blend_mode),
+        bool(seam_alignment),
+        int(max_seam_shift_px),
+        int(seam_alignment_frames),
         base_video=pose_video if bool(composite_color_correction) else None,
         **composite_kwargs,
     )
@@ -7067,6 +7350,11 @@ def _run_tiled_long_video(
         "free_tail_window": int(free_tail_window),
         "max_tile_pixels": int(max_tile_pixels),
         "composite_blend_mode": str(composite_blend_mode),
+        "seam_alignment": {
+            "enabled": bool(seam_alignment),
+            "max_seam_shift_px": int(max_seam_shift_px),
+            "seam_alignment_frames": int(seam_alignment_frames),
+        },
         "internal_sam": internal_sam_summary,
         "preflight_warnings": preflight_warnings,
         "actual_tile_output_warnings": actual_manifest.get("actual_tile_output_warnings", []),
@@ -7125,6 +7413,9 @@ class SCAIL2TiledLongVideo:
                 "tile_seed_mode": (["offset_by_tile", "same_seed"], {"default": "offset_by_tile"}),
                 "cache_mode": (["disk", "off"], {"default": "disk"}),
                 "composite_blend_mode": (["core_feather", "ttp_seam"], {"default": "core_feather"}),
+                "seam_alignment": ("BOOLEAN", {"default": False}),
+                "max_seam_shift_px": ("INT", {"default": 4, "min": 0, "max": 32, "step": 1}),
+                "seam_alignment_frames": ("INT", {"default": 9, "min": 1, "max": 33, "step": 1}),
                 "free_tail_window": _free_tail_window_input_spec(),
             },
             "optional": optional,
@@ -7176,6 +7467,9 @@ class SCAIL2TiledLongVideo:
         tile_seed_mode: str = "offset_by_tile",
         cache_mode: str = "disk",
         composite_blend_mode: str = "core_feather",
+        seam_alignment: bool = False,
+        max_seam_shift_px: int = 4,
+        seam_alignment_frames: int = 9,
         free_tail_window: int = 0,
         pose_video_mask: Optional[torch.Tensor] = None,
         prompt=None,
@@ -7216,6 +7510,9 @@ class SCAIL2TiledLongVideo:
             composite_color_correction=bool(composite_color_correction),
             tile_seed_mode=str(tile_seed_mode),
             free_tail_window=int(free_tail_window),
+            seam_alignment=bool(seam_alignment),
+            max_seam_shift_px=int(max_seam_shift_px),
+            seam_alignment_frames=int(seam_alignment_frames),
             pose_video_mask=pose_video_mask,
             sam_options=None,
             prompt=prompt,
@@ -7284,6 +7581,9 @@ class SCAIL2TiledLongVideoWithSAM:
                 "tile_seed_mode": (["offset_by_tile", "same_seed"], {"default": "offset_by_tile"}),
                 "cache_mode": (["disk", "off"], {"default": "disk"}),
                 "composite_blend_mode": (["core_feather", "ttp_seam"], {"default": "core_feather"}),
+                "seam_alignment": ("BOOLEAN", {"default": False}),
+                "max_seam_shift_px": ("INT", {"default": 4, "min": 0, "max": 32, "step": 1}),
+                "seam_alignment_frames": ("INT", {"default": 9, "min": 1, "max": 33, "step": 1}),
                 "free_tail_window": _free_tail_window_input_spec(),
             },
             "optional": optional,
@@ -7341,6 +7641,9 @@ class SCAIL2TiledLongVideoWithSAM:
         tile_seed_mode: str = "offset_by_tile",
         cache_mode: str = "disk",
         composite_blend_mode: str = "core_feather",
+        seam_alignment: bool = False,
+        max_seam_shift_px: int = 4,
+        seam_alignment_frames: int = 9,
         free_tail_window: int = 0,
         sam_model=None,
         sam_conditioning=None,
@@ -7382,6 +7685,9 @@ class SCAIL2TiledLongVideoWithSAM:
             composite_color_correction=bool(composite_color_correction),
             tile_seed_mode=str(tile_seed_mode),
             free_tail_window=int(free_tail_window),
+            seam_alignment=bool(seam_alignment),
+            max_seam_shift_px=int(max_seam_shift_px),
+            seam_alignment_frames=int(seam_alignment_frames),
             pose_video_mask=None,
             sam_options={
                 "sam_model": sam_model,

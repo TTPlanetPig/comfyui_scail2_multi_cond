@@ -354,7 +354,12 @@ context, while only the core edge is softly blended into neighboring tiles.
 The default `blend_mode=core_feather` is conservative. `blend_mode=ttp_seam`
 uses a narrower TTP-style seam transition so fewer pixels average two
 independently generated tiles; try it when overlap ghosting is more visible than
-hard seam risk. Keep `tile_fit_mode` at `stretch` for the default extractor output. If tile videos differ in length,
+hard seam risk. Enable `seam_alignment` when independently generated tiles have
+small whole-tile drift at the overlap. It samples frames across the timeline,
+estimates one stable integer-pixel offset per tile from the overlap bands, and
+applies that offset before blending. `max_seam_shift_px` caps the correction;
+start with `4` and raise only when the seam is visibly displaced. Keep
+`tile_fit_mode` at `stretch` for the default extractor output. If tile videos differ in length,
 `trim_to_shortest` drops only trailing mismatched frames; use `error` when
 debugging workflow alignment.
 

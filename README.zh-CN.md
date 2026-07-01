@@ -287,6 +287,10 @@ tile 的 `tile_align` 会被规范到 32 像素步进，`tile_generate_size` 必
 默认 `composite_blend_mode=core_feather`。如果接缝重影比硬边更明显，可以测试
 `composite_blend_mode=ttp_seam`；它参考 TTP 图像拼接，把混合压到更窄的接缝带，
 减少两块独立生成画面被大面积平均的像素数量。
+如果两块独立生成后在 overlap 上出现整体轻微漂移，可以开启 `seam_alignment`。
+它会从时间线上抽样多帧，只分析相邻 tile 的重叠带，估计每块 tile 一个稳定的整数像素偏移，
+再在拼合前应用。`max_seam_shift_px` 控制允许的最大修正，建议先用默认 `4`，
+只有接缝明显错位时再调高。
 
 如果你想单独调试每一块，再使用 `SCAIL-2 Tile Extractor` 手动导出每块视频，
 分别生成后接 `SCAIL-2 Tile Repaint Collector` 和 `SCAIL-2 Tile Composite Video`。
