@@ -357,8 +357,12 @@ independently generated tiles; try it when overlap ghosting is more visible than
 hard seam risk. Enable `seam_alignment` when independently generated tiles have
 small whole-tile drift at the overlap. It samples frames across the timeline,
 estimates one stable integer-pixel offset per tile from the overlap bands, and
-applies that offset before blending. `max_seam_shift_px` caps the correction;
-start with `4` and raise only when the seam is visibly displaced. Keep
+applies that offset before blending. The default
+`seam_alignment_apply_mode=shifted_canvas_crop` moves tile paste boxes on an
+expanded canvas and then crops the covered original viewport without resizing;
+the output may be a few pixels smaller than `tile_manifest.target_size`.
+`max_seam_shift_px` caps the correction; start with `4` and raise only when the
+seam is visibly displaced. Keep
 `tile_fit_mode` at `stretch` for the default extractor output. If tile videos differ in length,
 `trim_to_shortest` drops only trailing mismatched frames; use `error` when
 debugging workflow alignment.

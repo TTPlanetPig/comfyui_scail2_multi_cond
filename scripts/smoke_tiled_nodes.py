@@ -77,12 +77,25 @@ def main() -> None:
     tiled_sam_required = nodes.SCAIL2TiledLongVideoWithSAM.INPUT_TYPES()["required"]
     assert_true("blend_mode" in composite_required, "tile composite should expose blend_mode")
     assert_true("seam_alignment" in composite_required, "tile composite should expose seam_alignment")
+    assert_true(
+        composite_required["seam_alignment_apply_mode"][1]["default"] == "shifted_canvas_crop",
+        "seam alignment should default to shifted-canvas crop",
+    )
     assert_true(composite_required["max_seam_shift_px"][1]["default"] == 4, "unexpected max_seam_shift_px default")
     assert_true(composite_required["seam_alignment_frames"][1]["default"] == 9, "unexpected seam_alignment_frames default")
     assert_true("composite_blend_mode" in tiled_required, "tiled long video should expose composite_blend_mode")
     assert_true("seam_alignment" in tiled_required, "tiled long video should expose seam_alignment")
+    assert_true("seam_alignment_apply_mode" in tiled_required, "tiled long video should expose seam_alignment_apply_mode")
     assert_true("seam_alignment" in tiled_sam_required, "internal SAM tiled long video should expose seam_alignment")
-    assert_true(list(composite_required)[-3:] == ["seam_alignment", "max_seam_shift_px", "seam_alignment_frames"], "tile composite seam widgets should append last")
+    assert_true(
+        "seam_alignment_apply_mode" in tiled_sam_required,
+        "internal SAM tiled long video should expose seam_alignment_apply_mode",
+    )
+    assert_true(
+        list(composite_required)[-4:]
+        == ["seam_alignment", "seam_alignment_apply_mode", "max_seam_shift_px", "seam_alignment_frames"],
+        "tile composite seam widgets should append last",
+    )
     assert_true(list(tiled_required)[-1] == "free_tail_window", "free_tail_window should stay last in tiled widgets")
     assert_true(
         list(tiled_required).index("composite_blend_mode") < list(tiled_required).index("free_tail_window"),
@@ -365,8 +378,11 @@ def main() -> None:
     composite_source = inspect.getsource(nodes.SCAIL2TileCompositeVideo.composite)
     assert_true("_estimate_tile_seam_offsets" in composite_source, "tile composite should run temporal seam alignment")
     assert_true("_shift_image_batch_integer" in composite_source, "tile composite should apply seam offsets before paste")
+    assert_true("_covered_viewport_crop_bbox" in composite_source, "shifted seam alignment should crop the covered viewport")
+    assert_true("shifted_canvas_crop" in composite_source, "tile composite should support shifted-canvas crop mode")
     orchestrator_source = inspect.getsource(nodes._run_tiled_long_video)
     assert_true("seam_alignment" in orchestrator_source, "tiled orchestrator should pass seam alignment options")
+    assert_true("seam_alignment_apply_mode" in orchestrator_source, "tiled orchestrator should pass seam apply mode")
 
     print("smoke_tiled_nodes: ok")
 
