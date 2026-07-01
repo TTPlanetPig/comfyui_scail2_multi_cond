@@ -43,6 +43,14 @@ def main() -> None:
         ndim = 4
         shape = (4, 960, 548, 3)
 
+    class FakeSourceVideo(sys.modules["torch"].Tensor):
+        ndim = 4
+        shape = (4, 1280, 704, 3)
+
+    class FakePackedReference(sys.modules["torch"].Tensor):
+        ndim = 4
+        shape = (1, 1920, 1056, 3)
+
     class FakeDoubleImage(sys.modules["torch"].Tensor):
         ndim = 4
         shape = (1, 1920, 1096, 3)
@@ -56,10 +64,16 @@ def main() -> None:
         "SCAIL2TiledLongVideoWithSAM" in nodes.NODE_CLASS_MAPPINGS,
         "missing tiled long video internal SAM node",
     )
+    assert_true("SCAIL2PlanReferencePackBuilder" in nodes.NODE_CLASS_MAPPINGS, "missing reference pack builder node")
     assert_true(
         nodes.NODE_DISPLAY_NAME_MAPPINGS["SCAIL2TiledLongVideoWithSAM"]
         == "SCAIL-2 Tiled Long Video (Internal SAM)",
         "unexpected display name",
+    )
+    assert_true(
+        nodes.SCAIL2PlanReferencePackBuilder.RETURN_NAMES
+        == ("reference_pack_images", "reference_pack_manifest", "debug_preview", "summary"),
+        "unexpected reference pack return names",
     )
     assert_true(
         nodes.SCAIL2TiledLongVideo.RETURN_NAMES
@@ -69,9 +83,22 @@ def main() -> None:
 
     external_optional = nodes.SCAIL2TiledLongVideo.INPUT_TYPES()["optional"]
     internal_optional = nodes.SCAIL2TiledLongVideoWithSAM.INPUT_TYPES()["optional"]
+    scheduled_optional = nodes.SCAIL2ScheduledLongVideo.INPUT_TYPES()["optional"]
+    scheduled_sam_optional = nodes.SCAIL2ScheduledLongVideoWithSAM.INPUT_TYPES()["optional"]
+    assert_true("reference_pack_images" not in scheduled_optional, "scheduled node should not expose tiled reference packs")
+    assert_true("reference_pack_images" not in scheduled_sam_optional, "scheduled SAM node should not expose tiled reference packs")
     assert_true("reference_1_mask" in external_optional, "external tiled node should expose reference masks")
     assert_true("reference_1_mask" not in internal_optional, "internal SAM node should not expose reference masks")
+    assert_true("reference_pack_images" in external_optional, "external tiled node should expose reference pack images")
+    assert_true("reference_pack_manifest" in external_optional, "external tiled node should expose reference pack manifest")
+    assert_true("reference_pack_images" in internal_optional, "internal SAM tiled node should expose reference pack images")
+    assert_true("reference_pack_manifest" in internal_optional, "internal SAM tiled node should expose reference pack manifest")
     assert_true({"sam_model", "sam_conditioning"} <= set(internal_optional), "internal SAM inputs missing")
+    pack_required = nodes.SCAIL2PlanReferencePackBuilder.INPUT_TYPES()["required"]
+    pack_optional = nodes.SCAIL2PlanReferencePackBuilder.INPUT_TYPES()["optional"]
+    assert_true(pack_required["resize_mode"][0][-1] == "upscale_model", "reference pack should support upscale_model mode")
+    assert_true("upscale_model" in pack_optional, "reference pack should expose optional upscale_model")
+    assert_true("tile_manifest" in pack_optional, "reference pack should accept tile_manifest for exact target size")
     composite_required = nodes.SCAIL2TileCompositeVideo.INPUT_TYPES()["required"]
     tiled_required = nodes.SCAIL2TiledLongVideo.INPUT_TYPES()["required"]
     tiled_sam_required = nodes.SCAIL2TiledLongVideoWithSAM.INPUT_TYPES()["required"]
@@ -141,6 +168,48 @@ def main() -> None:
     assert_true(
         target_info["resolution_basis"] == "output_width_preserve_aspect",
         "single-width target should use width as aspect-preserving basis",
+    )
+    parsed_pack = nodes._parse_reference_pack_manifest(
+        '{"source_size":[704,1280],"target_size":[1056,1920],"references":[{"reference":2,"batch_index":0}]}'
+    )
+    assert_true(parsed_pack["references"][0]["reference"] == 2, "reference pack should preserve plan reference id")
+    geometry_manifest = {
+        "source_size": [704, 1280],
+        "target_size": [1056, 1920],
+        "tiles": [
+            {
+                "tile_number": 1,
+                "source_crop_bbox": [0, 0, 352, 640],
+                "target_crop_bbox": [0, 0, 528, 960],
+            },
+            {
+                "tile_number": 2,
+                "source_crop_bbox": [352, 640, 704, 1280],
+                "target_crop_bbox": [528, 960, 1056, 1920],
+            },
+        ],
+    }
+    pack_info = {
+        "enabled": True,
+        "source_size": [704, 1280],
+        "target_size": [1056, 1920],
+        "references": [{"reference": 1, "batch_index": 0}],
+    }
+    geometry = nodes._validate_reference_pack_geometry(
+        pack_info,
+        geometry_manifest,
+        {1: FakePackedReference()},
+        FakeSourceVideo(),
+    )
+    assert_true(geometry["reference_count"] == 1, "reference pack geometry should count checked references")
+    assert_true(len(geometry["checked_tile_crops"]) == 2, "reference pack geometry should check every tile")
+    bad_manifest = {
+        **geometry_manifest,
+        "tiles": [{**geometry_manifest["tiles"][0], "target_crop_bbox": [1, 0, 528, 960]}],
+    }
+    assert_raises(
+        "reference pack pixel geometry mismatch",
+        lambda: nodes._validate_reference_pack_geometry(pack_info, bad_manifest, {1: FakePackedReference()}, FakeSourceVideo()),
     )
     clipped_segments = nodes._parse_plan(
         '[{"frames": 100, "reference": 1, "prompt": "test", "negative": ""}]',
@@ -398,6 +467,8 @@ def main() -> None:
     assert_true("seam_alignment" in orchestrator_source, "tiled orchestrator should pass seam alignment options")
     assert_true("seam_alignment_apply_mode" in orchestrator_source, "tiled orchestrator should pass seam apply mode")
     assert_true("seam_alignment_device" in orchestrator_source, "tiled orchestrator should pass seam device")
+    assert_true("_validate_reference_pack_geometry" in orchestrator_source, "tiled orchestrator should verify reference pack pixel geometry")
+    assert_true("effective_reference_count" in orchestrator_source, "tiled orchestrator should expand reference_count for reference packs")
 
     print("smoke_tiled_nodes: ok")
 

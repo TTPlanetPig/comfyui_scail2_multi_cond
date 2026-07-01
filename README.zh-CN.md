@@ -282,6 +282,16 @@ tile 的 `tile_align` 会被规范到 32 像素步进，`tile_generate_size` 必
 `overlap_ratio` 只会作用在和其他 tile 真实相邻的边上；画框外不会补内容，
 中间有空隙的边也不会互相扩 overlap。每块会在 manifest 里记录
 `overlap_edges_px_source`，方便检查左右上下哪几条边参与了上下文扩展。
+
+如果不想手动连接多张 `reference_N`，可以使用
+`SCAIL-2 Plan Reference Pack Builder`。把第一阶段 `pose_video`、同一个
+`segment_plan`，以及最好同一个 `tile_manifest` 接进去；节点会按 plan 中实际用到的
+reference 编号抽关键帧，可选调用 ComfyUI 的 `UPSCALE_MODEL`，然后把每张参考图精确调整到
+`tile_manifest.target_size`。把输出的 `reference_pack_images` 和
+`reference_pack_manifest` 接到 `SCAIL-2 Tiled Long Video` 或 Internal SAM 版本即可。
+Tiled 节点会在生成前逐 tile 检查 pack 参考图的裁切 bbox 是否完全等于 manifest 中的
+`target_crop_bbox`，不一致会直接报错，避免隐藏的像素偏移进入生成链路。
+
 拼合时使用 core 优先的 feather：overlap 主要作为生成上下文，不会整段大面积参与最终平均，
 只有 core 边缘会柔和过渡到相邻 tile。
 默认 `composite_blend_mode=core_feather`。如果接缝重影比硬边更明显，可以测试

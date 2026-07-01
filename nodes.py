@@ -2946,6 +2946,276 @@ def _resolve_tile_target_size(
     }
 
 
+def _resolve_reference_pack_target_size(
+    pose_video: torch.Tensor,
+    tile_manifest: str,
+    output_width: int,
+    output_height: int,
+    scale_factor: float,
+) -> tuple[int, int, dict[str, Any]]:
+    if not isinstance(pose_video, torch.Tensor) or pose_video.ndim != 4:
+        raise ValueError("pose_video must be a ComfyUI IMAGE tensor.")
+    _frames, source_h, source_w, _channels = pose_video.shape
+    text = str(tile_manifest or "").strip()
+    if text:
+        manifest = _parse_tile_manifest(text)
+        target_w, target_h = [int(value) for value in manifest.get("target_size", [0, 0])]
+        if target_w <= 0 or target_h <= 0:
+            raise ValueError("tile_manifest target_size is invalid.")
+        manifest_source_w, manifest_source_h = [
+            int(value)
+            for value in manifest.get("source_size", [int(source_w), int(source_h)])
+        ]
+        if [manifest_source_w, manifest_source_h] != [int(source_w), int(source_h)]:
+            raise ValueError(
+                "reference pack pose_video must match tile_manifest source_size exactly. "
+                f"pose_video={source_w}x{source_h}, tile_manifest.source_size={manifest_source_w}x{manifest_source_h}."
+            )
+        resolved_scale_x, resolved_scale_y = _validate_uniform_tile_scale(
+            int(source_w),
+            int(source_h),
+            int(target_w),
+            int(target_h),
+        )
+        return int(target_w), int(target_h), {
+            "basis": "tile_manifest",
+            "source_size": [int(source_w), int(source_h)],
+            "target_size": [int(target_w), int(target_h)],
+            "resolved_scale": [float(resolved_scale_x), float(resolved_scale_y)],
+            "tile_manifest_target_size": [int(target_w), int(target_h)],
+        }
+    target_w, target_h, target_info = _resolve_tile_target_size(
+        int(source_w),
+        int(source_h),
+        int(output_width),
+        int(output_height),
+        float(scale_factor),
+    )
+    return int(target_w), int(target_h), {"basis": "output_size_or_scale_factor", **target_info}
+
+
+def _run_upscale_model_for_reference_pack(upscale_model: Any, image: torch.Tensor) -> torch.Tensor:
+    if upscale_model is None:
+        raise ValueError("resize_mode=upscale_model requires an upscale_model input.")
+    try:
+        import nodes as comfy_nodes
+
+        node_cls = comfy_nodes.NODE_CLASS_MAPPINGS.get("ImageUpscaleWithModel")
+        if node_cls is None:
+            from comfy_extras.nodes_upscale_model import ImageUpscaleWithModel
+
+            node_cls = ImageUpscaleWithModel
+        result = node_cls().upscale(upscale_model, image)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to run ComfyUI ImageUpscaleWithModel for reference pack: {exc}") from exc
+    upscaled = result[0] if isinstance(result, tuple) else result
+    if not isinstance(upscaled, torch.Tensor) or upscaled.ndim != 4:
+        raise RuntimeError("ImageUpscaleWithModel did not return a ComfyUI IMAGE tensor.")
+    return upscaled.detach().float().clamp(0, 1).contiguous()
+
+
+def _resize_reference_pack_frame(
+    image: torch.Tensor,
+    target_w: int,
+    target_h: int,
+    resize_mode: str,
+    post_upscale_resize_mode: str,
+    upscale_model: Any,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    normalized_mode = str(resize_mode or "bicubic").strip()
+    if normalized_mode not in {"bilinear", "bicubic", "nearest", "upscale_model"}:
+        normalized_mode = "bicubic"
+    normalized_post_mode = str(post_upscale_resize_mode or "bicubic").strip()
+    if normalized_post_mode not in {"bilinear", "bicubic", "nearest"}:
+        normalized_post_mode = "bicubic"
+    source_shape = _shape(image)
+    if normalized_mode == "upscale_model":
+        upscaled = _run_upscale_model_for_reference_pack(upscale_model, image)
+        method = "upscale_model"
+        intermediate_shape = _shape(upscaled)
+        fitted = _fit_image_to_size(
+            upscaled,
+            int(target_h),
+            int(target_w),
+            fit_mode="stretch",
+            mode=normalized_post_mode,
+        )
+        final_resize_mode = normalized_post_mode
+    else:
+        method = normalized_mode
+        intermediate_shape = source_shape
+        fitted = _fit_image_to_size(
+            image.detach().float().clamp(0, 1),
+            int(target_h),
+            int(target_w),
+            fit_mode="stretch",
+            mode=normalized_mode,
+        )
+        final_resize_mode = normalized_mode
+    if int(fitted.shape[1]) != int(target_h) or int(fitted.shape[2]) != int(target_w):
+        raise RuntimeError(
+            "reference pack resize produced the wrong canvas size: "
+            f"expected={target_w}x{target_h}, got={int(fitted.shape[2])}x{int(fitted.shape[1])}."
+        )
+    return fitted.detach().float().clamp(0, 1).contiguous(), {
+        "method": method,
+        "source_shape": source_shape,
+        "intermediate_shape": intermediate_shape,
+        "output_shape": _shape(fitted),
+        "final_resize_mode": final_resize_mode,
+        "pixel_contract": "full-canvas reference image exactly matches tile_manifest.target_size before tile cropping",
+    }
+
+
+def _parse_reference_pack_manifest(reference_pack_manifest: str) -> dict[str, Any]:
+    text = str(reference_pack_manifest or "").strip()
+    if not text:
+        raise ValueError("reference_pack_manifest is empty.")
+    try:
+        manifest = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"reference_pack_manifest must be valid JSON: {exc}") from exc
+    if not isinstance(manifest, dict):
+        raise ValueError("reference_pack_manifest must be a JSON object.")
+    references = manifest.get("references")
+    if not isinstance(references, list) or not references:
+        raise ValueError("reference_pack_manifest must contain a non-empty references array.")
+    seen: set[int] = set()
+    normalized: list[dict[str, Any]] = []
+    for index, item in enumerate(references):
+        if not isinstance(item, dict):
+            raise ValueError(f"reference_pack_manifest.references[{index}] must be an object.")
+        reference = int(item.get("reference", 0))
+        batch_index = int(item.get("batch_index", index))
+        if reference < 1 or reference > MAX_REFERENCES:
+            raise ValueError(f"reference_pack_manifest reference {reference} must be between 1 and {MAX_REFERENCES}.")
+        if reference in seen:
+            raise ValueError(f"reference_pack_manifest contains duplicate reference {reference}.")
+        if batch_index < 0:
+            raise ValueError(f"reference_pack_manifest reference {reference} has invalid batch_index {batch_index}.")
+        seen.add(reference)
+        normalized.append({**item, "reference": int(reference), "batch_index": int(batch_index)})
+    return {**manifest, "references": normalized}
+
+
+def _collect_reference_pack_inputs(kwargs: dict[str, Any]) -> tuple[dict[int, torch.Tensor], dict[str, Any]]:
+    images = kwargs.get("reference_pack_images")
+    manifest_text = kwargs.get("reference_pack_manifest")
+    if images is None and not str(manifest_text or "").strip():
+        return {}, {"enabled": False}
+    if images is None or not isinstance(images, torch.Tensor) or images.ndim != 4:
+        raise ValueError("reference_pack_images must be connected with reference_pack_manifest.")
+    manifest = _parse_reference_pack_manifest(str(manifest_text or ""))
+    references: dict[int, torch.Tensor] = {}
+    collected: list[dict[str, Any]] = []
+    for item in manifest["references"]:
+        reference = int(item["reference"])
+        batch_index = int(item["batch_index"])
+        if batch_index >= int(images.shape[0]):
+            raise ValueError(
+                f"reference_pack_manifest reference {reference} points to batch_index {batch_index}, "
+                f"but reference_pack_images has only {int(images.shape[0])} image(s)."
+            )
+        reference_image = images[batch_index : batch_index + 1].detach().contiguous()
+        references[reference] = reference_image
+        collected.append(
+            {
+                "reference": int(reference),
+                "batch_index": int(batch_index),
+                "shape": _shape(reference_image),
+                "source": "reference_pack",
+            }
+        )
+    return references, {
+        "enabled": True,
+        "image_shape": _shape(images),
+        "source_size": manifest.get("source_size"),
+        "target_size": manifest.get("target_size"),
+        "references": collected,
+        "manifest": manifest,
+    }
+
+
+def _validate_reference_pack_geometry(
+    reference_pack_info: dict[str, Any],
+    tile_manifest: dict[str, Any],
+    references: dict[int, torch.Tensor],
+    pose_video: torch.Tensor,
+) -> dict[str, Any]:
+    if not bool(reference_pack_info.get("enabled")):
+        return {"enabled": False}
+    target_w, target_h = [int(value) for value in tile_manifest.get("target_size", [0, 0])]
+    source_w, source_h = [int(value) for value in tile_manifest.get("source_size", [int(pose_video.shape[2]), int(pose_video.shape[1])])]
+    if [source_w, source_h] != [int(pose_video.shape[2]), int(pose_video.shape[1])]:
+        raise ValueError(
+            "reference pack geometry check requires pose_video size to match tile_manifest.source_size. "
+            f"pose_video={int(pose_video.shape[2])}x{int(pose_video.shape[1])}, "
+            f"tile_manifest.source_size={source_w}x{source_h}."
+        )
+    pack_target = reference_pack_info.get("target_size")
+    if isinstance(pack_target, list) and [int(pack_target[0]), int(pack_target[1])] != [target_w, target_h]:
+        raise ValueError(
+            "reference_pack_manifest target_size does not match tile_manifest.target_size: "
+            f"pack={pack_target}, tile_manifest={[target_w, target_h]}."
+        )
+    pack_source = reference_pack_info.get("source_size")
+    if isinstance(pack_source, list) and [int(pack_source[0]), int(pack_source[1])] != [source_w, source_h]:
+        raise ValueError(
+            "reference_pack_manifest source_size does not match tile_manifest.source_size: "
+            f"pack={pack_source}, tile_manifest={[source_w, source_h]}."
+        )
+    checked_tiles: list[dict[str, Any]] = []
+    pack_refs = [int(item["reference"]) for item in reference_pack_info.get("references", [])]
+    for reference in pack_refs:
+        image = references.get(reference)
+        if image is None:
+            raise ValueError(f"reference pack reference {reference} was not collected.")
+        if int(image.shape[2]) != target_w or int(image.shape[1]) != target_h:
+            raise ValueError(
+                f"reference pack reference {reference} canvas must match tile_manifest.target_size exactly: "
+                f"expected={target_w}x{target_h}, got={int(image.shape[2])}x{int(image.shape[1])}."
+            )
+        for tile in tile_manifest.get("tiles", []):
+            source_bbox = [int(value) for value in tile["source_crop_bbox"]]
+            expected_bbox = [int(value) for value in tile["target_crop_bbox"]]
+            actual_bbox = _tile_tensor_crop_bbox(source_bbox, [int(source_w), int(source_h)], image)
+            if actual_bbox != expected_bbox:
+                raise ValueError(
+                    "reference pack pixel geometry mismatch: reference crop bbox does not equal tile target_crop_bbox. "
+                    f"reference={reference}, tile={tile.get('tile_number')}, actual={actual_bbox}, expected={expected_bbox}. "
+                    "Rebuild the reference pack from the same tile_manifest used by the tiled long video node."
+                )
+            checked_tiles.append(
+                {
+                    "reference": int(reference),
+                    "tile_number": int(tile.get("tile_number", len(checked_tiles) + 1)),
+                    "source_crop_bbox": source_bbox,
+                    "reference_crop_bbox": actual_bbox,
+                    "target_crop_bbox": expected_bbox,
+                    "match": True,
+                }
+            )
+    return {
+        "enabled": True,
+        "source_size": [int(source_w), int(source_h)],
+        "target_size": [int(target_w), int(target_h)],
+        "reference_count": int(len(pack_refs)),
+        "checked_tile_crops": checked_tiles,
+        "pixel_contract": "reference pack full-canvas crops exactly match tile target_crop_bbox for every packed reference and tile",
+    }
+
+
+def _effective_tiled_reference_count(
+    requested_reference_count: int,
+    segments: list[dict[str, Any]],
+    references: dict[int, torch.Tensor],
+) -> int:
+    candidates = [1, int(requested_reference_count)]
+    candidates.extend(int(segment["reference"]) for segment in segments)
+    candidates.extend(int(index) for index in references.keys())
+    return max(1, min(MAX_REFERENCES, max(candidates)))
+
+
 def _intervals_overlap(a0: int, a1: int, b0: int, b1: int) -> bool:
     return min(int(a1), int(b1)) > max(int(a0), int(b0))
 
@@ -6493,6 +6763,163 @@ class SCAIL2ManualTilePlanBuilder:
         }
 
 
+class SCAIL2PlanReferencePackBuilder:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pose_video": ("IMAGE",),
+                "segment_plan": ("STRING", {"default": DEFAULT_PLAN, "multiline": True}),
+                "output_width": ("INT", {"default": 0, "min": 0, "max": 8192, "step": 1}),
+                "output_height": ("INT", {"default": 0, "min": 0, "max": 8192, "step": 1}),
+                "scale_factor": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 8.0, "step": 0.05}),
+                "max_frames": ("INT", {"default": 0, "min": 0, "max": 100000, "step": 1}),
+                "reference_frame_mode": (["segment_start", "segment_middle", "segment_end"], {"default": "segment_start"}),
+                "resize_mode": (["bicubic", "bilinear", "nearest", "upscale_model"], {"default": "bicubic"}),
+                "post_upscale_resize_mode": (["bicubic", "bilinear", "nearest"], {"default": "bicubic"}),
+            },
+            "optional": {
+                "tile_manifest": ("STRING", {"default": "", "multiline": True, "forceInput": True}),
+                "upscale_model": ("UPSCALE_MODEL",),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING", "IMAGE", "STRING")
+    RETURN_NAMES = ("reference_pack_images", "reference_pack_manifest", "debug_preview", "summary")
+    FUNCTION = "build"
+    CATEGORY = f"{CATEGORY}/Tile Upscale"
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        fingerprint_inputs: dict[str, Any] = {}
+        for key in sorted(kwargs):
+            value = kwargs[key]
+            fingerprint_inputs[key] = value if isinstance(value, (str, int, float, bool)) or value is None else type(value).__name__
+        return _stable_fingerprint(fingerprint_inputs)
+
+    def build(
+        self,
+        pose_video: torch.Tensor,
+        segment_plan: str,
+        output_width: int = 0,
+        output_height: int = 0,
+        scale_factor: float = 2.0,
+        max_frames: int = 0,
+        reference_frame_mode: str = "segment_start",
+        resize_mode: str = "bicubic",
+        post_upscale_resize_mode: str = "bicubic",
+        tile_manifest: str = "",
+        upscale_model: Any = None,
+    ):
+        if not isinstance(pose_video, torch.Tensor) or pose_video.ndim != 4:
+            raise ValueError("pose_video must be a ComfyUI IMAGE tensor.")
+        frame_count = int(pose_video.shape[0])
+        if frame_count <= 0:
+            raise ValueError("pose_video contains no frames.")
+        _frames, source_h, source_w, _channels = pose_video.shape
+        target_w, target_h, target_info = _resolve_reference_pack_target_size(
+            pose_video,
+            str(tile_manifest or ""),
+            int(output_width),
+            int(output_height),
+            float(scale_factor),
+        )
+        segments = _parse_plan(segment_plan, pose_frame_count=frame_count, max_frames=max_frames)
+        normalized_frame_mode = str(reference_frame_mode or "segment_start").strip()
+        if normalized_frame_mode not in {"segment_start", "segment_middle", "segment_end"}:
+            normalized_frame_mode = "segment_start"
+
+        first_segment_by_reference: dict[int, dict[str, Any]] = {}
+        for segment in segments:
+            reference = int(segment["reference"])
+            if reference not in first_segment_by_reference:
+                first_segment_by_reference[reference] = segment
+        selected_references = sorted(first_segment_by_reference)
+        if not selected_references:
+            raise ValueError("segment_plan produced no references.")
+
+        images: list[torch.Tensor] = []
+        entries: list[dict[str, Any]] = []
+        for batch_index, reference in enumerate(selected_references):
+            segment = first_segment_by_reference[int(reference)]
+            start = int(segment["start"])
+            end = int(segment["end"])
+            if normalized_frame_mode == "segment_end":
+                frame_index = end - 1
+            elif normalized_frame_mode == "segment_middle":
+                frame_index = (start + end - 1) // 2
+            else:
+                frame_index = start
+            frame_index = max(0, min(frame_count - 1, int(frame_index)))
+            source_frame = pose_video[frame_index : frame_index + 1].detach().cpu().float().clamp(0, 1).contiguous()
+            reference_image, resize_info = _resize_reference_pack_frame(
+                source_frame,
+                int(target_w),
+                int(target_h),
+                str(resize_mode),
+                str(post_upscale_resize_mode),
+                upscale_model,
+            )
+            images.append(reference_image)
+            entries.append(
+                {
+                    "reference": int(reference),
+                    "batch_index": int(batch_index),
+                    "segment_index": int(segment["index"]),
+                    "segment_start": int(start),
+                    "segment_end": int(end),
+                    "source_frame": int(frame_index),
+                    "source_frame_1_based": int(frame_index + 1),
+                    "frame_mode": normalized_frame_mode,
+                    "target_size": [int(target_w), int(target_h)],
+                    "resize": resize_info,
+                }
+            )
+
+        pack_images = torch.cat(images, dim=0).contiguous().clamp(0, 1)
+        if int(pack_images.shape[1]) != int(target_h) or int(pack_images.shape[2]) != int(target_w):
+            raise RuntimeError(
+                "reference pack batch produced inconsistent image size: "
+                f"expected={target_w}x{target_h}, got={int(pack_images.shape[2])}x{int(pack_images.shape[1])}."
+            )
+        manifest = {
+            "version": 1,
+            "type": "scail2_reference_pack",
+            "source": "pose_video_plan_keyframes",
+            "source_shape": _shape(pose_video),
+            "source_size": [int(source_w), int(source_h)],
+            "target_size": [int(target_w), int(target_h)],
+            "target_size_resolution": target_info,
+            "segment_plan": segment_plan,
+            "segments": segments,
+            "references": entries,
+            "reference_count": int(len(entries)),
+            "reference_frame_mode": normalized_frame_mode,
+            "resize_mode": str(resize_mode),
+            "post_upscale_resize_mode": str(post_upscale_resize_mode),
+            "pixel_contract": (
+                "Every packed reference is a full-canvas image exactly matching tile_manifest.target_size. "
+                "Tiled Long Video verifies each packed reference crop bbox against tile target_crop_bbox before generation."
+            ),
+        }
+        summary = {
+            "node": "SCAIL2PlanReferencePackBuilder",
+            "output_shape": _shape(pack_images),
+            "reference_count": int(len(entries)),
+            "source_size": [int(source_w), int(source_h)],
+            "target_size": [int(target_w), int(target_h)],
+            "target_size_resolution": target_info,
+            "references": entries,
+            "connect_to": "Connect reference_pack_images and reference_pack_manifest to SCAIL-2 Tiled Long Video or its Internal SAM variant.",
+        }
+        return (
+            pack_images,
+            json.dumps(manifest, indent=2),
+            pack_images.detach().cpu().contiguous(),
+            json.dumps(summary, indent=2),
+        )
+
+
 class SCAIL2TileExtractor:
     @classmethod
     def INPUT_TYPES(cls):
@@ -7175,9 +7602,9 @@ def _collect_reference_inputs(
     reference_count: int,
     *,
     include_masks: bool,
-) -> tuple[dict[int, torch.Tensor], dict[int, torch.Tensor]]:
+) -> tuple[dict[int, torch.Tensor], dict[int, torch.Tensor], dict[str, Any]]:
     active_reference_count = max(1, min(MAX_REFERENCES, int(reference_count)))
-    references: dict[int, torch.Tensor] = {}
+    references, reference_pack_info = _collect_reference_pack_inputs(kwargs)
     reference_masks: dict[int, torch.Tensor] = {}
     for index in range(1, active_reference_count + 1):
         reference = kwargs.get(f"reference_{index}")
@@ -7189,7 +7616,16 @@ def _collect_reference_inputs(
                 if not isinstance(reference_mask, torch.Tensor) or reference_mask.ndim != 4:
                     raise ValueError(f"reference_{index}_mask must be a ComfyUI IMAGE tensor.")
                 reference_masks[index] = reference_mask[:1].detach().contiguous()
-    return references, reference_masks
+    if bool(reference_pack_info.get("enabled")):
+        reference_pack_info = {
+            **reference_pack_info,
+            "manual_reference_override_indices": [
+                int(index)
+                for index in range(1, active_reference_count + 1)
+                if kwargs.get(f"reference_{index}") is not None
+            ],
+        }
+    return references, reference_masks, reference_pack_info
 
 
 def _validate_tiled_reference_inputs(
@@ -7499,17 +7935,24 @@ def _run_tiled_long_video(
     send_status("planning_tiles", f"Planning {len(manifest.get('tiles', []))} tile(s)")
     segments = _parse_plan(segment_plan, pose_frame_count=int(pose_video.shape[0]), max_frames=max_frames)
     send_status("collecting_references", "Collecting tiled references and masks")
-    references, reference_masks = _collect_reference_inputs(
+    references, reference_masks, reference_pack_info = _collect_reference_inputs(
         kwargs,
         int(reference_count),
         include_masks=not bool(use_internal_sam),
+    )
+    effective_reference_count = _effective_tiled_reference_count(int(reference_count), segments, references)
+    reference_pack_geometry = _validate_reference_pack_geometry(
+        reference_pack_info,
+        manifest,
+        references,
+        pose_video,
     )
     sam_options = dict(sam_options or {})
     used_refs = _validate_tiled_reference_inputs(
         segments,
         references,
         reference_masks,
-        int(reference_count),
+        int(effective_reference_count),
         str(mode),
         pose_video_mask=pose_video_mask,
         use_internal_sam=bool(use_internal_sam),
@@ -7568,7 +8011,7 @@ def _run_tiled_long_video(
                 reference_masks,
                 manifest,
                 tile,
-                int(reference_count),
+                int(effective_reference_count),
                 str(image_resize_mode),
                 str(mask_resize_mode),
                 include_masks=include_masks,
@@ -7596,7 +8039,7 @@ def _run_tiled_long_video(
                 max_frames,
                 max_chunk_frames,
                 overlap_frames,
-                reference_count,
+                effective_reference_count,
                 color_correction,
                 cache_mode=str(cache_mode),
                 free_tail_window=int(free_tail_window),
@@ -7678,6 +8121,12 @@ def _run_tiled_long_video(
         "mode": str(mode),
         "segment_plan": segment_plan,
         "used_refs": used_refs,
+        "requested_reference_count": int(reference_count),
+        "effective_reference_count": int(effective_reference_count),
+        "reference_pack": {
+            **reference_pack_info,
+            "geometry_check": reference_pack_geometry,
+        },
         "tile_seed_mode": str(tile_seed_mode),
         "seed_start": int(seed),
         "free_tail_window": int(free_tail_window),
@@ -7711,6 +8160,8 @@ class SCAIL2TiledLongVideo:
     def INPUT_TYPES(cls):
         optional = {
             "pose_video_mask": ("IMAGE",),
+            "reference_pack_images": ("IMAGE",),
+            "reference_pack_manifest": ("STRING", {"default": "", "multiline": True, "forceInput": True}),
         }
         for index in range(1, MAX_REFERENCES + 1):
             optional[f"reference_{index}"] = ("IMAGE",)
@@ -7868,6 +8319,8 @@ class SCAIL2TiledLongVideoWithSAM:
         optional = {
             "sam_model": ("MODEL",),
             "sam_conditioning": ("CONDITIONING",),
+            "reference_pack_images": ("IMAGE",),
+            "reference_pack_manifest": ("STRING", {"default": "", "multiline": True, "forceInput": True}),
         }
         for index in range(1, MAX_REFERENCES + 1):
             optional[f"reference_{index}"] = ("IMAGE",)
@@ -8124,6 +8577,7 @@ NODE_CLASS_MAPPINGS = {
     "SCAIL2FaceCompositeBack": SCAIL2FaceCompositeBack,
     "SCAIL2TilePlanBuilder": SCAIL2TilePlanBuilder,
     "SCAIL2ManualTilePlanBuilder": SCAIL2ManualTilePlanBuilder,
+    "SCAIL2PlanReferencePackBuilder": SCAIL2PlanReferencePackBuilder,
     "SCAIL2TileExtractor": SCAIL2TileExtractor,
     "SCAIL2TileRepaintCollector": SCAIL2TileRepaintCollector,
     "SCAIL2TileCompositeVideo": SCAIL2TileCompositeVideo,
@@ -8144,6 +8598,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SCAIL2FaceCompositeBack": "SCAIL-2 Face Composite Back",
     "SCAIL2TilePlanBuilder": "SCAIL-2 Tile Plan Builder",
     "SCAIL2ManualTilePlanBuilder": "SCAIL-2 Manual Tile Plan Builder",
+    "SCAIL2PlanReferencePackBuilder": "SCAIL-2 Plan Reference Pack Builder",
     "SCAIL2TileExtractor": "SCAIL-2 Tile Extractor",
     "SCAIL2TileRepaintCollector": "SCAIL-2 Tile Repaint Collector",
     "SCAIL2TileCompositeVideo": "SCAIL-2 Tile Composite Video",

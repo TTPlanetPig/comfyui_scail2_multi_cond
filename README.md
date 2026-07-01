@@ -331,6 +331,17 @@ These standalone nodes remain useful for debugging or manually replacing a
 single tile pass; the tiled long-video nodes perform the same collection and
 composite steps internally for normal production workflows.
 
+`SCAIL-2 Plan Reference Pack Builder` can replace the manual `reference_N`
+wiring for tiled production. Connect the first-pass `pose_video`, the same
+`segment_plan`, and preferably the same `tile_manifest`; the node grabs one
+keyframe for each reference id used by the plan, optionally runs a connected
+ComfyUI `UPSCALE_MODEL`, then resizes every packed reference to exactly
+`tile_manifest.target_size`. Connect `reference_pack_images` and
+`reference_pack_manifest` to `SCAIL-2 Tiled Long Video` or its Internal SAM
+variant. The tiled node verifies every packed reference crop against each tile's
+`target_crop_bbox` before generation, so mismatched pack/manifest sizes fail
+early instead of creating a hidden pixel offset.
+
 For people videos, connect a face/head/person mask to
 `Tile Plan Builder.protected_masks`. The planner treats that mask as a protected
 region, pads it with `protected_padding_ratio` and `protected_padding_px`, then
