@@ -3056,6 +3056,11 @@ def _extract_comfy_image_tensor_output(value: Any, *, _depth: int = 0) -> Any:
     return value
 
 
+def _normalize_reference_pack_mode(pack_mode: Any) -> str:
+    normalized = str(pack_mode or "per_reference").strip()
+    return normalized if normalized in {"per_reference", "per_segment"} else "per_reference"
+
+
 def _resize_reference_pack_frame(
     image: torch.Tensor,
     target_w: int,
@@ -3204,22 +3209,38 @@ def _parse_reference_pack_manifest(reference_pack_manifest: str) -> dict[str, An
     references = manifest.get("references")
     if not isinstance(references, list) or not references:
         raise ValueError("reference_pack_manifest must contain a non-empty references array.")
+    pack_mode = _normalize_reference_pack_mode(manifest.get("pack_mode", "per_reference"))
     seen: set[int] = set()
     normalized: list[dict[str, Any]] = []
     for index, item in enumerate(references):
         if not isinstance(item, dict):
             raise ValueError(f"reference_pack_manifest.references[{index}] must be an object.")
         reference = int(item.get("reference", 0))
+        source_reference = int(item.get("source_reference", reference))
         batch_index = int(item.get("batch_index", index))
         if reference < 1 or reference > MAX_REFERENCES:
             raise ValueError(f"reference_pack_manifest reference {reference} must be between 1 and {MAX_REFERENCES}.")
+        if source_reference < 1 or source_reference > MAX_REFERENCES:
+            raise ValueError(
+                f"reference_pack_manifest source_reference {source_reference} must be between 1 and {MAX_REFERENCES}."
+            )
         if reference in seen:
             raise ValueError(f"reference_pack_manifest contains duplicate reference {reference}.")
         if batch_index < 0:
             raise ValueError(f"reference_pack_manifest reference {reference} has invalid batch_index {batch_index}.")
+        if pack_mode == "per_segment" and "segment_index" not in item:
+            raise ValueError("per_segment reference_pack_manifest entries must include segment_index.")
         seen.add(reference)
-        normalized.append({**item, "reference": int(reference), "batch_index": int(batch_index)})
-    return {**manifest, "references": normalized}
+        normalized_item = {
+            **item,
+            "reference": int(reference),
+            "source_reference": int(source_reference),
+            "batch_index": int(batch_index),
+        }
+        if "segment_index" in item:
+            normalized_item["segment_index"] = int(item["segment_index"])
+        normalized.append(normalized_item)
+    return {**manifest, "pack_mode": pack_mode, "references": normalized}
 
 
 def _collect_reference_pack_inputs(kwargs: dict[str, Any]) -> tuple[dict[int, torch.Tensor], dict[str, Any]]:
@@ -3245,6 +3266,8 @@ def _collect_reference_pack_inputs(kwargs: dict[str, Any]) -> tuple[dict[int, to
         collected.append(
             {
                 "reference": int(reference),
+                "source_reference": int(item.get("source_reference", reference)),
+                "segment_index": int(item["segment_index"]) if "segment_index" in item else None,
                 "batch_index": int(batch_index),
                 "shape": _shape(reference_image),
                 "source": "reference_pack",
@@ -3255,6 +3278,7 @@ def _collect_reference_pack_inputs(kwargs: dict[str, Any]) -> tuple[dict[int, to
         "image_shape": _shape(images),
         "source_size": manifest.get("source_size"),
         "target_size": manifest.get("target_size"),
+        "pack_mode": _normalize_reference_pack_mode(manifest.get("pack_mode", "per_reference")),
         "references": collected,
         "manifest": manifest,
     }
@@ -3380,6 +3404,79 @@ def _effective_tiled_reference_count(
     candidates.extend(int(segment["reference"]) for segment in segments)
     candidates.extend(int(index) for index in references.keys())
     return max(1, min(MAX_REFERENCES, max(candidates)))
+
+
+def _resolve_reference_pack_segment_plan(
+    original_segment_plan: str,
+    segments: list[dict[str, Any]],
+    reference_pack_info: dict[str, Any],
+) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
+    pack_manifest = reference_pack_info.get("manifest") if isinstance(reference_pack_info.get("manifest"), dict) else {}
+    pack_mode = _normalize_reference_pack_mode(pack_manifest.get("pack_mode", reference_pack_info.get("pack_mode", "per_reference")))
+    plan_info: dict[str, Any] = {
+        "enabled": False,
+        "pack_mode": pack_mode,
+        "segment_count": int(len(segments)),
+    }
+    if not bool(reference_pack_info.get("enabled")) or pack_mode != "per_segment":
+        return original_segment_plan, segments, plan_info
+
+    entries_by_segment: dict[int, dict[str, Any]] = {}
+    for item in pack_manifest.get("references", []):
+        if not isinstance(item, dict):
+            continue
+        if "segment_index" not in item:
+            raise ValueError("per_segment reference_pack_manifest entries must include segment_index.")
+        segment_index = int(item["segment_index"])
+        if segment_index in entries_by_segment:
+            raise ValueError(f"per_segment reference_pack_manifest contains duplicate segment_index {segment_index}.")
+        entries_by_segment[segment_index] = item
+
+    remapped_rows: list[dict[str, Any]] = []
+    remap_entries: list[dict[str, Any]] = []
+    for segment in segments:
+        segment_index = int(segment["index"])
+        item = entries_by_segment.get(segment_index)
+        if item is None:
+            raise ValueError(
+                "per_segment reference pack does not cover every active segment. "
+                f"Missing segment_index={segment_index}. Rebuild the pack from the same segment_plan and max_frames."
+            )
+        packed_reference = int(item.get("reference", 0))
+        source_reference = int(item.get("source_reference", segment["reference"]))
+        if packed_reference < 1 or packed_reference > MAX_REFERENCES:
+            raise ValueError(f"per_segment packed reference {packed_reference} must be between 1 and {MAX_REFERENCES}.")
+        if source_reference != int(segment["reference"]):
+            raise ValueError(
+                "per_segment reference pack source_reference does not match the active segment_plan. "
+                f"segment_index={segment_index}, pack_source_reference={source_reference}, "
+                f"segment_reference={int(segment['reference'])}. Rebuild the pack from the current segment_plan."
+            )
+        remapped = {**segment, "reference": int(packed_reference)}
+        remapped_rows.append(remapped)
+        remap_entries.append(
+            {
+                "segment_index": int(segment_index),
+                "source_reference": int(source_reference),
+                "packed_reference": int(packed_reference),
+                "batch_index": int(item.get("batch_index", packed_reference - 1)),
+                "source_frame": int(item["source_frame"]) if "source_frame" in item else None,
+            }
+        )
+
+    remapped_plan = _format_plan_rows(remapped_rows)
+    plan_info.update(
+        {
+            "enabled": True,
+            "remapped_segment_plan": remapped_plan,
+            "remap": remap_entries,
+            "contract": (
+                "per_segment reference packs remap each active segment to its own packed reference slot "
+                "before tiled generation; the user-facing segment_plan is left unchanged."
+            ),
+        }
+    )
+    return remapped_plan, remapped_rows, plan_info
 
 
 def _intervals_overlap(a0: int, a1: int, b0: int, b1: int) -> bool:
@@ -6951,6 +7048,7 @@ class SCAIL2PlanReferencePackBuilder:
                 "content_alignment_policy": (["error", "warn", "off"], {"default": "error"}),
                 "max_content_shift_px": ("INT", {"default": 1, "min": 0, "max": 16, "step": 1}),
                 "content_alignment_device": (["auto", "cpu", "cuda", "mps"], {"default": "auto"}),
+                "pack_mode": (["per_reference", "per_segment"], {"default": "per_reference"}),
             },
             "optional": {
                 "tile_manifest": ("STRING", {"default": "", "multiline": True, "forceInput": True}),
@@ -6985,6 +7083,7 @@ class SCAIL2PlanReferencePackBuilder:
         content_alignment_policy: str = "error",
         max_content_shift_px: int = 1,
         content_alignment_device: str = "auto",
+        pack_mode: str = "per_reference",
         tile_manifest: str = "",
         upscale_model: Any = None,
     ):
@@ -7005,20 +7104,33 @@ class SCAIL2PlanReferencePackBuilder:
         normalized_frame_mode = str(reference_frame_mode or "segment_start").strip()
         if normalized_frame_mode not in {"segment_start", "segment_middle", "segment_end"}:
             normalized_frame_mode = "segment_start"
+        normalized_pack_mode = _normalize_reference_pack_mode(pack_mode)
 
-        first_segment_by_reference: dict[int, dict[str, Any]] = {}
-        for segment in segments:
-            reference = int(segment["reference"])
-            if reference not in first_segment_by_reference:
-                first_segment_by_reference[reference] = segment
-        selected_references = sorted(first_segment_by_reference)
-        if not selected_references:
+        selected_entries: list[tuple[int, dict[str, Any]]] = []
+        if normalized_pack_mode == "per_segment":
+            if len(segments) > MAX_REFERENCES:
+                raise ValueError(
+                    f"pack_mode=per_segment supports at most {MAX_REFERENCES} active segments, "
+                    f"but segment_plan produced {len(segments)}. Split the plan or use per_reference mode."
+                )
+            selected_entries = [(index + 1, segment) for index, segment in enumerate(segments)]
+        else:
+            first_segment_by_reference: dict[int, dict[str, Any]] = {}
+            for segment in segments:
+                reference = int(segment["reference"])
+                if reference not in first_segment_by_reference:
+                    first_segment_by_reference[reference] = segment
+            selected_entries = [
+                (int(reference), first_segment_by_reference[int(reference)])
+                for reference in sorted(first_segment_by_reference)
+            ]
+        if not selected_entries:
             raise ValueError("segment_plan produced no references.")
 
         images: list[torch.Tensor] = []
         entries: list[dict[str, Any]] = []
-        for batch_index, reference in enumerate(selected_references):
-            segment = first_segment_by_reference[int(reference)]
+        for batch_index, (packed_reference, segment) in enumerate(selected_entries):
+            source_reference = int(segment["reference"])
             start = int(segment["start"])
             end = int(segment["end"])
             if normalized_frame_mode == "segment_end":
@@ -7049,7 +7161,9 @@ class SCAIL2PlanReferencePackBuilder:
             images.append(reference_image)
             entries.append(
                 {
-                    "reference": int(reference),
+                    "reference": int(packed_reference),
+                    "packed_reference": int(packed_reference),
+                    "source_reference": int(source_reference),
                     "batch_index": int(batch_index),
                     "segment_index": int(segment["index"]),
                     "segment_start": int(start),
@@ -7077,10 +7191,13 @@ class SCAIL2PlanReferencePackBuilder:
             "source_size": [int(source_w), int(source_h)],
             "target_size": [int(target_w), int(target_h)],
             "target_size_resolution": target_info,
+            "pack_mode": normalized_pack_mode,
             "segment_plan": segment_plan,
             "segments": segments,
             "references": entries,
             "reference_count": int(len(entries)),
+            "plan_segment_count": int(len(segments)),
+            "used_source_references": sorted({int(segment["reference"]) for segment in segments}),
             "reference_frame_mode": normalized_frame_mode,
             "resize_mode": str(resize_mode),
             "post_upscale_resize_mode": str(post_upscale_resize_mode),
@@ -7095,7 +7212,10 @@ class SCAIL2PlanReferencePackBuilder:
         summary = {
             "node": "SCAIL2PlanReferencePackBuilder",
             "output_shape": _shape(pack_images),
+            "pack_mode": normalized_pack_mode,
             "reference_count": int(len(entries)),
+            "plan_segment_count": int(len(segments)),
+            "used_source_references": sorted({int(segment["reference"]) for segment in segments}),
             "source_size": [int(source_w), int(source_h)],
             "target_size": [int(target_w), int(target_h)],
             "target_size_resolution": target_info,
@@ -8209,7 +8329,12 @@ def _run_tiled_long_video(
         int(reference_count),
         include_masks=not bool(use_internal_sam),
     )
-    effective_reference_count = _effective_tiled_reference_count(int(reference_count), segments, references)
+    generation_segment_plan, generation_segments, reference_pack_plan = _resolve_reference_pack_segment_plan(
+        str(segment_plan),
+        segments,
+        reference_pack_info,
+    )
+    effective_reference_count = _effective_tiled_reference_count(int(reference_count), generation_segments, references)
     reference_pack_geometry = _validate_reference_pack_geometry(
         reference_pack_info,
         manifest,
@@ -8218,7 +8343,7 @@ def _run_tiled_long_video(
     )
     sam_options = dict(sam_options or {})
     used_refs = _validate_tiled_reference_inputs(
-        segments,
+        generation_segments,
         references,
         reference_masks,
         int(effective_reference_count),
@@ -8301,7 +8426,7 @@ def _run_tiled_long_video(
                 sigmas,
                 clip_vision,
                 tile_pose_video,
-                segment_plan,
+                generation_segment_plan,
                 current_seed,
                 cfg,
                 mode,
@@ -8390,6 +8515,8 @@ def _run_tiled_long_video(
         "source_size": actual_manifest.get("source_size"),
         "mode": str(mode),
         "segment_plan": segment_plan,
+        "generation_segment_plan": generation_segment_plan,
+        "reference_pack_plan": reference_pack_plan,
         "used_refs": used_refs,
         "requested_reference_count": int(reference_count),
         "effective_reference_count": int(effective_reference_count),

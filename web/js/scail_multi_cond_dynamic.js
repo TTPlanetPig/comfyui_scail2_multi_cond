@@ -26,6 +26,7 @@ const SCAIL_WIDGET_TOOLTIPS = new Map([
     ["reference_pack_images", "Batch of full-canvas reference images produced by Plan Reference Pack Builder."],
     ["reference_pack_manifest", "JSON mapping each packed image batch index back to the segment-plan reference number."],
     ["reference_frame_mode", "Which frame inside each plan segment is captured as its generated reference image."],
+    ["pack_mode", "per_reference keeps one packed image per source reference id; per_segment captures one packed image for each active segment and remaps the tiled plan internally."],
     ["resize_mode", "How generated reference keyframes are resized; upscale_model uses the connected ComfyUI upscale model."],
     ["post_upscale_resize_mode", "Final resize filter after an upscale model so packed references exactly match the tile target canvas."],
     ["content_alignment_policy", "How the reference pack handles detected content shifts against the original pose keyframe."],

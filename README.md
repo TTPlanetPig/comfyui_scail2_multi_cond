@@ -333,8 +333,12 @@ composite steps internally for normal production workflows.
 
 `SCAIL-2 Plan Reference Pack Builder` can replace the manual `reference_N`
 wiring for tiled production. Connect the first-pass `pose_video`, the same
-`segment_plan`, and preferably the same `tile_manifest`; the node grabs one
-keyframe for each reference id used by the plan, optionally runs a connected
+`segment_plan`, and preferably the same `tile_manifest`. By default
+`pack_mode=per_reference` grabs one keyframe for each reference id used by the
+plan, which preserves older workflows. Use `pack_mode=per_segment` when each
+segment needs its own reference keyframe; the pack then contains one image per
+active segment and the tiled node internally remaps those segments to the packed
+reference slots before generation. The builder can optionally run a connected
 ComfyUI `UPSCALE_MODEL`, then resizes every packed reference to exactly
 `tile_manifest.target_size`. Connect `reference_pack_images` and
 `reference_pack_manifest` to `SCAIL-2 Tiled Long Video` or its Internal SAM

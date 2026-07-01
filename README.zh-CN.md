@@ -285,8 +285,12 @@ tile 的 `tile_align` 会被规范到 32 像素步进，`tile_generate_size` 必
 
 如果不想手动连接多张 `reference_N`，可以使用
 `SCAIL-2 Plan Reference Pack Builder`。把第一阶段 `pose_video`、同一个
-`segment_plan`，以及最好同一个 `tile_manifest` 接进去；节点会按 plan 中实际用到的
-reference 编号抽关键帧，可选调用 ComfyUI 的 `UPSCALE_MODEL`，然后把每张参考图精确调整到
+`segment_plan`，以及最好同一个 `tile_manifest` 接进去。默认
+`pack_mode=per_reference` 会按 plan 中实际用到的 reference 编号各抽一张关键帧，
+用来兼容旧工作流；如果你希望每个分段都有自己的参考图，请切到
+`pack_mode=per_segment`，这时 pack 会按 active segment 数量输出同样数量的图片，
+Tiled 节点会在内部把每段临时映射到对应的 packed reference slot 后再生成。
+节点可选调用 ComfyUI 的 `UPSCALE_MODEL`，然后把每张参考图精确调整到
 `tile_manifest.target_size`。把输出的 `reference_pack_images` 和
 `reference_pack_manifest` 接到 `SCAIL-2 Tiled Long Video` 或 Internal SAM 版本即可。
 Tiled 节点会在生成前逐 tile 检查 pack 参考图的裁切 bbox 是否完全等于 manifest 中的

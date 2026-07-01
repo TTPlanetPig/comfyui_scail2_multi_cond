@@ -100,6 +100,9 @@ def main() -> None:
     assert_true(pack_required["content_alignment_policy"][1]["default"] == "error", "reference pack should reject content shifts by default")
     assert_true(pack_required["max_content_shift_px"][1]["default"] == 1, "reference pack should allow at most one shifted pixel by default")
     assert_true(pack_required["content_alignment_device"][1]["default"] == "auto", "reference pack content alignment should default to auto device")
+    assert_true(pack_required["pack_mode"][1]["default"] == "per_reference", "reference pack should preserve old per-reference behavior by default")
+    assert_true("per_segment" in pack_required["pack_mode"][0], "reference pack should support one packed reference per segment")
+    assert_true(list(pack_required)[-1] == "pack_mode", "pack_mode should append last to avoid shifting older reference-pack widgets")
     assert_true("upscale_model" in pack_optional, "reference pack should expose optional upscale_model")
     assert_true("tile_manifest" in pack_optional, "reference pack should accept tile_manifest for exact target size")
     packed_reference = FakePackedReference()
@@ -201,6 +204,54 @@ def main() -> None:
         '{"source_size":[704,1280],"target_size":[1056,1920],"references":[{"reference":2,"batch_index":0}]}'
     )
     assert_true(parsed_pack["references"][0]["reference"] == 2, "reference pack should preserve plan reference id")
+    parsed_segment_pack = nodes._parse_reference_pack_manifest(
+        '{"pack_mode":"per_segment","source_size":[704,1280],"target_size":[1056,1920],"references":['
+        '{"reference":1,"source_reference":1,"segment_index":0,"batch_index":0},'
+        '{"reference":2,"source_reference":1,"segment_index":1,"batch_index":1},'
+        '{"reference":3,"source_reference":2,"segment_index":2,"batch_index":2}]}'
+    )
+    assert_true(parsed_segment_pack["pack_mode"] == "per_segment", "reference pack should preserve per-segment mode")
+    assert_true(parsed_segment_pack["references"][1]["source_reference"] == 1, "per-segment pack should keep the source reference id")
+    assert_raises(
+        "per_segment reference_pack_manifest entries must include segment_index",
+        lambda: nodes._parse_reference_pack_manifest(
+            '{"pack_mode":"per_segment","references":[{"reference":1,"source_reference":1,"batch_index":0}]}'
+        ),
+    )
+    duplicate_source_segments = nodes._parse_plan(
+        '[{"frames": 10, "reference": 1, "prompt": "a", "negative": ""},'
+        '{"frames": 8, "reference": 1, "prompt": "b", "negative": ""},'
+        '{"frames": 6, "reference": 2, "prompt": "c", "negative": ""}]',
+        pose_frame_count=24,
+        max_frames=0,
+    )
+    remapped_plan, remapped_segments, remap_info = nodes._resolve_reference_pack_segment_plan(
+        "original plan text",
+        duplicate_source_segments,
+        {"enabled": True, "manifest": parsed_segment_pack},
+    )
+    assert_true(remap_info["enabled"], "per-segment pack should rewrite the generation plan")
+    assert_true([int(segment["reference"]) for segment in remapped_segments] == [1, 2, 3], "per-segment pack should assign one packed ref per segment")
+    assert_true("8 | 2 | b" in remapped_plan, "remapped plan should preserve segment prompts while changing references")
+    assert_true(remap_info["remap"][1]["source_reference"] == 1, "remap should preserve original repeated source reference")
+    assert_raises(
+        "source_reference does not match",
+        lambda: nodes._resolve_reference_pack_segment_plan(
+            "original plan text",
+            duplicate_source_segments,
+            {
+                "enabled": True,
+                "manifest": {
+                    **parsed_segment_pack,
+                    "references": [
+                        parsed_segment_pack["references"][0],
+                        {**parsed_segment_pack["references"][1], "source_reference": 2},
+                        parsed_segment_pack["references"][2],
+                    ],
+                },
+            },
+        ),
+    )
     geometry_manifest = {
         "source_size": [704, 1280],
         "target_size": [1056, 1920],
@@ -502,6 +553,8 @@ def main() -> None:
     assert_true("seam_alignment_apply_mode" in orchestrator_source, "tiled orchestrator should pass seam apply mode")
     assert_true("seam_alignment_device" in orchestrator_source, "tiled orchestrator should pass seam device")
     assert_true("junction_mode" in orchestrator_source, "tiled orchestrator should pass the junction blending mode")
+    assert_true("_resolve_reference_pack_segment_plan" in orchestrator_source, "tiled orchestrator should remap per-segment reference packs")
+    assert_true("generation_segment_plan" in orchestrator_source, "tiled orchestrator should pass the remapped generation plan")
     assert_true("_validate_reference_pack_geometry" in orchestrator_source, "tiled orchestrator should verify reference pack pixel geometry")
     assert_true("effective_reference_count" in orchestrator_source, "tiled orchestrator should expand reference_count for reference packs")
     content_source = inspect.getsource(nodes._check_reference_content_alignment)
