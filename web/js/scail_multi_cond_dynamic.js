@@ -68,6 +68,7 @@ const SCAIL_WIDGET_TOOLTIPS = new Map([
     ["tile_seed_mode", "Use the same seed for every tile or offset the seed by tile number."],
     ["composite_blend_mode", "Tile seam blending method. core_feather is standard; ttp_seam uses the alternate TTP-style blend."],
     ["blend_mode", "Tile composite blend method."],
+    ["junction_mode", "How pixels covered by more than two tiles are normalized. top2 keeps only the two strongest tile weights at each pixel."],
     ["seam_alignment", "Analyze tile overlap across sampled frames and apply one stable whole-tile offset before compositing."],
     ["seam_alignment_apply_mode", "shifted_canvas_crop moves tile paste boxes and globally crops the final canvas; fixed_crop shifts inside each tile crop."],
     ["seam_alignment_device", "Device used for seam offset scoring. auto prefers CUDA, then MPS, then CPU, with CPU fallback if unavailable."],

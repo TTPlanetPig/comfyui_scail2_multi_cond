@@ -4123,6 +4123,11 @@ def _tile_weight_mask(
     return _tile_weight_mask_core_feather(height, width, crop_bbox, core_bbox, feather_px)
 
 
+def _normalize_tile_junction_mode(junction_mode: str) -> str:
+    normalized = str(junction_mode or "weighted_average").strip()
+    return normalized if normalized in {"weighted_average", "top2_normalized"} else "weighted_average"
+
+
 def _shift_image_batch_integer(image: torch.Tensor, dx: int, dy: int) -> torch.Tensor:
     if int(dx) == 0 and int(dy) == 0:
         return image.contiguous()
@@ -7392,6 +7397,7 @@ class SCAIL2TileCompositeVideo:
                 "seam_alignment_device": (["auto", "cpu", "cuda", "mps"], {"default": "auto"}),
                 "max_seam_shift_px": ("INT", {"default": 4, "min": 0, "max": 32, "step": 1}),
                 "seam_alignment_frames": ("INT", {"default": 9, "min": 1, "max": 33, "step": 1}),
+                "junction_mode": (["weighted_average", "top2_normalized"], {"default": "weighted_average"}),
             },
             "optional": optional,
         }
@@ -7423,6 +7429,7 @@ class SCAIL2TileCompositeVideo:
         seam_alignment_device: str = "auto",
         max_seam_shift_px: int = 4,
         seam_alignment_frames: int = 9,
+        junction_mode: str = "weighted_average",
         base_video: Optional[torch.Tensor] = None,
         **kwargs,
     ):
@@ -7458,6 +7465,7 @@ class SCAIL2TileCompositeVideo:
         normalized_blend_mode = str(blend_mode or "core_feather").strip()
         if normalized_blend_mode not in {"core_feather", "ttp_seam"}:
             normalized_blend_mode = "core_feather"
+        normalized_junction_mode = _normalize_tile_junction_mode(str(junction_mode))
         normalized_seam_apply_mode = str(seam_alignment_apply_mode or "shifted_canvas_crop").strip()
         if normalized_seam_apply_mode not in {"shifted_canvas_crop", "fixed_crop"}:
             normalized_seam_apply_mode = "shifted_canvas_crop"
@@ -7577,6 +7585,17 @@ class SCAIL2TileCompositeVideo:
             }
 
         paste_events: list[dict[str, Any]] = []
+        paste_descriptors: list[dict[str, Any]] = []
+        top_weight_1: Optional[torch.Tensor] = None
+        top_weight_2: Optional[torch.Tensor] = None
+        top_index_1: Optional[torch.Tensor] = None
+        top_index_2: Optional[torch.Tensor] = None
+        if normalized_junction_mode == "top2_normalized":
+            top_weight_1 = torch.zeros((1, canvas_h, canvas_w, 1), dtype=torch.float32)
+            top_weight_2 = torch.zeros((1, canvas_h, canvas_w, 1), dtype=torch.float32)
+            top_index_1 = torch.full((1, canvas_h, canvas_w, 1), -1, dtype=torch.int16)
+            top_index_2 = torch.full((1, canvas_h, canvas_w, 1), -1, dtype=torch.int16)
+
         for prepared in prepared_tiles:
             tile = prepared["tile"]
             video = prepared["video"]
@@ -7629,8 +7648,38 @@ class SCAIL2TileCompositeVideo:
             if base_target is not None:
                 target_patch = base_target[:, y0:y1, x0:x1, :]
                 fitted, _color_info = _local_mean_std_color_match(fitted, target_patch, mask)
-            output[:, y0:y1, x0:x1, :] += fitted[:, :, :, :3] * mask
-            weights[:, y0:y1, x0:x1, :] += mask
+            descriptor_index = len(paste_descriptors)
+            if normalized_junction_mode == "top2_normalized":
+                paste_descriptors.append(
+                    {
+                        "index": int(descriptor_index),
+                        "x0": int(x0),
+                        "y0": int(y0),
+                        "x1": int(x1),
+                        "y1": int(y1),
+                        "fitted": fitted,
+                        "mask": mask,
+                    }
+                )
+                assert top_weight_1 is not None and top_weight_2 is not None
+                assert top_index_1 is not None and top_index_2 is not None
+                region_w1 = top_weight_1[:, y0:y1, x0:x1, :]
+                region_w2 = top_weight_2[:, y0:y1, x0:x1, :]
+                region_i1 = top_index_1[:, y0:y1, x0:x1, :]
+                region_i2 = top_index_2[:, y0:y1, x0:x1, :]
+                old_w1 = region_w1.clone()
+                old_i1 = region_i1.clone()
+                better_1 = mask > region_w1
+                better_2 = torch.logical_and(torch.logical_not(better_1), mask > region_w2)
+                region_w2[better_1] = old_w1[better_1]
+                region_i2[better_1] = old_i1[better_1]
+                region_w1[better_1] = mask[better_1]
+                region_i1[better_1] = int(descriptor_index)
+                region_w2[better_2] = mask[better_2]
+                region_i2[better_2] = int(descriptor_index)
+            else:
+                output[:, y0:y1, x0:x1, :] += fitted[:, :, :, :3] * mask
+                weights[:, y0:y1, x0:x1, :] += mask
             paste_events.append(
                 {
                     "tile_number": int(tile_number),
@@ -7652,12 +7701,41 @@ class SCAIL2TileCompositeVideo:
                     "tile_to_target_scale": tile.get("tile_to_target_scale"),
                     "actual_tile_to_target_scale": tile.get("actual_tile_to_target_scale"),
                     "blend_mode": normalized_blend_mode,
+                    "junction_mode": normalized_junction_mode,
                     "seam_alignment_offset_xy": [int(value) for value in offset_xy],
                     "seam_alignment_apply_mode": normalized_seam_apply_mode,
                     "input_shape": _shape(video),
                     "fitted_shape": _shape(fitted),
                 }
             )
+
+        top2_summary: Optional[dict[str, Any]] = None
+        if normalized_junction_mode == "top2_normalized":
+            assert top_index_1 is not None and top_index_2 is not None
+            selected_pixels_total = 0
+            for descriptor in paste_descriptors:
+                descriptor_index = int(descriptor["index"])
+                x0 = int(descriptor["x0"])
+                y0 = int(descriptor["y0"])
+                x1 = int(descriptor["x1"])
+                y1 = int(descriptor["y1"])
+                mask = descriptor["mask"]
+                fitted = descriptor["fitted"]
+                region_i1 = top_index_1[:, y0:y1, x0:x1, :]
+                region_i2 = top_index_2[:, y0:y1, x0:x1, :]
+                selected = torch.logical_or(region_i1 == descriptor_index, region_i2 == descriptor_index)
+                selected = torch.logical_and(selected, mask > 0)
+                selected_pixels_total += int(selected.sum().item())
+                selected_mask = mask * selected.to(dtype=mask.dtype)
+                output[:, y0:y1, x0:x1, :] += fitted[:, :, :, :3] * selected_mask
+                weights[:, y0:y1, x0:x1, :] += selected_mask
+            pixels_with_second = int((top_index_2 >= 0).sum().item())
+            top2_summary = {
+                "selected_tile_slots": int(selected_pixels_total),
+                "pixels_with_second_tile": int(pixels_with_second),
+                "descriptor_count": int(len(paste_descriptors)),
+                "contract": "Only the two highest tile weights at each pixel contribute before final weight normalization.",
+            }
 
         output = output / weights.clamp_min(1e-6)
         uncovered = weights <= 1e-6
@@ -7694,6 +7772,8 @@ class SCAIL2TileCompositeVideo:
             "tile_weight_mode": normalized_blend_mode,
             "tile_fit_mode": normalized_tile_fit_mode,
             "color_correction": bool(color_correction and base_target is not None),
+            "tile_junction_mode": normalized_junction_mode,
+            "top2_normalized": top2_summary,
             "seam_alignment": {
                 **seam_alignment_summary,
                 "apply_mode": normalized_seam_apply_mode,
@@ -8091,6 +8171,7 @@ def _run_tiled_long_video(
     seam_alignment_device: str,
     max_seam_shift_px: int,
     seam_alignment_frames: int,
+    junction_mode: str,
     pose_video_mask: Optional[torch.Tensor],
     sam_options: Optional[dict[str, Any]],
     prompt=None,
@@ -8298,6 +8379,7 @@ def _run_tiled_long_video(
         str(seam_alignment_device),
         int(max_seam_shift_px),
         int(seam_alignment_frames),
+        str(junction_mode),
         base_video=pose_video if bool(composite_color_correction) else None,
         **composite_kwargs,
     )
@@ -8320,6 +8402,7 @@ def _run_tiled_long_video(
         "free_tail_window": int(free_tail_window),
         "max_tile_pixels": int(max_tile_pixels),
         "composite_blend_mode": str(composite_blend_mode),
+        "junction_mode": _normalize_tile_junction_mode(str(junction_mode)),
         "seam_alignment": {
             "enabled": bool(seam_alignment),
             "apply_mode": str(seam_alignment_apply_mode),
@@ -8393,6 +8476,7 @@ class SCAIL2TiledLongVideo:
                 "max_seam_shift_px": ("INT", {"default": 4, "min": 0, "max": 32, "step": 1}),
                 "seam_alignment_frames": ("INT", {"default": 9, "min": 1, "max": 33, "step": 1}),
                 "free_tail_window": _free_tail_window_input_spec(),
+                "junction_mode": (["weighted_average", "top2_normalized"], {"default": "weighted_average"}),
             },
             "optional": optional,
             "hidden": {
@@ -8449,6 +8533,7 @@ class SCAIL2TiledLongVideo:
         max_seam_shift_px: int = 4,
         seam_alignment_frames: int = 9,
         free_tail_window: int = 0,
+        junction_mode: str = "weighted_average",
         pose_video_mask: Optional[torch.Tensor] = None,
         prompt=None,
         unique_id=None,
@@ -8493,6 +8578,7 @@ class SCAIL2TiledLongVideo:
             seam_alignment_device=str(seam_alignment_device),
             max_seam_shift_px=int(max_seam_shift_px),
             seam_alignment_frames=int(seam_alignment_frames),
+            junction_mode=str(junction_mode),
             pose_video_mask=pose_video_mask,
             sam_options=None,
             prompt=prompt,
@@ -8569,6 +8655,7 @@ class SCAIL2TiledLongVideoWithSAM:
                 "max_seam_shift_px": ("INT", {"default": 4, "min": 0, "max": 32, "step": 1}),
                 "seam_alignment_frames": ("INT", {"default": 9, "min": 1, "max": 33, "step": 1}),
                 "free_tail_window": _free_tail_window_input_spec(),
+                "junction_mode": (["weighted_average", "top2_normalized"], {"default": "weighted_average"}),
             },
             "optional": optional,
             "hidden": {
@@ -8631,6 +8718,7 @@ class SCAIL2TiledLongVideoWithSAM:
         max_seam_shift_px: int = 4,
         seam_alignment_frames: int = 9,
         free_tail_window: int = 0,
+        junction_mode: str = "weighted_average",
         sam_model=None,
         sam_conditioning=None,
         prompt=None,
@@ -8676,6 +8764,7 @@ class SCAIL2TiledLongVideoWithSAM:
             seam_alignment_device=str(seam_alignment_device),
             max_seam_shift_px=int(max_seam_shift_px),
             seam_alignment_frames=int(seam_alignment_frames),
+            junction_mode=str(junction_mode),
             pose_video_mask=None,
             sam_options={
                 "sam_model": sam_model,

@@ -131,10 +131,13 @@ def main() -> None:
     assert_true(composite_required["seam_alignment_device"][1]["default"] == "auto", "seam alignment should default to auto device")
     assert_true(composite_required["max_seam_shift_px"][1]["default"] == 4, "unexpected max_seam_shift_px default")
     assert_true(composite_required["seam_alignment_frames"][1]["default"] == 9, "unexpected seam_alignment_frames default")
+    assert_true(composite_required["junction_mode"][1]["default"] == "weighted_average", "junction_mode should preserve old behavior by default")
+    assert_true("top2_normalized" in composite_required["junction_mode"][0], "tile composite should expose top2 junction mode")
     assert_true("composite_blend_mode" in tiled_required, "tiled long video should expose composite_blend_mode")
     assert_true("seam_alignment" in tiled_required, "tiled long video should expose seam_alignment")
     assert_true("seam_alignment_apply_mode" in tiled_required, "tiled long video should expose seam_alignment_apply_mode")
     assert_true("seam_alignment_device" in tiled_required, "tiled long video should expose seam_alignment_device")
+    assert_true(tiled_required["junction_mode"][1]["default"] == "weighted_average", "tiled junction mode should default to old blending")
     assert_true("seam_alignment" in tiled_sam_required, "internal SAM tiled long video should expose seam_alignment")
     assert_true(
         "seam_alignment_apply_mode" in tiled_sam_required,
@@ -144,12 +147,17 @@ def main() -> None:
         "seam_alignment_device" in tiled_sam_required,
         "internal SAM tiled long video should expose seam_alignment_device",
     )
+    assert_true(tiled_sam_required["junction_mode"][1]["default"] == "weighted_average", "internal SAM junction mode should default to old blending")
     assert_true(
         list(composite_required)[-4:]
-        == ["seam_alignment_apply_mode", "seam_alignment_device", "max_seam_shift_px", "seam_alignment_frames"],
+        == ["seam_alignment_device", "max_seam_shift_px", "seam_alignment_frames", "junction_mode"],
         "tile composite seam widgets should append last",
     )
-    assert_true(list(tiled_required)[-1] == "free_tail_window", "free_tail_window should stay last in tiled widgets")
+    assert_true(list(tiled_required)[-2:] == ["free_tail_window", "junction_mode"], "junction_mode should append after free_tail_window")
+    assert_true(
+        list(tiled_sam_required)[-2:] == ["free_tail_window", "junction_mode"],
+        "internal SAM junction_mode should append after free_tail_window",
+    )
     assert_true(
         list(tiled_required).index("composite_blend_mode") < list(tiled_required).index("free_tail_window"),
         "composite_blend_mode should stay before free_tail_window",
@@ -480,6 +488,8 @@ def main() -> None:
     assert_true("_covered_viewport_crop_bbox" in composite_source, "shifted seam alignment should crop the covered viewport")
     assert_true("shifted_canvas_crop" in composite_source, "tile composite should support shifted-canvas crop mode")
     assert_true("mask.repeat(frame_count" not in composite_source, "tile composite should not duplicate seam masks for every frame")
+    assert_true("top2_normalized" in composite_source, "tile composite should support top2 normalized junction blending")
+    assert_true("top_index_1" in composite_source and "top_index_2" in composite_source, "top2 mode should track the two strongest tile weights")
     crop_source = inspect.getsource(nodes._covered_viewport_crop_bbox)
     assert_true("largest_fully_covered_rectangle" in crop_source, "shifted canvas crop should remove uncovered black borders")
     assert_true("cropped_uncovered_pixels" in crop_source, "shifted canvas crop should report remaining uncovered pixels")
@@ -491,6 +501,7 @@ def main() -> None:
     assert_true("seam_alignment" in orchestrator_source, "tiled orchestrator should pass seam alignment options")
     assert_true("seam_alignment_apply_mode" in orchestrator_source, "tiled orchestrator should pass seam apply mode")
     assert_true("seam_alignment_device" in orchestrator_source, "tiled orchestrator should pass seam device")
+    assert_true("junction_mode" in orchestrator_source, "tiled orchestrator should pass the junction blending mode")
     assert_true("_validate_reference_pack_geometry" in orchestrator_source, "tiled orchestrator should verify reference pack pixel geometry")
     assert_true("effective_reference_count" in orchestrator_source, "tiled orchestrator should expand reference_count for reference packs")
     content_source = inspect.getsource(nodes._check_reference_content_alignment)

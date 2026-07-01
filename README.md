@@ -381,7 +381,11 @@ back to CPU if the requested device is unavailable. `max_seam_shift_px` caps the
 correction; start with `4` and raise only when the seam is visibly displaced. Keep
 `tile_fit_mode` at `stretch` for the default extractor output. If tile videos differ in length,
 `trim_to_shortest` drops only trailing mismatched frames; use `error` when
-debugging workflow alignment.
+debugging workflow alignment. `junction_mode=top2_normalized` changes only
+pixels covered by more than two tiles: it keeps the two strongest tile weights
+at each pixel before normalizing, which usually reduces blur or ghosting at
+3-way/4-way intersections while leaving ordinary two-tile overlaps effectively
+unchanged.
 
 For face quality, run the face-detail branch after tile compositing rather than
 before it:
