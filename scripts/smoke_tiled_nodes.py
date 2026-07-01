@@ -380,6 +380,7 @@ def main() -> None:
     assert_true("_shift_image_batch_integer" in composite_source, "tile composite should apply seam offsets before paste")
     assert_true("_covered_viewport_crop_bbox" in composite_source, "shifted seam alignment should crop the covered viewport")
     assert_true("shifted_canvas_crop" in composite_source, "tile composite should support shifted-canvas crop mode")
+    assert_true("mask.repeat(frame_count" not in composite_source, "tile composite should not duplicate seam masks for every frame")
     crop_source = inspect.getsource(nodes._covered_viewport_crop_bbox)
     assert_true("largest_fully_covered_rectangle" in crop_source, "shifted canvas crop should remove uncovered black borders")
     assert_true("cropped_uncovered_pixels" in crop_source, "shifted canvas crop should report remaining uncovered pixels")

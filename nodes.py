@@ -3942,7 +3942,10 @@ def _covered_viewport_crop_bbox(weights: torch.Tensor, viewport_bbox: list[int])
     vx1 = max(vx0 + 1, min(width, vx1))
     vy0 = max(0, min(height, vy0))
     vy1 = max(vy0 + 1, min(height, vy1))
-    coverage = (weights[:, :, :, 0] > 1e-6).all(dim=0).detach()
+    if weights.ndim == 4:
+        coverage = (weights[0, :, :, 0] > 1e-6).detach()
+    else:
+        coverage = (weights[:, :, 0] > 1e-6).detach()
     view = coverage[vy0:vy1, vx0:vx1]
     total_pixels = int(view.numel())
     covered_pixels = int(view.sum().item())
@@ -6736,7 +6739,7 @@ class SCAIL2TileCompositeVideo:
             normalized_seam_apply_mode = "shifted_canvas_crop"
 
         output = torch.zeros((frame_count, target_h, target_w, 3), dtype=torch.float32)
-        weights = torch.zeros((frame_count, target_h, target_w, 1), dtype=torch.float32)
+        weights = torch.zeros((1, target_h, target_w, 1), dtype=torch.float32)
         base_target: Optional[torch.Tensor] = None
         if bool(color_correction) and base_video is not None and isinstance(base_video, torch.Tensor) and base_video.ndim == 4:
             base_target = _resize_image_batch(
@@ -6828,7 +6831,7 @@ class SCAIL2TileCompositeVideo:
                 int(-canvas_min_y + target_h),
             ]
             output = torch.zeros((frame_count, canvas_h, canvas_w, 3), dtype=torch.float32)
-            weights = torch.zeros((frame_count, canvas_h, canvas_w, 1), dtype=torch.float32)
+            weights = torch.zeros((1, canvas_h, canvas_w, 1), dtype=torch.float32)
             if base_target is not None:
                 import torch.nn.functional as F
 
@@ -6897,7 +6900,6 @@ class SCAIL2TileCompositeVideo:
                 int(feather_px),
                 normalized_blend_mode,
             ).view(1, crop_h, crop_w, 1)
-            mask = mask.repeat(frame_count, 1, 1, 1).contiguous()
             if base_target is not None:
                 target_patch = base_target[:, y0:y1, x0:x1, :]
                 fitted, _color_info = _local_mean_std_color_match(fitted, target_patch, mask)
