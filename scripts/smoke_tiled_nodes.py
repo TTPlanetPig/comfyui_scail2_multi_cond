@@ -102,6 +102,23 @@ def main() -> None:
     assert_true(pack_required["content_alignment_device"][1]["default"] == "auto", "reference pack content alignment should default to auto device")
     assert_true("upscale_model" in pack_optional, "reference pack should expose optional upscale_model")
     assert_true("tile_manifest" in pack_optional, "reference pack should accept tile_manifest for exact target size")
+    packed_reference = FakePackedReference()
+
+    class FakeNodeOutput:
+        outputs = (packed_reference,)
+
+    assert_true(
+        nodes._extract_comfy_image_tensor_output((packed_reference,)) is packed_reference,
+        "upscale wrapper should extract legacy tuple outputs",
+    )
+    assert_true(
+        nodes._extract_comfy_image_tensor_output({"result": (packed_reference,)}) is packed_reference,
+        "upscale wrapper should extract dict result outputs",
+    )
+    assert_true(
+        nodes._extract_comfy_image_tensor_output(FakeNodeOutput()) is packed_reference,
+        "upscale wrapper should extract V3 NodeOutput-style outputs",
+    )
     composite_required = nodes.SCAIL2TileCompositeVideo.INPUT_TYPES()["required"]
     tiled_required = nodes.SCAIL2TiledLongVideo.INPUT_TYPES()["required"]
     tiled_sam_required = nodes.SCAIL2TiledLongVideoWithSAM.INPUT_TYPES()["required"]

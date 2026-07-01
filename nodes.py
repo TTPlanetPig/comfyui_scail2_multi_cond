@@ -3008,10 +3008,52 @@ def _run_upscale_model_for_reference_pack(upscale_model: Any, image: torch.Tenso
         result = node_cls().upscale(upscale_model, image)
     except Exception as exc:
         raise RuntimeError(f"Failed to run ComfyUI ImageUpscaleWithModel for reference pack: {exc}") from exc
-    upscaled = result[0] if isinstance(result, tuple) else result
+    upscaled = _extract_comfy_image_tensor_output(result)
     if not isinstance(upscaled, torch.Tensor) or upscaled.ndim != 4:
-        raise RuntimeError("ImageUpscaleWithModel did not return a ComfyUI IMAGE tensor.")
+        result_type = type(result).__name__
+        upscaled_type = type(upscaled).__name__ if upscaled is not None else "None"
+        raise RuntimeError(
+            "ImageUpscaleWithModel did not return a ComfyUI IMAGE tensor. "
+            f"result_type={result_type}, extracted_type={upscaled_type}."
+        )
     return upscaled.detach().float().clamp(0, 1).contiguous()
+
+
+def _extract_comfy_image_tensor_output(value: Any, *, _depth: int = 0) -> Any:
+    if _depth > 4:
+        return value
+    if isinstance(value, torch.Tensor):
+        return value
+    if isinstance(value, dict):
+        for key in ("result", "outputs", "output", "values", "data"):
+            if key in value:
+                extracted = _extract_comfy_image_tensor_output(value[key], _depth=_depth + 1)
+                if isinstance(extracted, torch.Tensor):
+                    return extracted
+        return value
+    if isinstance(value, (tuple, list)):
+        for item in value:
+            extracted = _extract_comfy_image_tensor_output(item, _depth=_depth + 1)
+            if isinstance(extracted, torch.Tensor):
+                return extracted
+        return value[0] if value else None
+    for attr in ("result", "outputs", "output", "values", "data"):
+        if hasattr(value, attr):
+            try:
+                extracted = _extract_comfy_image_tensor_output(getattr(value, attr), _depth=_depth + 1)
+            except Exception:
+                continue
+            if isinstance(extracted, torch.Tensor):
+                return extracted
+    if hasattr(value, "__iter__") and not isinstance(value, (str, bytes)):
+        try:
+            for item in value:
+                extracted = _extract_comfy_image_tensor_output(item, _depth=_depth + 1)
+                if isinstance(extracted, torch.Tensor):
+                    return extracted
+        except Exception:
+            pass
+    return value
 
 
 def _resize_reference_pack_frame(
