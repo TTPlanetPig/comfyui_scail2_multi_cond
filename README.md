@@ -580,7 +580,7 @@ long-video cache directory with an LRU policy.
 Default limits:
 
 ```text
-SCAIL2_DISK_CACHE_MAX_ENTRIES = 24
+SCAIL2_DISK_CACHE_MAX_ENTRIES = 1
 SCAIL2_DISK_CACHE_MAX_GB = 30
 SCAIL2_DISK_CACHE_MAX_AGE_DAYS = 14
 ```

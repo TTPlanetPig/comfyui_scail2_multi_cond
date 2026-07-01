@@ -53,6 +53,16 @@ def main() -> None:
 
         cache_root = output_dir / "scail2_cache" / "long_video"
 
+        for key in [
+            "SCAIL2_DISK_CACHE_MAX_ENTRIES",
+            "SCAIL2_DISK_CACHE_MAX_BYTES",
+            "SCAIL2_DISK_CACHE_MAX_GB",
+            "SCAIL2_DISK_CACHE_MAX_AGE_DAYS",
+        ]:
+            os.environ.pop(key, None)
+        default_config = nodes._disk_cache_prune_config()
+        assert_true(default_config["max_entries"] == 1, "default disk cache should keep one slot")
+
         os.environ["SCAIL2_DISK_CACHE_MAX_ENTRIES"] = "2"
         os.environ["SCAIL2_DISK_CACHE_MAX_BYTES"] = "0"
         os.environ["SCAIL2_DISK_CACHE_MAX_AGE_DAYS"] = "0"
