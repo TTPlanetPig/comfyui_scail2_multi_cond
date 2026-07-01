@@ -290,7 +290,9 @@ reference 编号抽关键帧，可选调用 ComfyUI 的 `UPSCALE_MODEL`，然后
 `tile_manifest.target_size`。把输出的 `reference_pack_images` 和
 `reference_pack_manifest` 接到 `SCAIL-2 Tiled Long Video` 或 Internal SAM 版本即可。
 Tiled 节点会在生成前逐 tile 检查 pack 参考图的裁切 bbox 是否完全等于 manifest 中的
-`target_crop_bbox`，不一致会直接报错，避免隐藏的像素偏移进入生成链路。
+`target_crop_bbox`，还会根据 pack 记录的原始 pose keyframe 复查内容是否发生整体位移。
+默认 `content_alignment_policy=error`，如果测得内容位移超过 `max_content_shift_px=1`，
+会直接报错；这样 upscale 路径如果偷偷加了 padding、裁切或平移，不会带着隐藏偏移进入生成链路。
 
 拼合时使用 core 优先的 feather：overlap 主要作为生成上下文，不会整段大面积参与最终平均，
 只有 core 边缘会柔和过渡到相邻 tile。

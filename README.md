@@ -339,8 +339,12 @@ ComfyUI `UPSCALE_MODEL`, then resizes every packed reference to exactly
 `tile_manifest.target_size`. Connect `reference_pack_images` and
 `reference_pack_manifest` to `SCAIL-2 Tiled Long Video` or its Internal SAM
 variant. The tiled node verifies every packed reference crop against each tile's
-`target_crop_bbox` before generation, so mismatched pack/manifest sizes fail
-early instead of creating a hidden pixel offset.
+`target_crop_bbox` before generation, and rechecks content registration against
+the original pose keyframe recorded in the pack. By default
+`content_alignment_policy=error` rejects packed references whose measured
+content shift is greater than `max_content_shift_px=1`, so an upscale path that
+adds padding, cropping, or translation fails early instead of creating a hidden
+generation offset.
 
 For people videos, connect a face/head/person mask to
 `Tile Plan Builder.protected_masks`. The planner treats that mask as a protected

@@ -3067,6 +3067,88 @@ def _resize_reference_pack_frame(
     }
 
 
+def _normalize_reference_content_alignment_policy(policy: str) -> str:
+    normalized = str(policy or "error").strip()
+    return normalized if normalized in {"error", "warn", "off"} else "error"
+
+
+def _check_reference_content_alignment(
+    source_frame: torch.Tensor,
+    reference_image: torch.Tensor,
+    *,
+    target_w: int,
+    target_h: int,
+    max_content_shift_px: int,
+    policy: str,
+    alignment_device: str,
+) -> dict[str, Any]:
+    normalized_policy = _normalize_reference_content_alignment_policy(policy)
+    max_allowed = max(0, int(max_content_shift_px))
+    result: dict[str, Any] = {
+        "enabled": normalized_policy != "off",
+        "policy": normalized_policy,
+        "max_content_shift_px": int(max_allowed),
+    }
+    if normalized_policy == "off":
+        return result
+    if not isinstance(source_frame, torch.Tensor) or source_frame.ndim != 4 or int(source_frame.shape[0]) <= 0:
+        raise ValueError("source_frame must be a non-empty ComfyUI IMAGE tensor.")
+    if not isinstance(reference_image, torch.Tensor) or reference_image.ndim != 4 or int(reference_image.shape[0]) <= 0:
+        raise ValueError("reference_image must be a non-empty ComfyUI IMAGE tensor.")
+    if int(reference_image.shape[1]) != int(target_h) or int(reference_image.shape[2]) != int(target_w):
+        raise ValueError(
+            "reference content alignment check requires reference_image to match target canvas: "
+            f"expected={target_w}x{target_h}, got={int(reference_image.shape[2])}x{int(reference_image.shape[1])}."
+        )
+    baseline = _fit_image_to_size(
+        source_frame[:1].detach().float().clamp(0, 1),
+        int(target_h),
+        int(target_w),
+        fit_mode="stretch",
+        mode="bilinear",
+    )
+    search_px = max(4, int(max_allowed))
+    estimate = _estimate_overlap_shift(
+        baseline,
+        reference_image[:1].detach().float().clamp(0, 1),
+        max_shift_px=int(search_px),
+        frame_indices=[0],
+        alignment_device=str(alignment_device or "auto"),
+    )
+    shift = [int(value) for value in estimate.get("shift", [0, 0])]
+    exceeded = bool(estimate.get("status") == "ok" and (abs(shift[0]) > max_allowed or abs(shift[1]) > max_allowed))
+    result.update(
+        {
+            "status": estimate.get("status"),
+            "shift": shift,
+            "search_px": int(search_px),
+            "content_alignment_device": estimate.get("alignment_device"),
+            "confidence": float(estimate.get("confidence", 0.0)),
+            "texture": float(estimate.get("texture", 0.0)) if "texture" in estimate else None,
+            "verified": bool(estimate.get("status") == "ok"),
+            "exceeded": exceeded,
+            "baseline_shape": _shape(baseline),
+            "reference_shape": _shape(reference_image),
+            "pixel_contract": "packed reference content should align with the same pose frame mapped by full-canvas stretch resize",
+        }
+    )
+    if exceeded:
+        message = (
+            "reference pack content alignment exceeded the allowed shift: "
+            f"shift={shift}, allowed={max_allowed}px. "
+            "The packed reference may have been cropped, padded, or translated by the upscale path."
+        )
+        result["message"] = message
+        if normalized_policy == "error":
+            raise ValueError(message)
+    elif estimate.get("status") != "ok":
+        result["message"] = (
+            "reference pack content alignment could not be measured reliably; "
+            f"status={estimate.get('status')}. Size/bbox checks still passed."
+        )
+    return result
+
+
 def _parse_reference_pack_manifest(reference_pack_manifest: str) -> dict[str, Any]:
     text = str(reference_pack_manifest or "").strip()
     if not text:
@@ -3166,6 +3248,16 @@ def _validate_reference_pack_geometry(
         )
     checked_tiles: list[dict[str, Any]] = []
     pack_refs = [int(item["reference"]) for item in reference_pack_info.get("references", [])]
+    pack_manifest = reference_pack_info.get("manifest") if isinstance(reference_pack_info.get("manifest"), dict) else {}
+    manifest_entries = {
+        int(item.get("reference", 0)): item
+        for item in pack_manifest.get("references", [])
+        if isinstance(item, dict) and int(item.get("reference", 0)) > 0
+    }
+    content_policy = _normalize_reference_content_alignment_policy(str(pack_manifest.get("content_alignment_policy", "error")))
+    max_content_shift_px = max(0, int(pack_manifest.get("max_content_shift_px", 1)))
+    content_alignment_device = str(pack_manifest.get("content_alignment_device", "auto"))
+    content_checks: list[dict[str, Any]] = []
     for reference in pack_refs:
         image = references.get(reference)
         if image is None:
@@ -3195,13 +3287,45 @@ def _validate_reference_pack_geometry(
                     "match": True,
                 }
             )
+        entry = manifest_entries.get(int(reference))
+        if isinstance(entry, dict) and "source_frame" in entry:
+            source_frame_index = max(0, min(int(pose_video.shape[0]) - 1, int(entry.get("source_frame", 0))))
+            content_check = _check_reference_content_alignment(
+                pose_video[source_frame_index : source_frame_index + 1],
+                image,
+                target_w=int(target_w),
+                target_h=int(target_h),
+                max_content_shift_px=int(max_content_shift_px),
+                policy=content_policy,
+                alignment_device=content_alignment_device,
+            )
+            content_checks.append(
+                {
+                    "reference": int(reference),
+                    "source_frame": int(source_frame_index),
+                    **content_check,
+                }
+            )
+        else:
+            content_checks.append(
+                {
+                    "reference": int(reference),
+                    "verified": False,
+                    "status": "skipped_missing_source_frame",
+                    "message": "reference_pack_manifest entry has no source_frame; content registration was not rechecked.",
+                }
+            )
     return {
         "enabled": True,
         "source_size": [int(source_w), int(source_h)],
         "target_size": [int(target_w), int(target_h)],
         "reference_count": int(len(pack_refs)),
         "checked_tile_crops": checked_tiles,
-        "pixel_contract": "reference pack full-canvas crops exactly match tile target_crop_bbox for every packed reference and tile",
+        "content_alignment_checks": content_checks,
+        "pixel_contract": (
+            "reference pack full-canvas crops exactly match tile target_crop_bbox for every packed reference and tile; "
+            "content registration is rechecked against pose_video source_frame when available"
+        ),
     }
 
 
@@ -6777,6 +6901,9 @@ class SCAIL2PlanReferencePackBuilder:
                 "reference_frame_mode": (["segment_start", "segment_middle", "segment_end"], {"default": "segment_start"}),
                 "resize_mode": (["bicubic", "bilinear", "nearest", "upscale_model"], {"default": "bicubic"}),
                 "post_upscale_resize_mode": (["bicubic", "bilinear", "nearest"], {"default": "bicubic"}),
+                "content_alignment_policy": (["error", "warn", "off"], {"default": "error"}),
+                "max_content_shift_px": ("INT", {"default": 1, "min": 0, "max": 16, "step": 1}),
+                "content_alignment_device": (["auto", "cpu", "cuda", "mps"], {"default": "auto"}),
             },
             "optional": {
                 "tile_manifest": ("STRING", {"default": "", "multiline": True, "forceInput": True}),
@@ -6808,6 +6935,9 @@ class SCAIL2PlanReferencePackBuilder:
         reference_frame_mode: str = "segment_start",
         resize_mode: str = "bicubic",
         post_upscale_resize_mode: str = "bicubic",
+        content_alignment_policy: str = "error",
+        max_content_shift_px: int = 1,
+        content_alignment_device: str = "auto",
         tile_manifest: str = "",
         upscale_model: Any = None,
     ):
@@ -6860,6 +6990,15 @@ class SCAIL2PlanReferencePackBuilder:
                 str(post_upscale_resize_mode),
                 upscale_model,
             )
+            content_alignment = _check_reference_content_alignment(
+                source_frame,
+                reference_image,
+                target_w=int(target_w),
+                target_h=int(target_h),
+                max_content_shift_px=int(max_content_shift_px),
+                policy=str(content_alignment_policy),
+                alignment_device=str(content_alignment_device),
+            )
             images.append(reference_image)
             entries.append(
                 {
@@ -6873,6 +7012,7 @@ class SCAIL2PlanReferencePackBuilder:
                     "frame_mode": normalized_frame_mode,
                     "target_size": [int(target_w), int(target_h)],
                     "resize": resize_info,
+                    "content_alignment": content_alignment,
                 }
             )
 
@@ -6897,9 +7037,12 @@ class SCAIL2PlanReferencePackBuilder:
             "reference_frame_mode": normalized_frame_mode,
             "resize_mode": str(resize_mode),
             "post_upscale_resize_mode": str(post_upscale_resize_mode),
+            "content_alignment_policy": _normalize_reference_content_alignment_policy(str(content_alignment_policy)),
+            "max_content_shift_px": int(max(0, int(max_content_shift_px))),
+            "content_alignment_device": str(content_alignment_device or "auto"),
             "pixel_contract": (
                 "Every packed reference is a full-canvas image exactly matching tile_manifest.target_size. "
-                "Tiled Long Video verifies each packed reference crop bbox against tile target_crop_bbox before generation."
+                "Tiled Long Video verifies each packed reference crop bbox and content registration before generation."
             ),
         }
         summary = {
@@ -6909,6 +7052,9 @@ class SCAIL2PlanReferencePackBuilder:
             "source_size": [int(source_w), int(source_h)],
             "target_size": [int(target_w), int(target_h)],
             "target_size_resolution": target_info,
+            "content_alignment_policy": _normalize_reference_content_alignment_policy(str(content_alignment_policy)),
+            "max_content_shift_px": int(max(0, int(max_content_shift_px))),
+            "content_alignment_device": str(content_alignment_device or "auto"),
             "references": entries,
             "connect_to": "Connect reference_pack_images and reference_pack_manifest to SCAIL-2 Tiled Long Video or its Internal SAM variant.",
         }

@@ -97,6 +97,9 @@ def main() -> None:
     pack_required = nodes.SCAIL2PlanReferencePackBuilder.INPUT_TYPES()["required"]
     pack_optional = nodes.SCAIL2PlanReferencePackBuilder.INPUT_TYPES()["optional"]
     assert_true(pack_required["resize_mode"][0][-1] == "upscale_model", "reference pack should support upscale_model mode")
+    assert_true(pack_required["content_alignment_policy"][1]["default"] == "error", "reference pack should reject content shifts by default")
+    assert_true(pack_required["max_content_shift_px"][1]["default"] == 1, "reference pack should allow at most one shifted pixel by default")
+    assert_true(pack_required["content_alignment_device"][1]["default"] == "auto", "reference pack content alignment should default to auto device")
     assert_true("upscale_model" in pack_optional, "reference pack should expose optional upscale_model")
     assert_true("tile_manifest" in pack_optional, "reference pack should accept tile_manifest for exact target size")
     composite_required = nodes.SCAIL2TileCompositeVideo.INPUT_TYPES()["required"]
@@ -203,6 +206,10 @@ def main() -> None:
     )
     assert_true(geometry["reference_count"] == 1, "reference pack geometry should count checked references")
     assert_true(len(geometry["checked_tile_crops"]) == 2, "reference pack geometry should check every tile")
+    assert_true(
+        geometry["content_alignment_checks"][0]["status"] == "skipped_missing_source_frame",
+        "reference pack geometry should skip content checks when source_frame is unavailable",
+    )
     bad_manifest = {
         **geometry_manifest,
         "tiles": [{**geometry_manifest["tiles"][0], "target_crop_bbox": [1, 0, 528, 960]}],
@@ -469,6 +476,9 @@ def main() -> None:
     assert_true("seam_alignment_device" in orchestrator_source, "tiled orchestrator should pass seam device")
     assert_true("_validate_reference_pack_geometry" in orchestrator_source, "tiled orchestrator should verify reference pack pixel geometry")
     assert_true("effective_reference_count" in orchestrator_source, "tiled orchestrator should expand reference_count for reference packs")
+    content_source = inspect.getsource(nodes._check_reference_content_alignment)
+    assert_true("_estimate_overlap_shift" in content_source, "reference pack should estimate content registration, not only canvas size")
+    assert_true("max_content_shift_px" in content_source, "reference pack content shift should be thresholded")
 
     print("smoke_tiled_nodes: ok")
 
