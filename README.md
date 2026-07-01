@@ -171,13 +171,25 @@ crop. Use `face_scale` only for intentional small corrections: values above
 
 `face_detector_backend` defaults to `auto`. In auto mode the node tries
 InsightFace first, then falls back to MediaPipe if InsightFace is not installed
-or fails to load/detect a face. Use `insightface` when you want the strongest
-detector and already have `insightface` plus `onnxruntime-gpu` installed. Use
-`mediapipe` when you want the easiest install path:
+or fails to load/detect a face. If MediaPipe also fails, auto mode then tries
+the AnimeFace backend as a final fallback. Use `insightface` when you want the
+strongest detector and already have `insightface` plus `onnxruntime-gpu`
+installed. Use `mediapipe` when you want the easiest install path:
 
 ```text
 python -m pip install mediapipe
 ```
+
+Use `animeface` for 2D/anime-style face references:
+
+```text
+python -m pip install opencv-python
+```
+
+The AnimeFace backend uses `lbpcascade_animeface.xml`. The node first looks at
+`SCAIL2_ANIME_FACE_CASCADE`, then `ComfyUI/models/scail2/`, then this plugin's
+`models/` folder. If the file is not found, it attempts to download the cascade
+from the upstream `nagadomi/lbpcascade_animeface` repository.
 
 For InsightFace, install `insightface` plus `onnxruntime-gpu` for CUDA or
 `onnxruntime` for CPU. The recommended model is `buffalo_l`; `buffalo_s` is

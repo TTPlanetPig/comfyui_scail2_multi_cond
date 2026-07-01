@@ -22,6 +22,11 @@ DEFAULT_PLAN = """# frames | reference | prompt | negative | boundary_overlap
 """
 _INSIGHTFACE_APP_CACHE: dict[tuple[str, str, int], Any] = {}
 _MEDIAPIPE_FACE_DETECTION_CACHE: dict[tuple[int, float], Any] = {}
+_ANIME_FACE_CASCADE_CACHE: dict[str, Any] = {}
+_ANIME_FACE_CASCADE_NAME = "lbpcascade_animeface.xml"
+_ANIME_FACE_CASCADE_URL = (
+    "https://raw.githubusercontent.com/nagadomi/lbpcascade_animeface/master/lbpcascade_animeface.xml"
+)
 
 
 def _shape(value: Any) -> list[int]:
@@ -1641,6 +1646,161 @@ def _detect_face_info_mediapipe(
     return selected, {**model_info, "candidate_count": int(len(candidates))}
 
 
+def _anime_face_cascade_candidate_paths() -> list[str]:
+    paths: list[str] = []
+    env_path = os.environ.get("SCAIL2_ANIME_FACE_CASCADE")
+    if env_path:
+        paths.append(os.path.abspath(os.path.expanduser(env_path)))
+    try:
+        import folder_paths
+
+        models_dir = getattr(folder_paths, "models_dir", None)
+        if models_dir:
+            paths.append(os.path.join(str(models_dir), "scail2", _ANIME_FACE_CASCADE_NAME))
+    except Exception:
+        pass
+    plugin_dir = os.path.dirname(os.path.abspath(__file__))
+    paths.append(os.path.join(plugin_dir, "models", _ANIME_FACE_CASCADE_NAME))
+    paths.append(os.path.join(plugin_dir, _ANIME_FACE_CASCADE_NAME))
+
+    unique_paths: list[str] = []
+    seen: set[str] = set()
+    for path in paths:
+        normalized = os.path.normcase(os.path.abspath(path))
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        unique_paths.append(os.path.abspath(path))
+    return unique_paths
+
+
+def _download_anime_face_cascade(target_path: str) -> None:
+    import urllib.request
+
+    os.makedirs(os.path.dirname(os.path.abspath(target_path)), exist_ok=True)
+    tmp_path = target_path + ".tmp"
+    try:
+        with urllib.request.urlopen(_ANIME_FACE_CASCADE_URL, timeout=30) as response:
+            data = response.read()
+        if len(data) < 1024 or b"opencv_storage" not in data[:4096]:
+            raise RuntimeError("downloaded cascade file did not look like an OpenCV cascade XML.")
+        with open(tmp_path, "wb") as handle:
+            handle.write(data)
+        os.replace(tmp_path, target_path)
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+
+def _resolve_anime_face_cascade_path() -> str:
+    candidate_paths = _anime_face_cascade_candidate_paths()
+    for path in candidate_paths:
+        if os.path.isfile(path) and os.path.getsize(path) > 0:
+            return path
+
+    download_errors: list[str] = []
+    for path in candidate_paths:
+        try:
+            _download_anime_face_cascade(path)
+            return path
+        except Exception as exc:
+            download_errors.append(f"{path}: {exc}")
+
+    expected = "; ".join(candidate_paths)
+    detail = "; ".join(download_errors)
+    raise RuntimeError(
+        "AnimeFace backend requires lbpcascade_animeface.xml. The node could not find or download it. "
+        f"Place it at one of: {expected}; or set SCAIL2_ANIME_FACE_CASCADE to its full path. "
+        f"Download source: {_ANIME_FACE_CASCADE_URL}. Errors: {detail}"
+    )
+
+
+def _get_anime_face_cascade():
+    try:
+        import cv2
+    except Exception as exc:
+        raise RuntimeError("AnimeFace backend requires OpenCV. Install it with: python -m pip install opencv-python") from exc
+
+    cascade_path = _resolve_anime_face_cascade_path()
+    detector = _ANIME_FACE_CASCADE_CACHE.get(cascade_path)
+    if detector is None:
+        detector = cv2.CascadeClassifier(cascade_path)
+        if detector.empty():
+            raise RuntimeError(f"AnimeFace cascade failed to load from: {cascade_path}")
+        _ANIME_FACE_CASCADE_CACHE[cascade_path] = detector
+    return detector, {
+        "backend": "animeface",
+        "model": _ANIME_FACE_CASCADE_NAME,
+        "cascade_path": cascade_path,
+        "source": _ANIME_FACE_CASCADE_URL,
+    }
+
+
+def _detect_face_info_animeface(
+    image_rgb: Any,
+    select_mode: str,
+    name: str,
+    scale_factor: float,
+    min_neighbors: int,
+    min_size_ratio: float,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    image_h, image_w = int(image_rgb.shape[0]), int(image_rgb.shape[1])
+    detector, model_info = _get_anime_face_cascade()
+    import cv2
+
+    gray = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
+    gray = cv2.equalizeHist(gray)
+    normalized_scale = max(1.01, min(1.5, float(scale_factor)))
+    normalized_neighbors = max(0, min(20, int(min_neighbors)))
+    normalized_min_size_ratio = max(0.01, min(0.8, float(min_size_ratio)))
+    min_dim = max(1, min(int(image_w), int(image_h)))
+    min_size = max(12, min(min_dim, int(round(float(min_dim) * normalized_min_size_ratio))))
+    detect_kwargs = {
+        "scaleFactor": float(normalized_scale),
+        "minNeighbors": int(normalized_neighbors),
+        "minSize": (int(min_size), int(min_size)),
+    }
+    candidates: list[dict[str, Any]] = []
+    weights: list[Optional[float]] = []
+    try:
+        rects, _reject_levels, level_weights = detector.detectMultiScale3(
+            gray,
+            outputRejectLevels=True,
+            **detect_kwargs,
+        )
+        weights = [float(value) for value in list(level_weights)]
+    except Exception:
+        rects = detector.detectMultiScale(gray, **detect_kwargs)
+    for index, rect in enumerate(list(rects)):
+        x, y, w, h = [float(value) for value in rect]
+        x0 = max(0.0, min(float(image_w), x))
+        y0 = max(0.0, min(float(image_h), y))
+        x1 = max(x0 + 1.0, min(float(image_w), x + w))
+        y1 = max(y0 + 1.0, min(float(image_h), y + h))
+        score = weights[index] if index < len(weights) else None
+        candidates.append(
+            {
+                "bbox": [float(x0), float(y0), float(x1), float(y1)],
+                "bbox_int": [int(round(x0)), int(round(y0)), int(round(x1)), int(round(y1))],
+                "center": [float((x0 + x1) * 0.5), float((y0 + y1) * 0.5)],
+                "size": [float(x1 - x0), float(y1 - y0)],
+                "score": float(score) if score is not None else None,
+            }
+        )
+    selected = _select_face_info(candidates, int(image_w), int(image_h), str(select_mode), str(name), "AnimeFace")
+    return selected, {
+        **model_info,
+        "candidate_count": int(len(candidates)),
+        "scale_factor": float(normalized_scale),
+        "min_neighbors": int(normalized_neighbors),
+        "min_size_ratio": float(normalized_min_size_ratio),
+        "min_size_px": int(min_size),
+    }
+
+
 def _detect_face_pair(
     target_rgb: Any,
     reference_rgb: Any,
@@ -1652,9 +1812,12 @@ def _detect_face_pair(
     det_size: int,
     mediapipe_model_selection: str,
     mediapipe_min_detection_confidence: float,
+    animeface_scale_factor: float = 1.1,
+    animeface_min_neighbors: int = 3,
+    animeface_min_size_ratio: float = 0.08,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     requested_backend = str(backend or "auto").strip()
-    if requested_backend not in {"auto", "insightface", "mediapipe"}:
+    if requested_backend not in {"auto", "insightface", "mediapipe", "animeface"}:
         requested_backend = "auto"
 
     def run_insightface() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
@@ -1706,10 +1869,44 @@ def _detect_face_pair(
             detector_info["auto_fallback_from_insightface"] = auto_fallback_reason
         return target_info, reference_info, detector_info
 
+    def run_animeface(
+        auto_fallback_from_insightface: Optional[str] = None,
+        auto_fallback_from_mediapipe: Optional[str] = None,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        target_info, target_model = _detect_face_info_animeface(
+            target_rgb,
+            str(target_select),
+            "face_crop_video target frame",
+            float(animeface_scale_factor),
+            int(animeface_min_neighbors),
+            float(animeface_min_size_ratio),
+        )
+        reference_info, reference_model = _detect_face_info_animeface(
+            reference_rgb,
+            str(reference_select),
+            "reference_image",
+            float(animeface_scale_factor),
+            int(animeface_min_neighbors),
+            float(animeface_min_size_ratio),
+        )
+        detector_info = {
+            "requested_backend": requested_backend,
+            "backend_used": "animeface",
+            "target": target_model,
+            "reference": reference_model,
+        }
+        if auto_fallback_from_insightface:
+            detector_info["auto_fallback_from_insightface"] = auto_fallback_from_insightface
+        if auto_fallback_from_mediapipe:
+            detector_info["auto_fallback_from_mediapipe"] = auto_fallback_from_mediapipe
+        return target_info, reference_info, detector_info
+
     if requested_backend == "insightface":
         return run_insightface()
     if requested_backend == "mediapipe":
         return run_mediapipe()
+    if requested_backend == "animeface":
+        return run_animeface()
 
     try:
         return run_insightface()
@@ -1717,10 +1914,14 @@ def _detect_face_pair(
         try:
             return run_mediapipe(str(insightface_exc))
         except Exception as mediapipe_exc:
-            raise RuntimeError(
-                "Auto face detector failed with both InsightFace and MediaPipe. "
-                f"InsightFace error: {insightface_exc}; MediaPipe error: {mediapipe_exc}"
-            ) from mediapipe_exc
+            try:
+                return run_animeface(str(insightface_exc), str(mediapipe_exc))
+            except Exception as animeface_exc:
+                raise RuntimeError(
+                    "Auto face detector failed with InsightFace, MediaPipe, and AnimeFace. "
+                    f"InsightFace error: {insightface_exc}; MediaPipe error: {mediapipe_exc}; "
+                    f"AnimeFace error: {animeface_exc}"
+                ) from animeface_exc
 
 
 def _extract_reference_window_no_resize(
@@ -3561,7 +3762,7 @@ class SCAIL2AlignReferenceFaceToCrop:
                 "insightface_model": (["buffalo_l", "buffalo_s"], {"default": "buffalo_l"}),
                 "provider": (["auto", "cuda", "cpu"], {"default": "auto"}),
                 "det_size": ("INT", {"default": 640, "min": 160, "max": 2048, "step": 32}),
-                "face_detector_backend": (["auto", "insightface", "mediapipe"], {"default": "auto"}),
+                "face_detector_backend": (["auto", "insightface", "mediapipe", "animeface"], {"default": "auto"}),
                 "mediapipe_model_selection": (["full_range", "short_range"], {"default": "full_range"}),
                 "mediapipe_min_detection_confidence": (
                     "FLOAT",

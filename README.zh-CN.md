@@ -195,15 +195,24 @@ SCAIL-2 Scheduled Long Video / Internal SAM
 
 检测后端：
 
-- `face_detector_backend = auto`：优先使用 InsightFace，失败或未安装时自动使用 MediaPipe。
+- `face_detector_backend = auto`：优先使用 InsightFace，失败或未安装时自动使用 MediaPipe；如果 MediaPipe 也没有检测到脸，最后会使用 AnimeFace 兜底。
 - `insightface`：检测更强，适合已经安装 `insightface` 和 `onnxruntime-gpu` 的环境。
 - `mediapipe`：安装最简单。
+- `animeface`：用于二次元/2D 风格脸。
 
 MediaPipe 安装：
 
 ```text
 python -m pip install mediapipe
 ```
+
+AnimeFace 安装：
+
+```text
+python -m pip install opencv-python
+```
+
+AnimeFace 后端使用 `lbpcascade_animeface.xml`。节点会依次查找 `SCAIL2_ANIME_FACE_CASCADE` 环境变量、`ComfyUI/models/scail2/`、插件自己的 `models/` 目录；如果没有找到，会尝试从上游 `nagadomi/lbpcascade_animeface` 仓库自动下载。
 
 InsightFace 安装：
 
