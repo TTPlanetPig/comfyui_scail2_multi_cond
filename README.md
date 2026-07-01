@@ -338,7 +338,9 @@ wiring for tiled production. Connect the first-pass `pose_video`, the same
 plan, which preserves older workflows. Use `pack_mode=per_segment` when each
 segment needs its own reference keyframe; the pack then contains one image per
 active segment and the tiled node internally remaps those segments to the packed
-reference slots before generation. The builder can optionally run a connected
+reference slots before generation. If `pose_video` length or `max_frames` clips
+the plan, the builder summary reports raw versus active segment counts and the
+clipped segment indices. The builder can optionally run a connected
 ComfyUI `UPSCALE_MODEL`, then resizes every packed reference to exactly
 `tile_manifest.target_size`. Connect `reference_pack_images` and
 `reference_pack_manifest` to `SCAIL-2 Tiled Long Video` or its Internal SAM

@@ -641,6 +641,79 @@ def _parse_plan(segment_plan: str, pose_frame_count: Optional[int] = None, max_f
     return segments
 
 
+def _segment_plan_clip_report(
+    segment_plan: str,
+    segments: list[dict[str, Any]],
+    *,
+    pose_frame_count: Optional[int] = None,
+    max_frames: int = 0,
+) -> dict[str, Any]:
+    raw_rows = _parse_plan_input(segment_plan)
+    raw_segment_count = int(len(raw_rows))
+    active_indices = {int(segment["index"]) for segment in segments}
+    clipped_indices = [
+        int(index)
+        for index in range(raw_segment_count)
+        if int(index) not in active_indices
+    ]
+    planned_frames_before_clip = 0
+    raw_ranges: list[dict[str, Any]] = []
+    for index, item in enumerate(raw_rows):
+        frames = int(item.get("frames", 0))
+        raw_ranges.append(
+            {
+                "index": int(index),
+                "start": int(planned_frames_before_clip),
+                "end": int(planned_frames_before_clip + frames),
+                "frames": int(frames),
+                "reference": int(item.get("reference", 1)),
+            }
+        )
+        planned_frames_before_clip += int(frames)
+    cap = int(max_frames) if max_frames and int(max_frames) > 0 else None
+    if pose_frame_count is not None:
+        cap = min(cap, int(pose_frame_count)) if cap is not None else int(pose_frame_count)
+    clipped_segments = [
+        item
+        for item in raw_ranges
+        if int(item["index"]) in clipped_indices
+    ]
+    partial_segments = []
+    active_by_index = {int(segment["index"]): segment for segment in segments}
+    for item in raw_ranges:
+        active = active_by_index.get(int(item["index"]))
+        if active is not None and int(active["frames"]) != int(item["frames"]):
+            partial_segments.append(
+                {
+                    "index": int(item["index"]),
+                    "planned_frames": int(item["frames"]),
+                    "active_frames": int(active["frames"]),
+                    "planned_range": [int(item["start"]), int(item["end"])],
+                    "active_range": [int(active["start"]), int(active["end"])],
+                    "reference": int(item["reference"]),
+                }
+            )
+    warnings = []
+    if raw_segment_count != int(len(segments)):
+        warnings.append(
+            "segment_plan was clipped before reference packing; per_segment outputs one image per active segment, "
+            "not per UI segment_count row."
+        )
+    return {
+        "raw_segment_count": int(raw_segment_count),
+        "active_segment_count": int(len(segments)),
+        "planned_frames_before_clip": int(planned_frames_before_clip),
+        "active_frames_after_clip": int(sum(int(segment["frames"]) for segment in segments)),
+        "clip_cap_frames": int(cap) if cap is not None else None,
+        "pose_frame_count": int(pose_frame_count) if pose_frame_count is not None else None,
+        "max_frames": int(max_frames),
+        "clipped_segment_indices": clipped_indices,
+        "clipped_segments": clipped_segments,
+        "partial_segments": partial_segments,
+        "warnings": warnings,
+    }
+
+
 def _clean_plan_cell(value: Any) -> str:
     text = str(value or "").replace("|", "/")
     return " ".join(part.strip() for part in text.splitlines() if part.strip())
@@ -7101,6 +7174,12 @@ class SCAIL2PlanReferencePackBuilder:
             float(scale_factor),
         )
         segments = _parse_plan(segment_plan, pose_frame_count=frame_count, max_frames=max_frames)
+        plan_clip_report = _segment_plan_clip_report(
+            segment_plan,
+            segments,
+            pose_frame_count=int(frame_count),
+            max_frames=int(max_frames),
+        )
         normalized_frame_mode = str(reference_frame_mode or "segment_start").strip()
         if normalized_frame_mode not in {"segment_start", "segment_middle", "segment_end"}:
             normalized_frame_mode = "segment_start"
@@ -7197,6 +7276,9 @@ class SCAIL2PlanReferencePackBuilder:
             "references": entries,
             "reference_count": int(len(entries)),
             "plan_segment_count": int(len(segments)),
+            "raw_plan_segment_count": int(plan_clip_report["raw_segment_count"]),
+            "active_plan_segment_count": int(plan_clip_report["active_segment_count"]),
+            "segment_plan_clip": plan_clip_report,
             "used_source_references": sorted({int(segment["reference"]) for segment in segments}),
             "reference_frame_mode": normalized_frame_mode,
             "resize_mode": str(resize_mode),
@@ -7215,6 +7297,9 @@ class SCAIL2PlanReferencePackBuilder:
             "pack_mode": normalized_pack_mode,
             "reference_count": int(len(entries)),
             "plan_segment_count": int(len(segments)),
+            "raw_plan_segment_count": int(plan_clip_report["raw_segment_count"]),
+            "active_plan_segment_count": int(plan_clip_report["active_segment_count"]),
+            "segment_plan_clip": plan_clip_report,
             "used_source_references": sorted({int(segment["reference"]) for segment in segments}),
             "source_size": [int(source_w), int(source_h)],
             "target_size": [int(target_w), int(target_h)],

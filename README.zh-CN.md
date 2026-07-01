@@ -290,6 +290,8 @@ tile 的 `tile_align` 会被规范到 32 像素步进，`tile_generate_size` 必
 用来兼容旧工作流；如果你希望每个分段都有自己的参考图，请切到
 `pack_mode=per_segment`，这时 pack 会按 active segment 数量输出同样数量的图片，
 Tiled 节点会在内部把每段临时映射到对应的 packed reference slot 后再生成。
+如果 `pose_video` 长度或 `max_frames` 把 plan 裁掉，builder summary 会明确显示
+raw/active segment 数量，以及被裁掉的 segment index。
 节点可选调用 ComfyUI 的 `UPSCALE_MODEL`，然后把每张参考图精确调整到
 `tile_manifest.target_size`。把输出的 `reference_pack_images` 和
 `reference_pack_manifest` 接到 `SCAIL-2 Tiled Long Video` 或 Internal SAM 版本即可。

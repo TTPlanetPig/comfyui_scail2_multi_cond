@@ -234,6 +234,24 @@ def main() -> None:
     assert_true([int(segment["reference"]) for segment in remapped_segments] == [1, 2, 3], "per-segment pack should assign one packed ref per segment")
     assert_true("8 | 2 | b" in remapped_plan, "remapped plan should preserve segment prompts while changing references")
     assert_true(remap_info["remap"][1]["source_reference"] == 1, "remap should preserve original repeated source reference")
+    five_segment_plan = (
+        '[{"frames": 10, "reference": 1, "prompt": "a", "negative": ""},'
+        '{"frames": 10, "reference": 2, "prompt": "b", "negative": ""},'
+        '{"frames": 10, "reference": 3, "prompt": "c", "negative": ""},'
+        '{"frames": 10, "reference": 4, "prompt": "d", "negative": ""},'
+        '{"frames": 10, "reference": 5, "prompt": "e", "negative": ""}]'
+    )
+    four_active_segments = nodes._parse_plan(five_segment_plan, pose_frame_count=40, max_frames=0)
+    clip_report = nodes._segment_plan_clip_report(
+        five_segment_plan,
+        four_active_segments,
+        pose_frame_count=40,
+        max_frames=0,
+    )
+    assert_true(clip_report["raw_segment_count"] == 5, "clip report should preserve raw segment count")
+    assert_true(clip_report["active_segment_count"] == 4, "clip report should show active segment count after clipping")
+    assert_true(clip_report["clipped_segment_indices"] == [4], "clip report should identify the clipped fifth segment")
+    assert_true(clip_report["clip_cap_frames"] == 40, "clip report should expose the frame cap that caused clipping")
     assert_raises(
         "source_reference does not match",
         lambda: nodes._resolve_reference_pack_segment_plan(
