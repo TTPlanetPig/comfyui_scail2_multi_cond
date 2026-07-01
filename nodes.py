@@ -3933,6 +3933,8 @@ def _estimate_tile_seam_offsets(
 
 
 def _covered_viewport_crop_bbox(weights: torch.Tensor, viewport_bbox: list[int]) -> tuple[list[int], dict[str, Any]]:
+    import numpy as np
+
     vx0, vy0, vx1, vy1 = [int(value) for value in viewport_bbox]
     height = int(weights.shape[1])
     width = int(weights.shape[2])
@@ -3940,7 +3942,7 @@ def _covered_viewport_crop_bbox(weights: torch.Tensor, viewport_bbox: list[int])
     vx1 = max(vx0 + 1, min(width, vx1))
     vy0 = max(0, min(height, vy0))
     vy1 = max(vy0 + 1, min(height, vy1))
-    coverage = (weights[0, :, :, 0] > 1e-6).detach()
+    coverage = (weights[:, :, :, 0] > 1e-6).all(dim=0).detach()
     view = coverage[vy0:vy1, vx0:vx1]
     total_pixels = int(view.numel())
     covered_pixels = int(view.sum().item())
@@ -3951,23 +3953,52 @@ def _covered_viewport_crop_bbox(weights: torch.Tensor, viewport_bbox: list[int])
             "uncovered_pixels": int(total_pixels),
             "coverage_ratio": 0.0,
         }
-    row_fraction = view.float().mean(dim=1)
-    col_fraction = view.float().mean(dim=0)
-    valid_rows = torch.nonzero(row_fraction >= 0.999, as_tuple=False).reshape(-1)
-    valid_cols = torch.nonzero(col_fraction >= 0.999, as_tuple=False).reshape(-1)
-    method = "full_row_col_coverage"
-    if int(valid_rows.numel()) > 0 and int(valid_cols.numel()) > 0:
-        crop_x0 = vx0 + int(valid_cols[0].item())
-        crop_x1 = vx0 + int(valid_cols[-1].item()) + 1
-        crop_y0 = vy0 + int(valid_rows[0].item())
-        crop_y1 = vy0 + int(valid_rows[-1].item()) + 1
-    else:
+    mask = view.detach().cpu().numpy().astype(bool)
+    mask_h, mask_w = int(mask.shape[0]), int(mask.shape[1])
+    heights = np.zeros((mask_w,), dtype=np.int32)
+    best_area = 0
+    best_rect = [0, 0, mask_w, mask_h]
+    center_x = (mask_w - 1) * 0.5
+    center_y = (mask_h - 1) * 0.5
+    best_center_distance = float("inf")
+    for row in range(mask_h):
+        heights = (heights + 1) * mask[row].astype(np.int32)
+        stack: list[int] = []
+        for col in range(mask_w + 1):
+            current_h = int(heights[col]) if col < mask_w else 0
+            while stack and current_h < int(heights[stack[-1]]):
+                top = int(stack.pop())
+                rect_h = int(heights[top])
+                left = int(stack[-1] + 1) if stack else 0
+                right = int(col)
+                rect_w = int(right - left)
+                area = int(rect_w * rect_h)
+                if area <= 0:
+                    continue
+                rect_y0 = int(row - rect_h + 1)
+                rect_y1 = int(row + 1)
+                rect_center_x = (left + right - 1) * 0.5
+                rect_center_y = (rect_y0 + rect_y1 - 1) * 0.5
+                center_distance = abs(rect_center_x - center_x) + abs(rect_center_y - center_y)
+                if area > best_area or (area == best_area and center_distance < best_center_distance):
+                    best_area = int(area)
+                    best_center_distance = float(center_distance)
+                    best_rect = [int(left), int(rect_y0), int(right), int(rect_y1)]
+            stack.append(int(col))
+
+    if best_area <= 0:
         nonzero = torch.nonzero(view, as_tuple=False)
         crop_y0 = vy0 + int(nonzero[:, 0].min().item())
         crop_y1 = vy0 + int(nonzero[:, 0].max().item()) + 1
         crop_x0 = vx0 + int(nonzero[:, 1].min().item())
         crop_x1 = vx0 + int(nonzero[:, 1].max().item()) + 1
         method = "covered_bbox_fallback"
+    else:
+        crop_x0 = vx0 + int(best_rect[0])
+        crop_y0 = vy0 + int(best_rect[1])
+        crop_x1 = vx0 + int(best_rect[2])
+        crop_y1 = vy0 + int(best_rect[3])
+        method = "largest_fully_covered_rectangle"
     crop = [int(crop_x0), int(crop_y0), int(crop_x1), int(crop_y1)]
     cropped_view = coverage[crop_y0:crop_y1, crop_x0:crop_x1]
     cropped_total = int(cropped_view.numel())
@@ -3977,6 +4008,7 @@ def _covered_viewport_crop_bbox(weights: torch.Tensor, viewport_bbox: list[int])
         "covered_pixels": int(covered_pixels),
         "uncovered_pixels": int(total_pixels - covered_pixels),
         "coverage_ratio": float(covered_pixels / max(1, total_pixels)),
+        "largest_full_rectangle_area": int(best_area),
         "cropped_uncovered_pixels": int(cropped_uncovered),
         "cropped_coverage_ratio": float((cropped_total - cropped_uncovered) / max(1, cropped_total)),
     }
