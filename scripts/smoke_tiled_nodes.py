@@ -156,10 +156,22 @@ def main() -> None:
         == ["seam_alignment_device", "max_seam_shift_px", "seam_alignment_frames", "junction_mode"],
         "tile composite seam widgets should append last",
     )
-    assert_true(list(tiled_required)[-2:] == ["free_tail_window", "junction_mode"], "junction_mode should append after free_tail_window")
+    lookahead_keys = [
+        "lookahead_reference",
+        "lookahead_lead_frames",
+        "lookahead_search_window_frames",
+        "lookahead_analysis_stride",
+        "lookahead_min_visible_ratio",
+        "lookahead_min_new_area_ratio",
+        "lookahead_max_anchors_per_tile",
+    ]
     assert_true(
-        list(tiled_sam_required)[-2:] == ["free_tail_window", "junction_mode"],
-        "internal SAM junction_mode should append after free_tail_window",
+        list(tiled_required)[-8:] == ["junction_mode", *lookahead_keys],
+        "lookahead widgets should append after junction_mode",
+    )
+    assert_true(
+        list(tiled_sam_required)[-8:] == ["junction_mode", *lookahead_keys],
+        "internal SAM lookahead widgets should append after junction_mode",
     )
     assert_true(
         list(tiled_required).index("composite_blend_mode") < list(tiled_required).index("free_tail_window"),
@@ -177,6 +189,9 @@ def main() -> None:
     assert_true(free_tail_spec[0] == "INT", "free_tail_window should be a numeric tail-frame control")
     assert_true(free_tail_spec[1]["default"] == 0, "free_tail_window default should disable free tail")
     assert_true(free_tail_spec[1]["step"] == 4, "free_tail_window should step by four frames")
+    assert_true(tiled_required["lookahead_reference"][1]["default"] is False, "lookahead should default off")
+    assert_true(tiled_sam_required["lookahead_reference"][1]["default"] is False, "internal SAM lookahead should default off")
+    assert_true(tiled_required["lookahead_lead_frames"][1]["default"] == 8, "unexpected lookahead lead default")
 
     assert_true(nodes._tile_seed(123, 1, "same_seed") == 123, "same_seed changed tile 1")
     assert_true(nodes._tile_seed(123, 7, "same_seed") == 123, "same_seed changed tile 7")
@@ -234,6 +249,39 @@ def main() -> None:
     assert_true([int(segment["reference"]) for segment in remapped_segments] == [1, 2, 3], "per-segment pack should assign one packed ref per segment")
     assert_true("8 | 2 | b" in remapped_plan, "remapped plan should preserve segment prompts while changing references")
     assert_true(remap_info["remap"][1]["source_reference"] == 1, "remap should preserve original repeated source reference")
+    lookahead_segments = nodes._parse_plan(
+        '[{"frames": 10, "reference": 1, "prompt": "base", "negative": ""}]',
+        pose_frame_count=10,
+        max_frames=0,
+    )
+    tile_plan, tile_segments, tile_refs, tile_masks, tile_lookahead = nodes._apply_tile_lookahead_to_generation(
+        1,
+        lookahead_segments,
+        "original",
+        {1: FakePackedReference()},
+        {1: FakePackedReference()},
+        {
+            "enabled": True,
+            "anchors_by_tile": {
+                1: [
+                    {
+                        "tile_number": 1,
+                        "start_frame": 4,
+                        "entry_frame": 6,
+                        "reference_frame": 8,
+                        "batch_index": 0,
+                    }
+                ]
+            },
+            "reference_images": [FakePackedReference()],
+            "reference_masks": [FakePackedReference()],
+        },
+    )
+    assert_true(tile_lookahead["applied"], "tile lookahead should apply anchor")
+    assert_true(2 in tile_refs and 2 in tile_masks, "tile lookahead should allocate a new reference slot")
+    assert_true([segment["frames"] for segment in tile_segments] == [4, 6], "tile lookahead should split segment at start_frame")
+    assert_true([segment["reference"] for segment in tile_segments] == [1, 2], "tile lookahead should switch to anchor reference")
+    assert_true("6 | 2 | base" in tile_plan, "tile lookahead plan should preserve prompt while switching reference")
     five_segment_plan = (
         '[{"frames": 10, "reference": 1, "prompt": "a", "negative": ""},'
         '{"frames": 10, "reference": 2, "prompt": "b", "negative": ""},'

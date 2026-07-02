@@ -100,6 +100,13 @@ function defaultValue(name) {
         seam_alignment_frames: 9,
         free_tail_window: 0,
         junction_mode: "weighted_average",
+        lookahead_reference: false,
+        lookahead_lead_frames: 8,
+        lookahead_search_window_frames: 24,
+        lookahead_analysis_stride: 2,
+        lookahead_min_visible_ratio: 0.01,
+        lookahead_min_new_area_ratio: 0.015,
+        lookahead_max_anchors_per_tile: 2,
     };
     return Object.hasOwn(defaults, name) ? defaults[name] : "";
 }

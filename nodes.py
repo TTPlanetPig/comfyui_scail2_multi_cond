@@ -3552,6 +3552,386 @@ def _resolve_reference_pack_segment_plan(
     return remapped_plan, remapped_rows, plan_info
 
 
+def _lookahead_enabled_input_spec() -> tuple[str, dict[str, Any]]:
+    return (
+        "BOOLEAN",
+        {
+            "default": False,
+            "tooltip": (
+                "Use the global SAM pose mask to detect new tile-local visible regions and inject "
+                "future appearance references before they enter the tile."
+            ),
+        },
+    )
+
+
+def _lookahead_input_specs() -> dict[str, Any]:
+    return {
+        "lookahead_reference": _lookahead_enabled_input_spec(),
+        "lookahead_lead_frames": ("INT", {"default": 8, "min": 0, "max": 64, "step": 4}),
+        "lookahead_search_window_frames": ("INT", {"default": 24, "min": 1, "max": 128, "step": 1}),
+        "lookahead_analysis_stride": ("INT", {"default": 2, "min": 1, "max": 16, "step": 1}),
+        "lookahead_min_visible_ratio": ("FLOAT", {"default": 0.01, "min": 0.0, "max": 1.0, "step": 0.001}),
+        "lookahead_min_new_area_ratio": ("FLOAT", {"default": 0.015, "min": 0.0, "max": 1.0, "step": 0.001}),
+        "lookahead_max_anchors_per_tile": ("INT", {"default": 2, "min": 0, "max": MAX_REFERENCES, "step": 1}),
+    }
+
+
+def _mask_to_binary(mask: torch.Tensor, threshold: float = 1e-4) -> torch.Tensor:
+    if not isinstance(mask, torch.Tensor) or mask.ndim != 4:
+        raise ValueError("lookahead mask must be a ComfyUI IMAGE tensor.")
+    values = mask.detach().float()
+    if int(values.shape[-1]) > 1:
+        values = values.amax(dim=-1)
+    else:
+        values = values[..., 0]
+    return values > float(threshold)
+
+
+def _tile_lookahead_visibility(
+    binary_mask: torch.Tensor,
+    frame_index: int,
+    seen: torch.Tensor,
+) -> tuple[float, float]:
+    current = binary_mask[int(frame_index)]
+    visible = float(current.float().mean().detach().cpu().item())
+    new_area = float((current & ~seen).float().mean().detach().cpu().item())
+    return visible, new_area
+
+
+def _choose_lookahead_reference_frame(
+    binary_mask: torch.Tensor,
+    entry_frame: int,
+    search_window_frames: int,
+) -> tuple[int, float]:
+    frame_count = int(binary_mask.shape[0])
+    start = max(0, min(frame_count - 1, int(entry_frame)))
+    end = max(start + 1, min(frame_count, start + max(1, int(search_window_frames)) + 1))
+    best_frame = start
+    best_visible = -1.0
+    for frame_index in range(start, end):
+        visible = float(binary_mask[frame_index].float().mean().detach().cpu().item())
+        if visible > best_visible:
+            best_visible = visible
+            best_frame = int(frame_index)
+    return int(best_frame), float(max(0.0, best_visible))
+
+
+def _detect_tile_lookahead_anchors(
+    pose_video_mask: torch.Tensor,
+    manifest: dict[str, Any],
+    planned_frames: int,
+    *,
+    lead_frames: int,
+    search_window_frames: int,
+    analysis_stride: int,
+    min_visible_ratio: float,
+    min_new_area_ratio: float,
+    max_anchors_per_tile: int,
+) -> dict[int, list[dict[str, Any]]]:
+    if max_anchors_per_tile <= 0:
+        return {}
+    frame_count = min(int(planned_frames), int(pose_video_mask.shape[0]))
+    if frame_count <= 1:
+        return {}
+    source_size = manifest.get("source_size", [int(pose_video_mask.shape[2]), int(pose_video_mask.shape[1])])
+    binary_full = _mask_to_binary(pose_video_mask[:frame_count])
+    stride = max(1, int(analysis_stride))
+    lead = max(0, int(lead_frames))
+    anchors_by_tile: dict[int, list[dict[str, Any]]] = {}
+    for tile_position, tile in enumerate(manifest.get("tiles", []), start=1):
+        tile_number = int(tile.get("tile_number", int(tile.get("index", tile_position - 1)) + 1))
+        source_bbox = [int(value) for value in tile["source_crop_bbox"]]
+        mask_bbox = _tile_tensor_crop_bbox(source_bbox, source_size, pose_video_mask)
+        x0, y0, x1, y1 = [int(value) for value in mask_bbox]
+        if x1 <= x0 or y1 <= y0:
+            continue
+        tile_mask = binary_full[:, y0:y1, x0:x1].contiguous()
+        if int(tile_mask.numel()) <= 0:
+            continue
+        seen = tile_mask[0].clone()
+        cooldown_until = 0
+        anchors: list[dict[str, Any]] = []
+        sampled_indices = list(range(1, frame_count, stride))
+        if sampled_indices and sampled_indices[-1] != frame_count - 1:
+            sampled_indices.append(frame_count - 1)
+        previous_sample = 0
+        for sampled_frame in sampled_indices:
+            sampled_frame = int(sampled_frame)
+            seen_before = seen.clone()
+            current = tile_mask[sampled_frame]
+            seen |= current
+            if sampled_frame < cooldown_until:
+                previous_sample = sampled_frame
+                continue
+            visible, new_area = _tile_lookahead_visibility(tile_mask, sampled_frame, seen_before)
+            if visible < float(min_visible_ratio) or new_area < float(min_new_area_ratio):
+                previous_sample = sampled_frame
+                continue
+            entry_frame = sampled_frame
+            refine_start = max(1, int(previous_sample) + 1)
+            for candidate in range(refine_start, sampled_frame + 1):
+                candidate_visible, candidate_new = _tile_lookahead_visibility(tile_mask, candidate, seen_before)
+                if candidate_visible >= float(min_visible_ratio) and candidate_new >= float(min_new_area_ratio):
+                    entry_frame = int(candidate)
+                    visible = candidate_visible
+                    new_area = candidate_new
+                    break
+            reference_frame, reference_visible = _choose_lookahead_reference_frame(
+                tile_mask,
+                int(entry_frame),
+                int(search_window_frames),
+            )
+            anchors.append(
+                {
+                    "tile_number": int(tile_number),
+                    "event_type": "new_region_seen",
+                    "entry_frame": int(entry_frame),
+                    "entry_frame_1_based": int(entry_frame + 1),
+                    "start_frame": int(max(0, entry_frame - lead)),
+                    "start_frame_1_based": int(max(0, entry_frame - lead) + 1),
+                    "reference_frame": int(reference_frame),
+                    "reference_frame_1_based": int(reference_frame + 1),
+                    "visible_ratio": float(visible),
+                    "new_area_ratio": float(new_area),
+                    "reference_visible_ratio": float(reference_visible),
+                    "source_crop_bbox": source_bbox,
+                    "mask_crop_bbox": mask_bbox,
+                }
+            )
+            cooldown_until = int(entry_frame) + max(1, int(search_window_frames))
+            if len(anchors) >= int(max_anchors_per_tile):
+                break
+            previous_sample = sampled_frame
+        if anchors:
+            anchors_by_tile[int(tile_number)] = anchors
+    return anchors_by_tile
+
+
+def _build_tile_lookahead_context(
+    pose_video: torch.Tensor,
+    pose_video_mask: Optional[torch.Tensor],
+    manifest: dict[str, Any],
+    segments: list[dict[str, Any]],
+    *,
+    enabled: bool,
+    image_resize_mode: str,
+    mask_resize_mode: str,
+    lead_frames: int,
+    search_window_frames: int,
+    analysis_stride: int,
+    min_visible_ratio: float,
+    min_new_area_ratio: float,
+    max_anchors_per_tile: int,
+) -> dict[str, Any]:
+    planned_frames = sum(int(segment["frames"]) for segment in segments)
+    summary: dict[str, Any] = {
+        "enabled": bool(enabled),
+        "method": "global_sam_pose_mask_new_region",
+        "planned_frames": int(planned_frames),
+        "anchors": [],
+        "anchors_by_tile": {},
+    }
+    if not bool(enabled):
+        return {"enabled": False, "summary": summary}
+    if pose_video_mask is None:
+        summary.update({"enabled": False, "skipped": True, "reason": "pose_video_mask_unavailable"})
+        return {"enabled": False, "summary": summary}
+    if int(pose_video_mask.shape[0]) < 1:
+        summary.update({"enabled": False, "skipped": True, "reason": "empty_pose_video_mask"})
+        return {"enabled": False, "summary": summary}
+    target_w, target_h = [int(value) for value in manifest.get("target_size", [0, 0])]
+    if target_w <= 0 or target_h <= 0:
+        summary.update({"enabled": False, "skipped": True, "reason": "invalid_target_size"})
+        return {"enabled": False, "summary": summary}
+    anchors_by_tile = _detect_tile_lookahead_anchors(
+        pose_video_mask,
+        manifest,
+        int(planned_frames),
+        lead_frames=int(lead_frames),
+        search_window_frames=int(search_window_frames),
+        analysis_stride=int(analysis_stride),
+        min_visible_ratio=float(min_visible_ratio),
+        min_new_area_ratio=float(min_new_area_ratio),
+        max_anchors_per_tile=int(max_anchors_per_tile),
+    )
+    if not anchors_by_tile:
+        summary.update(
+            {
+                "enabled": True,
+                "anchor_count": 0,
+                "reason": "no_new_tile_regions_detected",
+                "params": {
+                    "lead_frames": int(lead_frames),
+                    "search_window_frames": int(search_window_frames),
+                    "analysis_stride": int(analysis_stride),
+                    "min_visible_ratio": float(min_visible_ratio),
+                    "min_new_area_ratio": float(min_new_area_ratio),
+                    "max_anchors_per_tile": int(max_anchors_per_tile),
+                },
+            }
+        )
+        return {"enabled": True, "anchors_by_tile": {}, "summary": summary}
+
+    reference_images: list[torch.Tensor] = []
+    reference_masks: list[torch.Tensor] = []
+    flat_anchors: list[dict[str, Any]] = []
+    for tile_number in sorted(anchors_by_tile):
+        for anchor in anchors_by_tile[tile_number]:
+            reference_frame = max(0, min(int(pose_video.shape[0]) - 1, int(anchor["reference_frame"])))
+            reference_image, image_resize = _resize_reference_pack_frame(
+                pose_video[reference_frame : reference_frame + 1],
+                int(target_w),
+                int(target_h),
+                str(image_resize_mode),
+                str(image_resize_mode),
+                None,
+            )
+            reference_mask, mask_resize = _resize_reference_pack_frame(
+                pose_video_mask[reference_frame : reference_frame + 1],
+                int(target_w),
+                int(target_h),
+                "nearest" if str(mask_resize_mode) not in {"bilinear"} else str(mask_resize_mode),
+                "nearest",
+                None,
+            )
+            batch_index = len(reference_images)
+            enriched = {
+                **anchor,
+                "batch_index": int(batch_index),
+                "image_resize": image_resize,
+                "mask_resize": mask_resize,
+                "target_size": [int(target_w), int(target_h)],
+            }
+            reference_images.append(reference_image)
+            reference_masks.append(reference_mask)
+            flat_anchors.append(enriched)
+    enriched_by_tile: dict[int, list[dict[str, Any]]] = {}
+    for anchor in flat_anchors:
+        enriched_by_tile.setdefault(int(anchor["tile_number"]), []).append(anchor)
+    summary.update(
+        {
+            "enabled": True,
+            "anchor_count": int(len(flat_anchors)),
+            "anchors": flat_anchors,
+            "anchors_by_tile": {str(key): value for key, value in enriched_by_tile.items()},
+            "reference_image_shape": _shape(torch.cat(reference_images, dim=0)) if reference_images else None,
+            "params": {
+                "lead_frames": int(lead_frames),
+                "search_window_frames": int(search_window_frames),
+                "analysis_stride": int(analysis_stride),
+                "min_visible_ratio": float(min_visible_ratio),
+                "min_new_area_ratio": float(min_new_area_ratio),
+                "max_anchors_per_tile": int(max_anchors_per_tile),
+            },
+        }
+    )
+    return {
+        "enabled": True,
+        "anchors_by_tile": enriched_by_tile,
+        "reference_images": reference_images,
+        "reference_masks": reference_masks,
+        "summary": summary,
+    }
+
+
+def _apply_tile_lookahead_to_generation(
+    tile_number: int,
+    generation_segments: list[dict[str, Any]],
+    generation_segment_plan: str,
+    references: dict[int, torch.Tensor],
+    reference_masks: dict[int, torch.Tensor],
+    lookahead_context: dict[str, Any],
+) -> tuple[str, list[dict[str, Any]], dict[int, torch.Tensor], dict[int, torch.Tensor], dict[str, Any]]:
+    if not bool(lookahead_context.get("enabled")):
+        return generation_segment_plan, generation_segments, references, reference_masks, {"enabled": False}
+    anchors = list((lookahead_context.get("anchors_by_tile") or {}).get(int(tile_number), []))
+    if not anchors:
+        return generation_segment_plan, generation_segments, references, reference_masks, {"enabled": True, "applied": False, "anchors": []}
+
+    tile_references = dict(references)
+    tile_reference_masks = dict(reference_masks)
+    used_slots = set(int(index) for index in tile_references)
+    assigned: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for anchor in sorted(anchors, key=lambda item: int(item["start_frame"])):
+        free_slots = [slot for slot in range(1, MAX_REFERENCES + 1) if slot not in used_slots]
+        if not free_slots:
+            skipped.append({**anchor, "skip_reason": "no_free_reference_slot"})
+            continue
+        slot = int(free_slots[0])
+        batch_index = int(anchor["batch_index"])
+        images = lookahead_context.get("reference_images") or []
+        masks = lookahead_context.get("reference_masks") or []
+        if batch_index >= len(images):
+            skipped.append({**anchor, "skip_reason": "missing_reference_image"})
+            continue
+        tile_references[slot] = images[batch_index]
+        if batch_index < len(masks):
+            tile_reference_masks[slot] = masks[batch_index]
+        used_slots.add(slot)
+        assigned.append({**anchor, "reference_slot": int(slot)})
+
+    if not assigned:
+        return (
+            generation_segment_plan,
+            generation_segments,
+            references,
+            reference_masks,
+            {"enabled": True, "applied": False, "anchors": [], "skipped": skipped},
+        )
+
+    rows: list[dict[str, Any]] = []
+    for segment in generation_segments:
+        segment_start = int(segment["start"])
+        segment_end = int(segment["end"])
+        current_reference = int(segment["reference"])
+        cursor = segment_start
+        segment_anchors = [
+            anchor
+            for anchor in assigned
+            if segment_start <= int(anchor["start_frame"]) < segment_end
+        ]
+        for anchor in segment_anchors:
+            anchor_start = int(anchor["start_frame"])
+            if anchor_start > cursor:
+                rows.append(
+                    {
+                        **segment,
+                        "frames": int(anchor_start - cursor),
+                        "reference": int(current_reference),
+                        "boundary_overlap": segment.get("boundary_overlap") if cursor == segment_start else None,
+                    }
+                )
+            current_reference = int(anchor["reference_slot"])
+            cursor = anchor_start
+        if segment_end > cursor:
+            rows.append(
+                {
+                    **segment,
+                    "frames": int(segment_end - cursor),
+                    "reference": int(current_reference),
+                    "boundary_overlap": segment.get("boundary_overlap") if cursor == segment_start else None,
+                }
+            )
+    tile_plan = _format_plan_rows(rows)
+    tile_segments = _parse_plan(tile_plan, pose_frame_count=sum(int(row["frames"]) for row in rows), max_frames=0)
+    return (
+        tile_plan,
+        tile_segments,
+        tile_references,
+        tile_reference_masks,
+        {
+            "enabled": True,
+            "applied": True,
+            "anchors": assigned,
+            "skipped": skipped,
+            "tile_generation_segment_plan": tile_plan,
+            "reference_slots": [int(anchor["reference_slot"]) for anchor in assigned],
+        },
+    )
+
+
 def _intervals_overlap(a0: int, a1: int, b0: int, b1: int) -> bool:
     return min(int(a1), int(b1)) > max(int(a0), int(b0))
 
@@ -8377,6 +8757,13 @@ def _run_tiled_long_video(
     max_seam_shift_px: int,
     seam_alignment_frames: int,
     junction_mode: str,
+    lookahead_reference: bool,
+    lookahead_lead_frames: int,
+    lookahead_search_window_frames: int,
+    lookahead_analysis_stride: int,
+    lookahead_min_visible_ratio: float,
+    lookahead_min_new_area_ratio: float,
+    lookahead_max_anchors_per_tile: int,
     pose_video_mask: Optional[torch.Tensor],
     sam_options: Optional[dict[str, Any]],
     prompt=None,
@@ -8465,6 +8852,27 @@ def _run_tiled_long_video(
             "mask_strategy": "not_used",
         }
 
+    lookahead_context = _build_tile_lookahead_context(
+        pose_video,
+        pose_video_mask,
+        manifest,
+        generation_segments,
+        enabled=bool(lookahead_reference) and bool(replacement_mode),
+        image_resize_mode=str(image_resize_mode),
+        mask_resize_mode=str(mask_resize_mode),
+        lead_frames=int(lookahead_lead_frames),
+        search_window_frames=int(lookahead_search_window_frames),
+        analysis_stride=int(lookahead_analysis_stride),
+        min_visible_ratio=float(lookahead_min_visible_ratio),
+        min_new_area_ratio=float(lookahead_min_new_area_ratio),
+        max_anchors_per_tile=int(lookahead_max_anchors_per_tile),
+    )
+    if bool(lookahead_context.get("summary", {}).get("enabled")):
+        send_status(
+            "planning_lookahead",
+            f"Planned {int(lookahead_context.get('summary', {}).get('anchor_count', 0))} lookahead reference anchor(s)",
+        )
+
     include_masks = bool(replacement_mode)
     generator_suffix = "global_sam_masks" if bool(use_internal_sam) else "external_masks"
     print(
@@ -8483,14 +8891,33 @@ def _run_tiled_long_video(
                 progress=tile_progress,
                 tile_number=int(tile_number),
             )
+            (
+                tile_generation_segment_plan,
+                tile_generation_segments,
+                tile_references,
+                tile_reference_masks,
+                tile_lookahead_summary,
+            ) = _apply_tile_lookahead_to_generation(
+                tile_number,
+                generation_segments,
+                generation_segment_plan,
+                references,
+                reference_masks,
+                lookahead_context,
+            )
+            tile_effective_reference_count = _effective_tiled_reference_count(
+                int(effective_reference_count),
+                tile_generation_segments,
+                tile_references,
+            )
             tile_pose_video, tile_kwargs, extraction_summary = _extract_tiled_long_video_inputs(
                 pose_video,
                 pose_video_mask,
-                references,
-                reference_masks,
+                tile_references,
+                tile_reference_masks,
                 manifest,
                 tile,
-                int(effective_reference_count),
+                int(tile_effective_reference_count),
                 str(image_resize_mode),
                 str(mask_resize_mode),
                 include_masks=include_masks,
@@ -8511,14 +8938,14 @@ def _run_tiled_long_video(
                 sigmas,
                 clip_vision,
                 tile_pose_video,
-                generation_segment_plan,
+                tile_generation_segment_plan,
                 current_seed,
                 cfg,
                 mode,
                 max_frames,
                 max_chunk_frames,
                 overlap_frames,
-                effective_reference_count,
+                tile_effective_reference_count,
                 color_correction,
                 cache_mode=str(cache_mode),
                 free_tail_window=int(free_tail_window),
@@ -8546,6 +8973,7 @@ def _run_tiled_long_video(
                 "source_crop_bbox": tile.get("source_crop_bbox"),
                 "target_crop_bbox": tile.get("target_crop_bbox"),
                 "extraction": extraction_summary,
+                "lookahead": tile_lookahead_summary,
                 "generated_shape": _shape(frames),
                 "used_pose_video_mask_shape": _shape(used_pose_mask),
                 "used_reference_mask_timeline_shape": _shape(used_reference_mask_timeline),
@@ -8609,6 +9037,7 @@ def _run_tiled_long_video(
             **reference_pack_info,
             "geometry_check": reference_pack_geometry,
         },
+        "lookahead_reference": lookahead_context.get("summary", {"enabled": False}),
         "tile_seed_mode": str(tile_seed_mode),
         "seed_start": int(seed),
         "free_tail_window": int(free_tail_window),
@@ -8689,6 +9118,7 @@ class SCAIL2TiledLongVideo:
                 "seam_alignment_frames": ("INT", {"default": 9, "min": 1, "max": 33, "step": 1}),
                 "free_tail_window": _free_tail_window_input_spec(),
                 "junction_mode": (["weighted_average", "top2_normalized"], {"default": "weighted_average"}),
+                **_lookahead_input_specs(),
             },
             "optional": optional,
             "hidden": {
@@ -8746,6 +9176,13 @@ class SCAIL2TiledLongVideo:
         seam_alignment_frames: int = 9,
         free_tail_window: int = 0,
         junction_mode: str = "weighted_average",
+        lookahead_reference: bool = False,
+        lookahead_lead_frames: int = 8,
+        lookahead_search_window_frames: int = 24,
+        lookahead_analysis_stride: int = 2,
+        lookahead_min_visible_ratio: float = 0.01,
+        lookahead_min_new_area_ratio: float = 0.015,
+        lookahead_max_anchors_per_tile: int = 2,
         pose_video_mask: Optional[torch.Tensor] = None,
         prompt=None,
         unique_id=None,
@@ -8791,6 +9228,13 @@ class SCAIL2TiledLongVideo:
             max_seam_shift_px=int(max_seam_shift_px),
             seam_alignment_frames=int(seam_alignment_frames),
             junction_mode=str(junction_mode),
+            lookahead_reference=bool(lookahead_reference),
+            lookahead_lead_frames=int(lookahead_lead_frames),
+            lookahead_search_window_frames=int(lookahead_search_window_frames),
+            lookahead_analysis_stride=int(lookahead_analysis_stride),
+            lookahead_min_visible_ratio=float(lookahead_min_visible_ratio),
+            lookahead_min_new_area_ratio=float(lookahead_min_new_area_ratio),
+            lookahead_max_anchors_per_tile=int(lookahead_max_anchors_per_tile),
             pose_video_mask=pose_video_mask,
             sam_options=None,
             prompt=prompt,
@@ -8868,6 +9312,7 @@ class SCAIL2TiledLongVideoWithSAM:
                 "seam_alignment_frames": ("INT", {"default": 9, "min": 1, "max": 33, "step": 1}),
                 "free_tail_window": _free_tail_window_input_spec(),
                 "junction_mode": (["weighted_average", "top2_normalized"], {"default": "weighted_average"}),
+                **_lookahead_input_specs(),
             },
             "optional": optional,
             "hidden": {
@@ -8931,6 +9376,13 @@ class SCAIL2TiledLongVideoWithSAM:
         seam_alignment_frames: int = 9,
         free_tail_window: int = 0,
         junction_mode: str = "weighted_average",
+        lookahead_reference: bool = False,
+        lookahead_lead_frames: int = 8,
+        lookahead_search_window_frames: int = 24,
+        lookahead_analysis_stride: int = 2,
+        lookahead_min_visible_ratio: float = 0.01,
+        lookahead_min_new_area_ratio: float = 0.015,
+        lookahead_max_anchors_per_tile: int = 2,
         sam_model=None,
         sam_conditioning=None,
         prompt=None,
@@ -8977,6 +9429,13 @@ class SCAIL2TiledLongVideoWithSAM:
             max_seam_shift_px=int(max_seam_shift_px),
             seam_alignment_frames=int(seam_alignment_frames),
             junction_mode=str(junction_mode),
+            lookahead_reference=bool(lookahead_reference),
+            lookahead_lead_frames=int(lookahead_lead_frames),
+            lookahead_search_window_frames=int(lookahead_search_window_frames),
+            lookahead_analysis_stride=int(lookahead_analysis_stride),
+            lookahead_min_visible_ratio=float(lookahead_min_visible_ratio),
+            lookahead_min_new_area_ratio=float(lookahead_min_new_area_ratio),
+            lookahead_max_anchors_per_tile=int(lookahead_max_anchors_per_tile),
             pose_video_mask=None,
             sam_options={
                 "sam_model": sam_model,

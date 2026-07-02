@@ -76,6 +76,13 @@ const SCAIL_WIDGET_TOOLTIPS = new Map([
     ["seam_alignment_device", "Device used for seam offset scoring. auto prefers CUDA, then MPS, then CPU, with CPU fallback if unavailable."],
     ["max_seam_shift_px", "Maximum integer-pixel correction allowed for automatic seam alignment."],
     ["seam_alignment_frames", "Number of frames sampled across the timeline when estimating seam alignment."],
+    ["lookahead_reference", "Use global SAM masks to detect new tile-local visible regions and inject future appearance references before they enter the tile."],
+    ["lookahead_lead_frames", "How many frames before a detected tile entry the lookahead reference should become active."],
+    ["lookahead_search_window_frames", "How far after an entry frame to search for the clearest lookahead reference frame."],
+    ["lookahead_analysis_stride", "Frame stride used for lookahead detection; higher values are faster but less precise."],
+    ["lookahead_min_visible_ratio", "Minimum tile mask coverage needed before a lookahead event can be created."],
+    ["lookahead_min_new_area_ratio", "Minimum newly visible tile area needed to create a lookahead event."],
+    ["lookahead_max_anchors_per_tile", "Maximum lookahead reference anchors to add for each tile."],
     ["layout_json", "Manual tile layout written by the visual editor. Keep this connected through the builder output."],
     ["preview_frame_count", "Number of preview frames saved for the manual tile editor."],
     ["preview_filename_prefix", "Filename prefix for manual tile preview images."],
@@ -188,6 +195,16 @@ const SCAIL_TILE_TAIL_29 = [
     "free_tail_window",
 ];
 const SCAIL_TILE_TAIL_CURRENT = [...SCAIL_TILE_TAIL_29, "junction_mode"];
+const SCAIL_LOOKAHEAD_WIDGETS = [
+    "lookahead_reference",
+    "lookahead_lead_frames",
+    "lookahead_search_window_frames",
+    "lookahead_analysis_stride",
+    "lookahead_min_visible_ratio",
+    "lookahead_min_new_area_ratio",
+    "lookahead_max_anchors_per_tile",
+];
+const SCAIL_TILE_TAIL_LOOKAHEAD = [...SCAIL_TILE_TAIL_CURRENT, ...SCAIL_LOOKAHEAD_WIDGETS];
 
 function scailTiledWidgetOrder(samWidgets, tail) {
     return [
@@ -222,6 +239,7 @@ const SCAIL_WIDGET_ORDER_HISTORY = new Map([
             scailTiledWidgetOrder([], SCAIL_TILE_TAIL_28),
             scailTiledWidgetOrder([], SCAIL_TILE_TAIL_29),
             scailTiledWidgetOrder([], SCAIL_TILE_TAIL_CURRENT),
+            scailTiledWidgetOrder([], SCAIL_TILE_TAIL_LOOKAHEAD),
         ],
     ],
     [
@@ -233,6 +251,7 @@ const SCAIL_WIDGET_ORDER_HISTORY = new Map([
             scailTiledWidgetOrder(SCAIL_SAM_WIDGETS, SCAIL_TILE_TAIL_28),
             scailTiledWidgetOrder(SCAIL_SAM_WIDGETS, SCAIL_TILE_TAIL_29),
             scailTiledWidgetOrder(SCAIL_SAM_WIDGETS, SCAIL_TILE_TAIL_CURRENT),
+            scailTiledWidgetOrder(SCAIL_SAM_WIDGETS, SCAIL_TILE_TAIL_LOOKAHEAD),
         ],
     ],
     [
