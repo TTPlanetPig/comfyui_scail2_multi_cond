@@ -83,6 +83,8 @@ const SCAIL_WIDGET_TOOLTIPS = new Map([
     ["lookahead_min_visible_ratio", "Minimum tile mask coverage needed before a lookahead event can be created."],
     ["lookahead_min_new_area_ratio", "Minimum newly visible tile area needed to create a lookahead event."],
     ["lookahead_max_anchors_per_tile", "Maximum lookahead reference anchors to add for each tile."],
+    ["lookahead_reference_pick_mode", "How the future reference frame is chosen after a tile-local entry is detected."],
+    ["lookahead_context_expand_ratio", "Extra tile padding used by expanded_tile_context when choosing a more complete future reference frame."],
     ["layout_json", "Manual tile layout written by the visual editor. Keep this connected through the builder output."],
     ["preview_frame_count", "Number of preview frames saved for the manual tile editor."],
     ["preview_filename_prefix", "Filename prefix for manual tile preview images."],
@@ -195,7 +197,7 @@ const SCAIL_TILE_TAIL_29 = [
     "free_tail_window",
 ];
 const SCAIL_TILE_TAIL_CURRENT = [...SCAIL_TILE_TAIL_29, "junction_mode"];
-const SCAIL_LOOKAHEAD_WIDGETS = [
+const SCAIL_LOOKAHEAD_WIDGETS_V1 = [
     "lookahead_reference",
     "lookahead_lead_frames",
     "lookahead_search_window_frames",
@@ -203,6 +205,11 @@ const SCAIL_LOOKAHEAD_WIDGETS = [
     "lookahead_min_visible_ratio",
     "lookahead_min_new_area_ratio",
     "lookahead_max_anchors_per_tile",
+];
+const SCAIL_LOOKAHEAD_WIDGETS = [
+    ...SCAIL_LOOKAHEAD_WIDGETS_V1,
+    "lookahead_reference_pick_mode",
+    "lookahead_context_expand_ratio",
 ];
 const SCAIL_TILE_TAIL_LOOKAHEAD = [...SCAIL_TILE_TAIL_CURRENT, ...SCAIL_LOOKAHEAD_WIDGETS];
 
@@ -239,6 +246,7 @@ const SCAIL_WIDGET_ORDER_HISTORY = new Map([
             scailTiledWidgetOrder([], SCAIL_TILE_TAIL_28),
             scailTiledWidgetOrder([], SCAIL_TILE_TAIL_29),
             scailTiledWidgetOrder([], SCAIL_TILE_TAIL_CURRENT),
+            scailTiledWidgetOrder([], [...SCAIL_TILE_TAIL_CURRENT, ...SCAIL_LOOKAHEAD_WIDGETS_V1]),
             scailTiledWidgetOrder([], SCAIL_TILE_TAIL_LOOKAHEAD),
         ],
     ],
@@ -251,6 +259,7 @@ const SCAIL_WIDGET_ORDER_HISTORY = new Map([
             scailTiledWidgetOrder(SCAIL_SAM_WIDGETS, SCAIL_TILE_TAIL_28),
             scailTiledWidgetOrder(SCAIL_SAM_WIDGETS, SCAIL_TILE_TAIL_29),
             scailTiledWidgetOrder(SCAIL_SAM_WIDGETS, SCAIL_TILE_TAIL_CURRENT),
+            scailTiledWidgetOrder(SCAIL_SAM_WIDGETS, [...SCAIL_TILE_TAIL_CURRENT, ...SCAIL_LOOKAHEAD_WIDGETS_V1]),
             scailTiledWidgetOrder(SCAIL_SAM_WIDGETS, SCAIL_TILE_TAIL_LOOKAHEAD),
         ],
     ],
@@ -278,6 +287,7 @@ const SCAIL_WIDGET_ENUM_VALUES = new Map([
     ["seam_alignment_apply_mode", new Set(["shifted_canvas_crop", "fixed_crop"])],
     ["seam_alignment_device", new Set(["auto", "cpu", "cuda", "mps"])],
     ["junction_mode", new Set(["weighted_average", "top2_normalized"])],
+    ["lookahead_reference_pick_mode", new Set(["tile_visible_max", "expanded_tile_context", "global_object_max"])],
     ["reference_frame_mode", new Set(["segment_start", "segment_middle", "segment_end"])],
     ["resize_mode", new Set(["bicubic", "bilinear", "nearest", "upscale_model"])],
     ["post_upscale_resize_mode", new Set(["bicubic", "bilinear", "nearest"])],
@@ -307,6 +317,7 @@ const SCAIL_WIDGET_DEFAULTS = new Map([
     ["content_alignment_policy", "error"],
     ["content_alignment_device", "auto"],
     ["pack_mode", "per_reference"],
+    ["lookahead_reference_pick_mode", "tile_visible_max"],
     ["free_tail_window", 0],
     ["max_seam_shift_px", 4],
     ["seam_alignment_frames", 9],

@@ -3574,6 +3574,27 @@ def _lookahead_input_specs() -> dict[str, Any]:
         "lookahead_min_visible_ratio": ("FLOAT", {"default": 0.01, "min": 0.0, "max": 1.0, "step": 0.001}),
         "lookahead_min_new_area_ratio": ("FLOAT", {"default": 0.015, "min": 0.0, "max": 1.0, "step": 0.001}),
         "lookahead_max_anchors_per_tile": ("INT", {"default": 2, "min": 0, "max": MAX_REFERENCES, "step": 1}),
+        "lookahead_reference_pick_mode": (
+            ["tile_visible_max", "expanded_tile_context", "global_object_max"],
+            {
+                "default": "tile_visible_max",
+                "tooltip": (
+                    "How lookahead chooses the future reference frame. tile_visible_max keeps legacy behavior; "
+                    "expanded_tile_context looks around the tile for a more complete entering part; "
+                    "global_object_max scores the full mask timeline."
+                ),
+            },
+        ),
+        "lookahead_context_expand_ratio": (
+            "FLOAT",
+            {
+                "default": 0.35,
+                "min": 0.0,
+                "max": 1.0,
+                "step": 0.01,
+                "tooltip": "Extra tile-context padding used by expanded_tile_context when choosing the future reference frame.",
+            },
+        ),
     }
 
 
@@ -3603,18 +3624,55 @@ def _choose_lookahead_reference_frame(
     binary_mask: torch.Tensor,
     entry_frame: int,
     search_window_frames: int,
-) -> tuple[int, float]:
+    *,
+    baseline_mask: Optional[torch.Tensor] = None,
+) -> tuple[int, float, float]:
     frame_count = int(binary_mask.shape[0])
     start = max(0, min(frame_count - 1, int(entry_frame)))
     end = max(start + 1, min(frame_count, start + max(1, int(search_window_frames)) + 1))
     best_frame = start
     best_visible = -1.0
+    best_new_area = -1.0
+    baseline = None
+    if isinstance(baseline_mask, torch.Tensor):
+        baseline = baseline_mask.to(dtype=torch.bool, device=binary_mask.device)
     for frame_index in range(start, end):
-        visible = float(binary_mask[frame_index].float().mean().detach().cpu().item())
-        if visible > best_visible:
+        current = binary_mask[frame_index]
+        visible = float(current.float().mean().detach().cpu().item())
+        new_area = 0.0
+        if baseline is not None:
+            new_area = float((current & ~baseline).float().mean().detach().cpu().item())
+        if (new_area, visible) > (best_new_area, best_visible):
+            best_new_area = float(new_area)
             best_visible = visible
             best_frame = int(frame_index)
-    return int(best_frame), float(max(0.0, best_visible))
+    return int(best_frame), float(max(0.0, best_visible)), float(max(0.0, best_new_area))
+
+
+def _expand_lookahead_bbox(bbox: list[int], width: int, height: int, expand_ratio: float) -> list[int]:
+    x0, y0, x1, y1 = [int(value) for value in bbox]
+    ratio = max(0.0, float(expand_ratio))
+    pad_x = int(round(max(1, x1 - x0) * ratio))
+    pad_y = int(round(max(1, y1 - y0) * ratio))
+    return list(_clamp_bbox((x0 - pad_x, y0 - pad_y, x1 + pad_x, y1 + pad_y), int(width), int(height)))
+
+
+def _lookahead_reference_selection_mask(
+    binary_full: torch.Tensor,
+    mask_bbox: list[int],
+    reference_pick_mode: str,
+    context_expand_ratio: float,
+) -> tuple[torch.Tensor, list[int], bool]:
+    frame_count, height, width = int(binary_full.shape[0]), int(binary_full.shape[1]), int(binary_full.shape[2])
+    pick_mode = str(reference_pick_mode or "tile_visible_max")
+    if pick_mode == "expanded_tile_context":
+        selection_bbox = _expand_lookahead_bbox(mask_bbox, width, height, float(context_expand_ratio))
+        x0, y0, x1, y1 = [int(value) for value in selection_bbox]
+        return binary_full[:, y0:y1, x0:x1].contiguous(), selection_bbox, True
+    if pick_mode == "global_object_max":
+        return binary_full.reshape(frame_count, height, width).contiguous(), [0, 0, width, height], True
+    x0, y0, x1, y1 = [int(value) for value in mask_bbox]
+    return binary_full[:, y0:y1, x0:x1].contiguous(), mask_bbox, False
 
 
 def _detect_tile_lookahead_anchors(
@@ -3628,6 +3686,8 @@ def _detect_tile_lookahead_anchors(
     min_visible_ratio: float,
     min_new_area_ratio: float,
     max_anchors_per_tile: int,
+    reference_pick_mode: str,
+    context_expand_ratio: float,
 ) -> dict[int, list[dict[str, Any]]]:
     if max_anchors_per_tile <= 0:
         return {}
@@ -3648,6 +3708,14 @@ def _detect_tile_lookahead_anchors(
             continue
         tile_mask = binary_full[:, y0:y1, x0:x1].contiguous()
         if int(tile_mask.numel()) <= 0:
+            continue
+        selection_mask, selection_bbox, use_selection_baseline = _lookahead_reference_selection_mask(
+            binary_full,
+            mask_bbox,
+            str(reference_pick_mode),
+            float(context_expand_ratio),
+        )
+        if int(selection_mask.numel()) <= 0:
             continue
         seen = tile_mask[0].clone()
         cooldown_until = 0
@@ -3677,10 +3745,16 @@ def _detect_tile_lookahead_anchors(
                     visible = candidate_visible
                     new_area = candidate_new
                     break
-            reference_frame, reference_visible = _choose_lookahead_reference_frame(
-                tile_mask,
+            selection_baseline = (
+                selection_mask[:entry_frame].any(dim=0)
+                if use_selection_baseline and int(entry_frame) > 0
+                else None
+            )
+            reference_frame, reference_visible, reference_new_area = _choose_lookahead_reference_frame(
+                selection_mask,
                 int(entry_frame),
                 int(search_window_frames),
+                baseline_mask=selection_baseline,
             )
             anchors.append(
                 {
@@ -3695,8 +3769,11 @@ def _detect_tile_lookahead_anchors(
                     "visible_ratio": float(visible),
                     "new_area_ratio": float(new_area),
                     "reference_visible_ratio": float(reference_visible),
+                    "reference_new_area_ratio": float(reference_new_area),
+                    "reference_pick_mode": str(reference_pick_mode),
                     "source_crop_bbox": source_bbox,
                     "mask_crop_bbox": mask_bbox,
+                    "reference_selection_bbox": selection_bbox,
                 }
             )
             cooldown_until = int(entry_frame) + max(1, int(search_window_frames))
@@ -3723,6 +3800,8 @@ def _build_tile_lookahead_context(
     min_visible_ratio: float,
     min_new_area_ratio: float,
     max_anchors_per_tile: int,
+    reference_pick_mode: str,
+    context_expand_ratio: float,
 ) -> dict[str, Any]:
     planned_frames = sum(int(segment["frames"]) for segment in segments)
     summary: dict[str, Any] = {
@@ -3754,6 +3833,8 @@ def _build_tile_lookahead_context(
         min_visible_ratio=float(min_visible_ratio),
         min_new_area_ratio=float(min_new_area_ratio),
         max_anchors_per_tile=int(max_anchors_per_tile),
+        reference_pick_mode=str(reference_pick_mode),
+        context_expand_ratio=float(context_expand_ratio),
     )
     if not anchors_by_tile:
         summary.update(
@@ -3768,6 +3849,8 @@ def _build_tile_lookahead_context(
                     "min_visible_ratio": float(min_visible_ratio),
                     "min_new_area_ratio": float(min_new_area_ratio),
                     "max_anchors_per_tile": int(max_anchors_per_tile),
+                    "reference_pick_mode": str(reference_pick_mode),
+                    "context_expand_ratio": float(context_expand_ratio),
                 },
             }
         )
@@ -3823,6 +3906,8 @@ def _build_tile_lookahead_context(
                 "min_visible_ratio": float(min_visible_ratio),
                 "min_new_area_ratio": float(min_new_area_ratio),
                 "max_anchors_per_tile": int(max_anchors_per_tile),
+                "reference_pick_mode": str(reference_pick_mode),
+                "context_expand_ratio": float(context_expand_ratio),
             },
         }
     )
@@ -8764,6 +8849,8 @@ def _run_tiled_long_video(
     lookahead_min_visible_ratio: float,
     lookahead_min_new_area_ratio: float,
     lookahead_max_anchors_per_tile: int,
+    lookahead_reference_pick_mode: str,
+    lookahead_context_expand_ratio: float,
     pose_video_mask: Optional[torch.Tensor],
     sam_options: Optional[dict[str, Any]],
     prompt=None,
@@ -8866,6 +8953,8 @@ def _run_tiled_long_video(
         min_visible_ratio=float(lookahead_min_visible_ratio),
         min_new_area_ratio=float(lookahead_min_new_area_ratio),
         max_anchors_per_tile=int(lookahead_max_anchors_per_tile),
+        reference_pick_mode=str(lookahead_reference_pick_mode),
+        context_expand_ratio=float(lookahead_context_expand_ratio),
     )
     if bool(lookahead_context.get("summary", {}).get("enabled")):
         send_status(
@@ -9183,6 +9272,8 @@ class SCAIL2TiledLongVideo:
         lookahead_min_visible_ratio: float = 0.01,
         lookahead_min_new_area_ratio: float = 0.015,
         lookahead_max_anchors_per_tile: int = 2,
+        lookahead_reference_pick_mode: str = "tile_visible_max",
+        lookahead_context_expand_ratio: float = 0.35,
         pose_video_mask: Optional[torch.Tensor] = None,
         prompt=None,
         unique_id=None,
@@ -9235,6 +9326,8 @@ class SCAIL2TiledLongVideo:
             lookahead_min_visible_ratio=float(lookahead_min_visible_ratio),
             lookahead_min_new_area_ratio=float(lookahead_min_new_area_ratio),
             lookahead_max_anchors_per_tile=int(lookahead_max_anchors_per_tile),
+            lookahead_reference_pick_mode=str(lookahead_reference_pick_mode),
+            lookahead_context_expand_ratio=float(lookahead_context_expand_ratio),
             pose_video_mask=pose_video_mask,
             sam_options=None,
             prompt=prompt,
@@ -9383,6 +9476,8 @@ class SCAIL2TiledLongVideoWithSAM:
         lookahead_min_visible_ratio: float = 0.01,
         lookahead_min_new_area_ratio: float = 0.015,
         lookahead_max_anchors_per_tile: int = 2,
+        lookahead_reference_pick_mode: str = "tile_visible_max",
+        lookahead_context_expand_ratio: float = 0.35,
         sam_model=None,
         sam_conditioning=None,
         prompt=None,
@@ -9436,6 +9531,8 @@ class SCAIL2TiledLongVideoWithSAM:
             lookahead_min_visible_ratio=float(lookahead_min_visible_ratio),
             lookahead_min_new_area_ratio=float(lookahead_min_new_area_ratio),
             lookahead_max_anchors_per_tile=int(lookahead_max_anchors_per_tile),
+            lookahead_reference_pick_mode=str(lookahead_reference_pick_mode),
+            lookahead_context_expand_ratio=float(lookahead_context_expand_ratio),
             pose_video_mask=None,
             sam_options={
                 "sam_model": sam_model,

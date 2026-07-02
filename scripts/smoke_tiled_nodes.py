@@ -164,13 +164,15 @@ def main() -> None:
         "lookahead_min_visible_ratio",
         "lookahead_min_new_area_ratio",
         "lookahead_max_anchors_per_tile",
+        "lookahead_reference_pick_mode",
+        "lookahead_context_expand_ratio",
     ]
     assert_true(
-        list(tiled_required)[-8:] == ["junction_mode", *lookahead_keys],
+        list(tiled_required)[-10:] == ["junction_mode", *lookahead_keys],
         "lookahead widgets should append after junction_mode",
     )
     assert_true(
-        list(tiled_sam_required)[-8:] == ["junction_mode", *lookahead_keys],
+        list(tiled_sam_required)[-10:] == ["junction_mode", *lookahead_keys],
         "internal SAM lookahead widgets should append after junction_mode",
     )
     assert_true(
@@ -192,6 +194,8 @@ def main() -> None:
     assert_true(tiled_required["lookahead_reference"][1]["default"] is False, "lookahead should default off")
     assert_true(tiled_sam_required["lookahead_reference"][1]["default"] is False, "internal SAM lookahead should default off")
     assert_true(tiled_required["lookahead_lead_frames"][1]["default"] == 8, "unexpected lookahead lead default")
+    assert_true(tiled_required["lookahead_reference_pick_mode"][1]["default"] == "tile_visible_max", "lookahead pick mode should preserve legacy default")
+    assert_true(tiled_required["lookahead_context_expand_ratio"][1]["default"] == 0.35, "unexpected lookahead context expansion default")
 
     assert_true(nodes._tile_seed(123, 1, "same_seed") == 123, "same_seed changed tile 1")
     assert_true(nodes._tile_seed(123, 7, "same_seed") == 123, "same_seed changed tile 7")

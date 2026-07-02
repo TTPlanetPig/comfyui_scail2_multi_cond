@@ -107,6 +107,8 @@ function defaultValue(name) {
         lookahead_min_visible_ratio: 0.01,
         lookahead_min_new_area_ratio: 0.015,
         lookahead_max_anchors_per_tile: 2,
+        lookahead_reference_pick_mode: "tile_visible_max",
+        lookahead_context_expand_ratio: 0.35,
     };
     return Object.hasOwn(defaults, name) ? defaults[name] : "";
 }
@@ -172,6 +174,22 @@ function widget(node, name) {
     assert(widget(node, "max_seam_shift_px").value === 32, "bad current device value should move to max shift");
     assert(widget(node, "seam_alignment_frames").value === 11, "bad current max shift value should move to seam frames");
     assert(widget(node, "free_tail_window").value === 8, "bad current seam frames value should move to free tail");
+}
+
+{
+    const legacyOrder = orderByLength("SCAIL2TiledLongVideo", 37);
+    const legacyValues = valuesForOrder(legacyOrder, {
+        lookahead_reference: true,
+        lookahead_lead_frames: 12,
+        lookahead_max_anchors_per_tile: 3,
+    });
+    const node = makeNode("SCAIL2TiledLongVideo");
+    migrateScailWidgetValues(node, "SCAIL2TiledLongVideo", { widgets_values: legacyValues });
+    assert(widget(node, "lookahead_reference").value === true, "legacy lookahead enable should be preserved");
+    assert(widget(node, "lookahead_lead_frames").value === 12, "legacy lookahead lead should be preserved");
+    assert(widget(node, "lookahead_max_anchors_per_tile").value === 3, "legacy lookahead anchors should be preserved");
+    assert(widget(node, "lookahead_reference_pick_mode").value === "tile_visible_max", "new lookahead pick mode should default");
+    assert(widget(node, "lookahead_context_expand_ratio").value === 0.35, "new lookahead expansion should default");
 }
 
 {
